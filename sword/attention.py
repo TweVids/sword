@@ -24,20 +24,30 @@ def apply_rotary_pos_emb(
     """
     Applies Rotary Position Embedding (RoPE) to Query and Key tensors.
     
-    Compatible with HuggingFace/Llama/Qwen2 conventions.
+    Compatible with HuggingFace/Llama/Qwen2/Qwen3.5 conventions.
     q: [batch_size, num_heads, seq_len, head_dim]
     k: [batch_size, num_kv_heads, seq_len, head_dim]
-    cos, sin: [1, 1, seq_len, head_dim] or [batch_size, 1, seq_len, head_dim]
+    cos, sin: [seq_len, dim], [batch_size, seq_len, dim], or [batch_size, 1, seq_len, dim]
     """
     if position_ids is not None:
         # Index cos/sin by position_ids if non-sequential
         cos = cos.squeeze(1).squeeze(0)[position_ids].unsqueeze(1)
         sin = sin.squeeze(1).squeeze(0)[position_ids].unsqueeze(1)
 
-    # Ensure cos and sin match the 4D shape [batch, 1, seq_len, rotary_dim] for proper broadcasting across heads
-    while cos.ndim < q.ndim:
+    # Ensure cos and sin match 4D shape [batch, 1, seq_len, rotary_dim] for proper broadcasting across heads
+    if cos.ndim == 2:
+        cos = cos.unsqueeze(0).unsqueeze(1)
+        sin = sin.unsqueeze(0).unsqueeze(1)
+    elif cos.ndim == 3:
         cos = cos.unsqueeze(1)
         sin = sin.unsqueeze(1)
+    elif cos.ndim > 4:
+        while cos.ndim > 4:
+            cos = cos.squeeze(0)
+            sin = sin.squeeze(0)
+        while cos.ndim < 4:
+            cos = cos.unsqueeze(1)
+            sin = sin.unsqueeze(1)
 
     rotary_dim = cos.shape[-1]
     if rotary_dim < q.shape[-1]:

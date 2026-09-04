@@ -43,13 +43,22 @@ class StaticKVCache:
 
         # Current length tracking per sequence in batch
         self.seq_lengths = torch.zeros((max_batch_size,), dtype=torch.long, device=device)
+        self.current_pos = 0
+
+    def set_pos(self, pos: int):
+        """Sets the current write position across all layers."""
+        self.current_pos = pos
+
+    def get_pos(self) -> int:
+        """Returns the current write position."""
+        return self.current_pos
 
     def update(
         self,
         layer_idx: int,
         k: torch.Tensor,
         v: torch.Tensor,
-        start_pos: int,
+        start_pos: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Updates cache for a single layer without reallocation.
@@ -58,11 +67,13 @@ class StaticKVCache:
             layer_idx: index of transformer layer
             k: [batch_size, num_kv_heads, seq_len, head_dim]
             v: [batch_size, num_kv_heads, seq_len, head_dim]
-            start_pos: write offset along the sequence dimension
+            start_pos: write offset along the sequence dimension (defaults to self.current_pos)
             
         Returns:
             Tuple of views into k_cache and v_cache up to (start_pos + seq_len).
         """
+        if start_pos is None:
+            start_pos = self.current_pos
         bsz, _, seq_len, _ = k.shape
         end_pos = start_pos + seq_len
 
@@ -94,8 +105,10 @@ class StaticKVCache:
             self.k_cache.zero_()
             self.v_cache.zero_()
             self.seq_lengths.zero_()
+            self.current_pos = 0
         else:
             for b in batch_indices:
                 self.k_cache[:, b].zero_()
                 self.v_cache[:, b].zero_()
                 self.seq_lengths[b] = 0
+            self.current_pos = 0

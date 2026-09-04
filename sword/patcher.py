@@ -12,6 +12,7 @@ def _fast_sdpa_attention(
     attention_mask: Optional[torch.Tensor] = None,
     dropout_p: float = 0.0,
     is_causal: bool = True,
+    scale: Optional[float] = None,
 ) -> torch.Tensor:
     """
     Pure-PyTorch Fast SDPA Attention kernel.
@@ -32,6 +33,7 @@ def _fast_sdpa_attention(
                     attn_mask=attention_mask,
                     dropout_p=dropout_p,
                     is_causal=is_causal and attention_mask is None,
+                    scale=scale,
                 )
         except Exception:
             return F.scaled_dot_product_attention(
@@ -39,6 +41,7 @@ def _fast_sdpa_attention(
                 attn_mask=attention_mask,
                 dropout_p=dropout_p,
                 is_causal=is_causal and attention_mask is None,
+                scale=scale,
             )
     else:
         return F.scaled_dot_product_attention(
@@ -46,6 +49,7 @@ def _fast_sdpa_attention(
             attn_mask=attention_mask,
             dropout_p=dropout_p,
             is_causal=is_causal and attention_mask is None,
+            scale=scale,
         )
 
 
@@ -86,29 +90,31 @@ def make_patched_qwen_attention_forward(original_forward):
         if head_dim is None:
             head_dim = key_raw.shape[-1] // num_kv_heads
 
-        expected_q_dim = num_heads * head_dim
+        hidden_shape = (*input_shape, -1, head_dim)
         gate = None
-        # Qwen 3.5 has dual projection [query, gate] where output features == 2 * num_heads * head_dim
-        if query_raw.shape[-1] == expected_q_dim * 2:
-            query_states, gate = torch.chunk(query_raw, 2, dim=-1)
+
+        # Qwen 3.5 dual projection [query, gate] where output features == 2 * num_heads * head_dim
+        # Slicing must be done along the head dimension:
+        # q_proj_out.view(*input_shape, -1, head_dim * 2).chunk(2, dim=-1)
+        if query_raw.shape[-1] == num_heads * head_dim * 2:
+            query_states, gate = torch.chunk(
+                query_raw.view(*input_shape, -1, head_dim * 2), 2, dim=-1
+            )
             gate = gate.reshape(*input_shape, -1)
+            query_states = query_states.view(hidden_shape)
         else:
-            query_states = query_raw
+            query_states = query_raw.view(hidden_shape)
 
         # Apply QK normalization if present
-        hidden_shape_q = (*input_shape, -1, head_dim)
-        if hasattr(self, "q_norm"):
-            query_states = self.q_norm(query_states.view(hidden_shape_q))
-        else:
-            query_states = query_states.view(hidden_shape_q)
+        if hasattr(self, "q_norm") and self.q_norm is not None:
+            query_states = self.q_norm(query_states)
 
         hidden_shape_k = (*input_shape, -1, head_dim)
-        if hasattr(self, "k_norm"):
-            key_states = self.k_norm(key_raw.view(hidden_shape_k))
-        else:
-            key_states = key_raw.view(hidden_shape_k)
+        key_states = key_raw.view(hidden_shape_k)
+        if hasattr(self, "k_norm") and self.k_norm is not None:
+            key_states = self.k_norm(key_states)
 
-        value_states = value_raw.view(*input_shape, -1, head_dim)
+        value_states = value_raw.view(hidden_shape_k)
 
         query_states = query_states.transpose(1, 2)
         key_states = key_states.transpose(1, 2)
@@ -121,13 +127,30 @@ def make_patched_qwen_attention_forward(original_forward):
             cos, sin = position_embeddings
             from .attention import apply_rotary_pos_emb
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        elif hasattr(self, "rotary_emb"):
+            start_pos_val = kwargs.get("start_pos", getattr(static_cache, "current_pos", 0) if static_cache else 0)
+            pos_ids = kwargs.get("position_ids", None)
+            if pos_ids is None:
+                pos_ids = torch.arange(start_pos_val, start_pos_val + q_len, dtype=torch.long, device=hidden_states.device).unsqueeze(0)
+            try:
+                cos, sin = self.rotary_emb(value_states, pos_ids)
+            except TypeError:
+                cos, sin = self.rotary_emb(value_states, seq_len=start_pos_val + q_len)
+            from .attention import apply_rotary_pos_emb
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         # -------------------------------------------------------------
         # 3. KV Cache update (Static zero-allocation or dynamic fallback)
         # -------------------------------------------------------------
         is_causal = (q_len > 1)
         if static_cache is not None:
-            start_pos = kwargs.get("start_pos", 0)
+            # Multi-level fallback to resolve exact start_pos
+            start_pos = kwargs.get("start_pos", None)
+            if start_pos is None and "cache_position" in kwargs and kwargs["cache_position"] is not None:
+                start_pos = int(kwargs["cache_position"][0].item())
+            if start_pos is None:
+                start_pos = getattr(static_cache, "current_pos", 0)
+
             key_states, value_states = static_cache.update(layer_idx, key_states, value_states, start_pos)
             if q_len == 1:
                 is_causal = False
@@ -156,6 +179,7 @@ def make_patched_qwen_attention_forward(original_forward):
             value_states,
             attention_mask=attention_mask,
             is_causal=is_causal and attention_mask is None,
+            scale=getattr(self, "scaling", None),
         )
 
         attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, q_len, -1)

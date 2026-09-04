@@ -29,7 +29,21 @@ class FastQwenServer:
             self.tokenizer.padding_side = "left"
         self.max_concurrency = max_concurrency
         self.max_seq_len = max_seq_len
-        self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+
+        # Determine device dynamically from model parameters or explicit argument
+        model_device = getattr(model, "device", None)
+        if model_device is None:
+            try:
+                model_device = next(model.parameters()).device
+            except (StopIteration, AttributeError):
+                model_device = None
+
+        if device is not None:
+            self.device = torch.device(device)
+        elif model_device is not None:
+            self.device = model_device
+        else:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         # Model configuration attributes (support both standard and multimodal text_config)
         cfg = getattr(model, "config", None)
@@ -127,8 +141,11 @@ class FastQwenServer:
 
         # Prefill phase
         self.static_cache.reset(list(range(bsz)))
+        self.static_cache.set_pos(0)
+        prefill_pos_ids = torch.arange(0, prompt_len, dtype=torch.long, device=self.device).unsqueeze(0).expand(bsz, -1)
         outputs = self.model(
             input_ids=input_ids,
+            position_ids=prefill_pos_ids,
             attention_mask=attention_mask,
             sword_static_cache=self.static_cache,
             start_pos=0,
@@ -146,20 +163,24 @@ class FastQwenServer:
 
         generated = [next_token]
         curr_pos = prompt_len
+        self.static_cache.set_pos(curr_pos)
         tokens_per_stream = [1] * bsz
         eos_id = getattr(self.tokenizer, "eos_token_id", None)
         active_mask = torch.ones((bsz, 1), dtype=torch.bool, device=self.device)
 
         # High-Speed Async Decode Loop (zero CPU-GPU sync stalls per token)
         for step in range(1, max_new_tokens):
+            self.static_cache.set_pos(curr_pos)
+            decode_pos_ids = torch.full((bsz, 1), curr_pos, dtype=torch.long, device=self.device)
             out = self.decode_fn(
                 input_ids=next_token,
+                position_ids=decode_pos_ids,
                 sword_static_cache=self.static_cache,
                 start_pos=curr_pos,
                 past_key_values=past_key_values,
                 use_cache=True,
             )
-            step_logits = out.logits[:, 0, :] if hasattr(out, "logits") else out[0][:, 0, :]
+            step_logits = out.logits[:, -1, :] if hasattr(out, "logits") else out[0][:, -1, :]
             past_key_values = getattr(out, "past_key_values", past_key_values)
 
             if temperature > 0.0:
