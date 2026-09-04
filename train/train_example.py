@@ -188,15 +188,20 @@ def main():
     train_ds, eval_ds = load_offline_dataset(dataset_path, seed=CFG["seed"], test_size=700)
 
     # 7. Checkpoint Callback with automated HuggingFace upload & pruning
-    checkpoint_cb = FullCheckpointCallback(
+    cb_kwargs = dict(
         tokenizer=tokenizer,
-        processor=processor,
         output_dir=CFG["output_dir"],
         save_steps=CFG["save_steps"],
         save_limit=CFG["save_limit"],
         hf_repo_id=HF_REPO_ID if HF_REPO_ID else None,
         hf_token=HF_TOKEN if HF_TOKEN else None,
     )
+    try:
+        checkpoint_cb = FullCheckpointCallback(processor=processor, **cb_kwargs)
+    except TypeError:
+        # Backward compatibility if an older version of sword is imported in the session
+        checkpoint_cb = FullCheckpointCallback(**cb_kwargs)
+        checkpoint_cb.processor = processor
 
     # 8. SFT Training Arguments
     sft_config_kwargs = dict(

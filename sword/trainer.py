@@ -247,6 +247,7 @@ class FullCheckpointCallback(TrainerCallback):
         hf_repo_id: Optional[str] = None,
         hf_token: Optional[str] = None,
         processor: Optional[Any] = None,
+        **kwargs,
     ):
         self.tokenizer = tokenizer
         self.processor = processor
@@ -291,8 +292,9 @@ class FullCheckpointCallback(TrainerCallback):
                 model.save_pretrained(ckpt_dir)
             if self.tokenizer is not None and hasattr(self.tokenizer, "save_pretrained"):
                 self.tokenizer.save_pretrained(ckpt_dir)
-            if self.processor is not None and hasattr(self.processor, "save_pretrained"):
-                self.processor.save_pretrained(ckpt_dir)
+            proc = getattr(self, "processor", None)
+            if proc is not None and hasattr(proc, "save_pretrained"):
+                proc.save_pretrained(ckpt_dir)
             print("  ✅ LoRA weights & tokenizer saved.")
         except Exception as e:
             print(f"  ⚠️  LoRA/tokenizer save failed: {e}")
