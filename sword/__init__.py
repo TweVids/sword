@@ -22,6 +22,32 @@ def _fix_torchvision_compatibility():
 
 _fix_torchvision_compatibility()
 
+
+def _fix_transformers_fp8_quantizer_bug():
+    """
+    Hotfixes upstream Transformers bug in FineGrainedFP8HfQuantizer.update_tp_plan
+    where layer_overrides is None, causing AttributeError: 'NoneType' object has no attribute 'get'
+    when loading models like tencent/Hy-MT2-30B-A3B-FP8.
+    """
+    try:
+        from transformers.quantizers.quantizer_finegrained_fp8 import FineGrainedFP8HfQuantizer
+        orig_fn = getattr(FineGrainedFP8HfQuantizer, "update_tp_plan", None)
+        if orig_fn is not None and not getattr(orig_fn, "_sword_patched", False):
+            def patched_update_tp_plan(self, config):
+                try:
+                    return orig_fn(self, config)
+                except AttributeError as err:
+                    if "'NoneType' object has no attribute 'get'" in str(err):
+                        return config
+                    raise
+            patched_update_tp_plan._sword_patched = True
+            FineGrainedFP8HfQuantizer.update_tp_plan = patched_update_tp_plan
+    except Exception:
+        pass
+
+
+_fix_transformers_fp8_quantizer_bug()
+
 from .attention import PureFlashAttention, apply_rotary_pos_emb
 from .kv_cache import StaticKVCache
 from .model import FastTransformerModel, FastTransformerConfig

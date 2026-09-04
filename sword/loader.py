@@ -87,6 +87,29 @@ def load_qwen_model(
     return model, tokenizer
 
 
+def _fix_transformers_fp8_quantizer_bug():
+    """
+    Hotfixes upstream Transformers bug in FineGrainedFP8HfQuantizer.update_tp_plan
+    where layer_overrides is None, causing AttributeError: 'NoneType' object has no attribute 'get'
+    when loading models like tencent/Hy-MT2-30B-A3B-FP8.
+    """
+    try:
+        from transformers.quantizers.quantizer_finegrained_fp8 import FineGrainedFP8HfQuantizer
+        orig_fn = getattr(FineGrainedFP8HfQuantizer, "update_tp_plan", None)
+        if orig_fn is not None and not getattr(orig_fn, "_sword_patched", False):
+            def patched_update_tp_plan(self, config):
+                try:
+                    return orig_fn(self, config)
+                except AttributeError as err:
+                    if "'NoneType' object has no attribute 'get'" in str(err):
+                        return config
+                    raise
+            patched_update_tp_plan._sword_patched = True
+            FineGrainedFP8HfQuantizer.update_tp_plan = patched_update_tp_plan
+    except Exception:
+        pass
+
+
 def load_moe_model(
     model_name_or_path: str = "tencent/Hy-MT2-30B-A3B-FP8",
     device_map: str = "auto",
@@ -113,6 +136,7 @@ def load_moe_model(
     Returns:
         Tuple of (patched_model, tokenizer)
     """
+    _fix_transformers_fp8_quantizer_bug()
     print(f"\n[Sword] Loading MoE model: {model_name_or_path}...")
     tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=True)
     tokenizer.padding_side = "left"
