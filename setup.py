@@ -7,7 +7,6 @@ setup(
     author="TweVids",
     packages=find_packages(),
     install_requires=[
-        "torch>=2.4.0",
         "transformers>=5.3.0",
         "accelerate",
         "bitsandbytes",

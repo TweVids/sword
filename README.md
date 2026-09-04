@@ -28,20 +28,16 @@ Specifically targeted for high-concurrency rollout generation (4+ concurrent str
 ## Quickstart
 
 ### 1. Environment Setup
-```powershell
-python -m venv venv
-.\venv\Scripts\activate
+The cloud environment (e.g. Modal / Colab with NVIDIA Blackwell) already provides PyTorch compiled for CUDA. Do not overwrite torch. Simply install the standalone dependencies:
+```bash
+pip install --no-deps -e .
+# or install without modifying existing torch:
 pip install -r requirements.txt
 ```
 
-### 2. Run Benchmark
-```powershell
-python benchmark.py
-```
-
-### 3. Run 4-Concurrency Serving
-```powershell
-python serve.py --concurrency 4 --max-new-tokens 64
+### 2. Run 4-Concurrency Serving & Benchmark
+```bash
+python test/serve.py --model-id Qwen/Qwen3.5-9B-Instruct --load-in-4bit --max-new-tokens 64
 ```
 
 ---

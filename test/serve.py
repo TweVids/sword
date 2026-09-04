@@ -106,7 +106,12 @@ def run_colab_serving():
 
     # 2. Comparative Before vs After Speed Benchmark
     print("\n[*] Running comparative benchmark (BEFORE vs AFTER)...")
-    server.benchmark_before_after(prompts, max_new_tokens=args.max_new_tokens)
+    metrics = server.benchmark_before_after(prompts, max_new_tokens=args.max_new_tokens)
+    
+    import json
+    print("\n[Raw Metrics Summary]:")
+    print(json.dumps(metrics, indent=2))
+    return metrics
 
 
 if __name__ == "__main__":
