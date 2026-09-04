@@ -84,10 +84,11 @@ def main():
         print(f"[*] GPU : {torch.cuda.get_device_name(0)}")
         print(f"[*] VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
 
-    # 1. Load Model & Tokenizer
+    # 1. Load Model & Tokenizer / Processor
     print(f"\n[*] Loading model and tokenizer in 4-bit QLoRA mode via FastModel...")
+    processor = None
     if FastModel is not None:
-        model, tokenizer = FastModel.from_pretrained(
+        model, processor_or_tokenizer = FastModel.from_pretrained(
             model_name=CFG["model_id"],
             max_seq_length=CFG["max_seq_len"],
             dtype=torch.bfloat16,
@@ -96,6 +97,13 @@ def main():
             device_map={"": 0} if torch.cuda.is_available() else None,
             token=HF_TOKEN if HF_TOKEN else None,
         )
+        # Vision-Language models (e.g. Qwen3VLProcessor) wrap the underlying tokenizer
+        if hasattr(processor_or_tokenizer, "tokenizer") and processor_or_tokenizer.tokenizer is not None:
+            processor = processor_or_tokenizer
+            tokenizer = processor_or_tokenizer.tokenizer
+            print(f"[*] Detected multimodal processor ({processor.__class__.__name__}); extracted text tokenizer.")
+        else:
+            tokenizer = processor_or_tokenizer
     else:
         tokenizer = AutoTokenizer.from_pretrained(
             CFG["model_id"],
@@ -127,7 +135,8 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    print(f"[*] Tokenizer loaded. Vocab size: {len(tokenizer)}, EOS token: {tokenizer.eos_token}")
+    vocab_len = len(tokenizer) if hasattr(tokenizer, "__len__") else len(vocab)
+    print(f"[*] Tokenizer loaded. Vocab size: {vocab_len}, EOS token: {tokenizer.eos_token}")
 
     # Freeze vision/multimodal layers if present
     for name, param in model.named_parameters():
@@ -181,6 +190,7 @@ def main():
     # 7. Checkpoint Callback with automated HuggingFace upload & pruning
     checkpoint_cb = FullCheckpointCallback(
         tokenizer=tokenizer,
+        processor=processor,
         output_dir=CFG["output_dir"],
         save_steps=CFG["save_steps"],
         save_limit=CFG["save_limit"],
@@ -310,6 +320,11 @@ def main():
     else:
         model.save_pretrained(final_dir)
         tokenizer.save_pretrained(final_dir)
+    if processor is not None and hasattr(processor, "save_pretrained"):
+        try:
+            processor.save_pretrained(final_dir)
+        except Exception:
+            pass
     print(f"✅ Local final model saved: {final_dir}")
 
     # Optional final upload to HF Hub

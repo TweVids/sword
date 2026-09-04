@@ -246,8 +246,10 @@ class FullCheckpointCallback(TrainerCallback):
         save_limit: int = 2,
         hf_repo_id: Optional[str] = None,
         hf_token: Optional[str] = None,
+        processor: Optional[Any] = None,
     ):
         self.tokenizer = tokenizer
+        self.processor = processor
         self.output_dir = output_dir
         self.save_steps = save_steps
         self.save_limit = save_limit
@@ -283,12 +285,14 @@ class FullCheckpointCallback(TrainerCallback):
         step = state.global_step
         print(f"\n💾 [Sword] Saving full checkpoint at step {step} -> {ckpt_dir}")
 
-        # Save model and tokenizer
+        # Save model and tokenizer / processor
         try:
             if hasattr(model, "save_pretrained"):
                 model.save_pretrained(ckpt_dir)
             if self.tokenizer is not None and hasattr(self.tokenizer, "save_pretrained"):
                 self.tokenizer.save_pretrained(ckpt_dir)
+            if self.processor is not None and hasattr(self.processor, "save_pretrained"):
+                self.processor.save_pretrained(ckpt_dir)
             print("  ✅ LoRA weights & tokenizer saved.")
         except Exception as e:
             print(f"  ⚠️  LoRA/tokenizer save failed: {e}")
