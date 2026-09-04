@@ -52,6 +52,42 @@ def _fast_sdpa_attention(
     )
 
 
+def _vanilla_quadratic_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    dropout_p: float = 0.0,
+    is_causal: bool = True,
+    scale: Optional[float] = None,
+) -> torch.Tensor:
+    """
+    Standard O(N^2) quadratic attention mechanism.
+    Materializes the full [batch, heads, seq_len, seq_len] attention matrix in VRAM.
+    Used to demonstrate O(N^2) memory & latency explosion vs FlashAttention O(N).
+    """
+    bsz, num_heads, q_len, head_dim = query.shape
+    kv_len = key.shape[2]
+    if scale is None:
+        scale = head_dim ** -0.5
+
+    # Full quadratic N x N matrix multiplication: O(N^2) memory
+    scores = torch.matmul(query, key.transpose(-1, -2)) * scale
+
+    if is_causal and q_len > 1:
+        mask = torch.triu(torch.full((q_len, kv_len), float("-inf"), device=query.device, dtype=query.dtype), diagonal=1)
+        scores = scores + mask
+
+    if attention_mask is not None:
+        scores = scores + attention_mask
+
+    attn_probs = F.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
+    if dropout_p > 0.0:
+        attn_probs = F.dropout(attn_probs, p=dropout_p)
+
+    return torch.matmul(attn_probs, value)
+
+
 def make_patched_qwen_attention_forward(original_forward):
     """
     Wraps Qwen attention forward to route through our pure-PyTorch FlashAttention SDPA
@@ -170,16 +206,27 @@ def make_patched_qwen_attention_forward(original_forward):
             value_states = repeat_kv(value_states, num_groups)
 
         # -------------------------------------------------------------
-        # 5. Pure FlashAttention SDPA Kernel
+        # 5. Pure FlashAttention SDPA vs Quadratic Vanilla Attention
         # -------------------------------------------------------------
-        attn_output = _fast_sdpa_attention(
-            query_states,
-            key_states,
-            value_states,
-            attention_mask=attention_mask,
-            is_causal=is_causal and attention_mask is None,
-            scale=getattr(self, "scaling", None),
-        )
+        attn_mode = getattr(self, "_sword_attn_mode", "flash")
+        if attn_mode == "vanilla":
+            attn_output = _vanilla_quadratic_attention(
+                query_states,
+                key_states,
+                value_states,
+                attention_mask=attention_mask,
+                is_causal=is_causal and attention_mask is None,
+                scale=getattr(self, "scaling", None),
+            )
+        else:
+            attn_output = _fast_sdpa_attention(
+                query_states,
+                key_states,
+                value_states,
+                attention_mask=attention_mask,
+                is_causal=is_causal and attention_mask is None,
+                scale=getattr(self, "scaling", None),
+            )
 
         attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, q_len, -1)
 
@@ -193,7 +240,21 @@ def make_patched_qwen_attention_forward(original_forward):
     return patched_forward
 
 
-def patch_qwen(model):
+def set_attention_mode(model, mode: str = "flash"):
+    """
+    Sets attention execution mode across all patched layers:
+    - 'flash': Pure-PyTorch FlashAttention SDPA (O(N) memory, tiled SRAM)
+    - 'vanilla': Quadratic O(N^2) materialized attention matrix (for benchmarking)
+    """
+    count = 0
+    for name, module in model.named_modules():
+        if hasattr(module, "_sword_original_forward"):
+            module._sword_attn_mode = mode
+            count += 1
+    return count
+
+
+def patch_qwen(model, mode: str = "flash"):
     """
     Patches all full attention layers of Qwen (Qwen2, Qwen2.5, Qwen3, Qwen3.5)
     with Sword's pure FlashAttention SDPA kernel.
@@ -204,7 +265,28 @@ def patch_qwen(model):
         mod_type = module.__class__.__name__.lower()
         if "attention" in mod_type or "attn" in mod_type:
             if hasattr(module, "q_proj") and hasattr(module, "k_proj") and hasattr(module, "v_proj"):
-                module.forward = types.MethodType(make_patched_qwen_attention_forward(module.forward), module)
+                if not hasattr(module, "_sword_original_forward"):
+                    module._sword_original_forward = module.forward
+                module._sword_attn_mode = mode
+                module.forward = types.MethodType(make_patched_qwen_attention_forward(module._sword_original_forward), module)
                 patched_count += 1
-    print(f"[Sword] Patched {patched_count} attention modules with Pure FlashAttention SDPA.")
+    print(f"[Sword] Patched {patched_count} attention modules with Pure FlashAttention SDPA (mode='{mode}').")
+    return model
+
+
+def unpatch_qwen(model):
+    """
+    Restores all attention modules back to original unpatched forward methods.
+    """
+    unpatched_count = 0
+    for name, module in model.named_modules():
+        if hasattr(module, "_sword_original_forward"):
+            module.forward = module._sword_original_forward
+            delattr(module, "_sword_original_forward")
+            if hasattr(module, "_sword_attn_mode"):
+                delattr(module, "_sword_attn_mode")
+            if hasattr(module, "_sword_static_cache"):
+                delattr(module, "_sword_static_cache")
+            unpatched_count += 1
+    print(f"[Sword] Unpatched {unpatched_count} attention modules to original forward.")
     return model

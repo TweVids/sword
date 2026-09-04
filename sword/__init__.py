@@ -26,11 +26,12 @@ from .attention import PureFlashAttention, apply_rotary_pos_emb
 from .kv_cache import StaticKVCache
 from .model import FastTransformerModel, FastTransformerConfig
 from .engine import SpeedEngine
-from .patcher import patch_qwen
+from .patcher import patch_qwen, unpatch_qwen, set_attention_mode
 from .loader import load_qwen_model
 from .server import FastQwenServer
+from .finetune import benchmark_finetune_8k, apply_lora_to_model
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 print(f"[Sword] Version {__version__} loaded successfully.")
 
 __all__ = [
@@ -41,7 +42,11 @@ __all__ = [
     "FastTransformerConfig",
     "SpeedEngine",
     "patch_qwen",
+    "unpatch_qwen",
+    "set_attention_mode",
     "load_qwen_model",
     "FastQwenServer",
+    "benchmark_finetune_8k",
+    "apply_lora_to_model",
     "__version__",
 ]
