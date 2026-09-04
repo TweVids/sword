@@ -31,11 +31,11 @@ def _fix_transformers_fp8_quantizer_bug():
     """
     try:
         from transformers.quantizers.quantizer_finegrained_fp8 import FineGrainedFP8HfQuantizer
-        orig_fn = getattr(FineGrainedFP8HfQuantizer, "update_tp_plan", None)
-        if orig_fn is not None and not getattr(orig_fn, "_sword_patched", False):
-            def patched_update_tp_plan(self, config):
+        orig_update_tp_plan = getattr(FineGrainedFP8HfQuantizer, "update_tp_plan", None)
+        if orig_update_tp_plan is not None and not getattr(orig_update_tp_plan, "_sword_patched", False):
+            def patched_update_tp_plan(self, config, _orig=orig_update_tp_plan):
                 try:
-                    return orig_fn(self, config)
+                    return _orig(self, config)
                 except AttributeError as err:
                     if "'NoneType' object has no attribute 'get'" in str(err):
                         return config
@@ -49,8 +49,8 @@ def _fix_transformers_fp8_quantizer_bug():
         from transformers.integrations import finegrained_fp8
         for fn_name in ("fp8_grouped_mm_experts_forward", "fp8_batched_mm_experts_forward"):
             if hasattr(finegrained_fp8, fn_name):
-                orig_fn = getattr(finegrained_fp8, fn_name)
-                if not getattr(orig_fn, "_sword_patched", False):
+                orig_forward_fn = getattr(finegrained_fp8, fn_name)
+                if not getattr(orig_forward_fn, "_sword_patched", False):
                     def make_safe_wrapper(target_fn):
                         def safe_wrapper(self, *args, **kwargs):
                             if getattr(self, "activation_scheme", None) == "static":
@@ -66,7 +66,7 @@ def _fix_transformers_fp8_quantizer_bug():
                                     return orig_fwd(*args, **kwargs)
                                 raise
                         return safe_wrapper
-                    wrapped_fn = make_safe_wrapper(orig_fn)
+                    wrapped_fn = make_safe_wrapper(orig_forward_fn)
                     wrapped_fn._sword_patched = True
                     setattr(finegrained_fp8, fn_name, wrapped_fn)
     except Exception:
