@@ -34,13 +34,27 @@ def apply_rotary_pos_emb(
         cos = cos.squeeze(1).squeeze(0)[position_ids].unsqueeze(1)
         sin = sin.squeeze(1).squeeze(0)[position_ids].unsqueeze(1)
 
-    # Ensure cos and sin match the 4D shape [batch, 1, seq_len, head_dim] for proper broadcasting across heads
+    # Ensure cos and sin match the 4D shape [batch, 1, seq_len, rotary_dim] for proper broadcasting across heads
     while cos.ndim < q.ndim:
         cos = cos.unsqueeze(1)
         sin = sin.unsqueeze(1)
 
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+    rotary_dim = cos.shape[-1]
+    if rotary_dim < q.shape[-1]:
+        # Partial RoPE (e.g. Qwen 3.5 with partial_rotary_factor=0.25)
+        q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
+        k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
+
+        q_rot_embed = (q_rot * cos) + (rotate_half(q_rot) * sin)
+        k_rot_embed = (k_rot * cos) + (rotate_half(k_rot) * sin)
+
+        q_embed = torch.cat([q_rot_embed, q_pass], dim=-1)
+        k_embed = torch.cat([k_rot_embed, k_pass], dim=-1)
+    else:
+        # Full RoPE
+        q_embed = (q * cos) + (rotate_half(q) * sin)
+        k_embed = (k * cos) + (rotate_half(k) * sin)
+
     return q_embed, k_embed
 
 
