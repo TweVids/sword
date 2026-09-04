@@ -11,6 +11,7 @@ def load_qwen_model(
     load_in_8bit: bool = False,
     device_map: str = "auto",
     dtype: Optional[torch.dtype] = None,
+    max_seq_length: int = 8192,
     use_unsloth: bool = True,
 ) -> Tuple[object, object]:
     """
@@ -23,6 +24,7 @@ def load_qwen_model(
         load_in_8bit: Use 8-bit bitsandbytes quantization
         device_map: Hardware placement ('auto', 'cuda', etc.)
         dtype: Compute precision (defaults to bfloat16 if GPU supported)
+        max_seq_length: Maximum sequence context length (default 8192)
         use_unsloth: Whether to try Unsloth FastLanguageModel first on GPU
         
     Returns:
@@ -42,15 +44,18 @@ def load_qwen_model(
     if use_unsloth and torch.cuda.is_available():
         try:
             from unsloth import FastLanguageModel
-            print(f"[Sword] Loading {model_name_or_path} with Unsloth FastLanguageModel (4-bit={load_in_4bit})...")
+            print(f"[Sword] Loading {model_name_or_path} with Unsloth FastLanguageModel (4-bit={load_in_4bit}, max_seq={max_seq_length})...")
             model, _ = FastLanguageModel.from_pretrained(
                 model_name=model_name_or_path,
-                max_seq_length=4096,
+                max_seq_length=max_seq_length,
                 dtype=dtype,
                 load_in_4bit=load_in_4bit,
             )
         except Exception as e:
-            print(f"[Sword] Unsloth load skipped ({e}). Falling back to Transformers + BitsAndBytes...")
+            err_msg = str(e)
+            print(f"[Sword] Unsloth load skipped ({err_msg}). Falling back to Transformers + BitsAndBytes...")
+            if "torchvision" in err_msg.lower():
+                print("[Sword] Tip: Run `pip install torchvision` to enable Unsloth vision/multimodal support.")
 
     # Standard Transformers + BitsAndBytes fallback / direct loader
     if model is None:
