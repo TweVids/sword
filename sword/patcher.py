@@ -27,39 +27,17 @@ def _fast_sdpa_attention(
     value: torch.Tensor,
     attention_mask: Optional[torch.Tensor] = None,
     dropout_p: float = 0.0,
-    is_causal: bool = True,
+    is_causal: bool = False,
     scale: Optional[float] = None,
-    enable_gqa: bool = False,
 ) -> torch.Tensor:
     """
     Pure-PyTorch Fast SDPA Attention kernel.
     Dispatches directly to FLASH_ATTENTION / EFFICIENT_ATTENTION on modern hardware (e.g. Blackwell).
-    Supports native zero-allocation GQA on PyTorch 2.6+.
     """
-    if not query.is_contiguous():
-        query = query.contiguous()
-    if not key.is_contiguous():
-        key = key.contiguous()
-    if not value.is_contiguous():
-        value = value.contiguous()
-    if attention_mask is not None and not attention_mask.is_contiguous():
-        attention_mask = attention_mask.contiguous()
-
-    if enable_gqa:
-        try:
-            return F.scaled_dot_product_attention(
-                query, key, value,
-                attn_mask=attention_mask,
-                dropout_p=dropout_p,
-                is_causal=is_causal and attention_mask is None,
-                scale=scale,
-                enable_gqa=True,
-            )
-        except TypeError:
-            pass
-
     return F.scaled_dot_product_attention(
-        query, key, value,
+        query,
+        key,
+        value,
         attn_mask=attention_mask,
         dropout_p=dropout_p,
         is_causal=is_causal and attention_mask is None,
@@ -134,15 +112,27 @@ def make_patched_attention_forward(original_forward):
         key_raw = self.k_proj(hidden_states)
         value_raw = self.v_proj(hidden_states)
 
-        cfg = getattr(self, "config", None)
-        t_cfg = getattr(cfg, "text_config", cfg)
-
-        num_heads = getattr(self, "num_heads", getattr(self, "num_attention_heads", getattr(t_cfg, "num_attention_heads", 16)))
-        num_kv_heads = getattr(self, "num_key_value_heads", getattr(t_cfg, "num_key_value_heads", num_heads))
-        head_dim = getattr(self, "head_dim", getattr(t_cfg, "head_dim", None))
-
-        if head_dim is None:
-            head_dim = key_raw.shape[-1] // num_kv_heads
+        # Cache model/head dimensions on module to eliminate per-token getattr overhead
+        num_heads = getattr(self, "_sword_num_heads", None)
+        if num_heads is None:
+            cfg = getattr(self, "config", None)
+            t_cfg = getattr(cfg, "text_config", cfg)
+            num_heads = getattr(self, "num_heads", getattr(self, "num_attention_heads", getattr(t_cfg, "num_attention_heads", 16)))
+            num_kv_heads = getattr(self, "num_key_value_heads", getattr(t_cfg, "num_key_value_heads", num_heads))
+            head_dim = getattr(self, "head_dim", getattr(t_cfg, "head_dim", None))
+            if head_dim is None:
+                head_dim = key_raw.shape[-1] // num_kv_heads
+            self._sword_num_heads = num_heads
+            self._sword_num_kv_heads = num_kv_heads
+            self._sword_head_dim = head_dim
+            self._sword_num_groups = num_heads // num_kv_heads
+            self._has_q_norm = hasattr(self, "q_norm") and self.q_norm is not None
+            self._has_k_norm = hasattr(self, "k_norm") and self.k_norm is not None
+            num_groups = self._sword_num_groups
+        else:
+            num_kv_heads = self._sword_num_kv_heads
+            head_dim = self._sword_head_dim
+            num_groups = self._sword_num_groups
 
         hidden_shape = (*input_shape, -1, head_dim)
         gate = None
@@ -160,12 +150,12 @@ def make_patched_attention_forward(original_forward):
             query_states = query_raw.view(hidden_shape)
 
         # Apply QK normalization if present
-        if hasattr(self, "q_norm") and self.q_norm is not None:
+        if self._has_q_norm:
             query_states = self.q_norm(query_states)
 
         hidden_shape_k = (*input_shape, -1, head_dim)
         key_states = key_raw.view(hidden_shape_k)
-        if hasattr(self, "k_norm") and self.k_norm is not None:
+        if self._has_k_norm:
             key_states = self.k_norm(key_states)
 
         value_states = value_raw.view(hidden_shape_k)
@@ -196,10 +186,7 @@ def make_patched_attention_forward(original_forward):
         # -------------------------------------------------------------
         is_causal = (q_len > 1)
         if static_cache is not None:
-            # Multi-level fallback to resolve exact start_pos
             start_pos = kwargs.get("start_pos", None)
-            if start_pos is None and "cache_position" in kwargs and kwargs["cache_position"] is not None:
-                start_pos = int(kwargs["cache_position"][0].item())
             if start_pos is None:
                 start_pos = getattr(static_cache, "current_pos", 0)
 
@@ -210,19 +197,18 @@ def make_patched_attention_forward(original_forward):
                 attention_mask = None
         elif past_key_values is not None and hasattr(past_key_values, "update"):
             key_states, value_states = past_key_values.update(key_states, value_states, layer_idx, kwargs)
-            # Also safe to drop causal mask in single-token decode with HF cache
             if q_len == 1:
                 is_causal = False
 
         # -------------------------------------------------------------
-        # 4. Pure FlashAttention SDPA (with Native Zero-Copy GQA)
+        # 4. Pure FlashAttention / Efficient Attention SDPA
         # -------------------------------------------------------------
-        num_groups = num_heads // num_kv_heads
+        if num_groups > 1:
+            key_states = repeat_kv(key_states, num_groups)
+            value_states = repeat_kv(value_states, num_groups)
+
         attn_mode = getattr(self, "_sword_attn_mode", "flash")
         if attn_mode == "vanilla":
-            if num_groups > 1:
-                key_states = repeat_kv(key_states, num_groups)
-                value_states = repeat_kv(value_states, num_groups)
             attn_output = _vanilla_quadratic_attention(
                 query_states,
                 key_states,
@@ -232,30 +218,14 @@ def make_patched_attention_forward(original_forward):
                 scale=getattr(self, "scaling", None),
             )
         else:
-            try:
-                # Native GQA in PyTorch SDPA (zero tensor allocations/copies)
-                attn_output = _fast_sdpa_attention(
-                    query_states,
-                    key_states,
-                    value_states,
-                    attention_mask=attention_mask,
-                    is_causal=is_causal and attention_mask is None,
-                    scale=getattr(self, "scaling", None),
-                    enable_gqa=(num_groups > 1),
-                )
-            except Exception:
-                # Fallback to repeat_kv if enable_gqa is unavailable
-                if num_groups > 1:
-                    key_states = repeat_kv(key_states, num_groups)
-                    value_states = repeat_kv(value_states, num_groups)
-                attn_output = _fast_sdpa_attention(
-                    query_states,
-                    key_states,
-                    value_states,
-                    attention_mask=attention_mask,
-                    is_causal=is_causal and attention_mask is None,
-                    scale=getattr(self, "scaling", None),
-                )
+            attn_output = _fast_sdpa_attention(
+                query_states,
+                key_states,
+                value_states,
+                attention_mask=attention_mask,
+                is_causal=is_causal and attention_mask is None,
+                scale=getattr(self, "scaling", None),
+            )
 
         attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, q_len, -1)
 
@@ -456,10 +426,9 @@ def unpatch_model(model):
         if hasattr(module, "_sword_original_forward"):
             module.forward = module._sword_original_forward
             delattr(module, "_sword_original_forward")
-            if hasattr(module, "_sword_attn_mode"):
-                delattr(module, "_sword_attn_mode")
-            if hasattr(module, "_sword_static_cache"):
-                delattr(module, "_sword_static_cache")
+            for attr in ("_sword_attn_mode", "_sword_static_cache", "_sword_num_heads", "_sword_num_kv_heads", "_sword_head_dim", "_sword_num_groups", "_has_q_norm", "_has_k_norm"):
+                if hasattr(module, attr):
+                    delattr(module, attr)
             unpatched_count += 1
     print(f"[Sword] Unpatched {unpatched_count} modules to original forward.")
     return model

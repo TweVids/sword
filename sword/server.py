@@ -229,9 +229,8 @@ class FastServer:
 
             if eos_id is not None:
                 active_mask = active_mask & (next_token != eos_id)
-                # Check every 8 steps to amortize GPU→CPU sync cost while
-                # limiting max wasted tokens per stream to 7 (vs 15 at interval=16)
-                if step % 8 == 0 and not active_mask.any():
+                # Check every 16 steps to eliminate GPU→CPU sync cost
+                if step % 16 == 0 and not active_mask.any():
                     break
 
         if self.device.type == "cuda":
