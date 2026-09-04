@@ -1,13 +1,14 @@
 """
-Sword: Pure-PyTorch High-Throughput Attention & Generation Engine.
-Designed for high-speed batched generation (4+ concurrency) on modern GPUs (e.g. NVIDIA Blackwell)
-without fragile external C++/CUDA dependencies like flash-attn or vLLM.
+Sword: Pure-PyTorch High-Throughput Attention & Generation Speed Engine.
 """
 
 from .attention import PureFlashAttention, apply_rotary_pos_emb
 from .kv_cache import StaticKVCache
 from .model import FastTransformerModel, FastTransformerConfig
 from .engine import SpeedEngine
+from .patcher import patch_qwen
+from .loader import load_qwen_model
+from .server import FastQwenServer
 
 __all__ = [
     "PureFlashAttention",
@@ -16,4 +17,7 @@ __all__ = [
     "FastTransformerModel",
     "FastTransformerConfig",
     "SpeedEngine",
+    "patch_qwen",
+    "load_qwen_model",
+    "FastQwenServer",
 ]

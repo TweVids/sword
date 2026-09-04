@@ -34,6 +34,11 @@ def apply_rotary_pos_emb(
         cos = cos.squeeze(1).squeeze(0)[position_ids].unsqueeze(1)
         sin = sin.squeeze(1).squeeze(0)[position_ids].unsqueeze(1)
 
+    # Ensure cos and sin match the 4D shape [batch, 1, seq_len, head_dim] for proper broadcasting across heads
+    while cos.ndim < q.ndim:
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
