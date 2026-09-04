@@ -46,6 +46,7 @@ def make_patched_qwen_attention_forward(original_forward):
     """
     Wraps Qwen attention forward to route through our pure-PyTorch FlashAttention SDPA
     and support static KV caching, preserving bitsandbytes 4-bit/8-bit linear projections.
+    Natively supports both standard Qwen (Qwen2/2.5) and Qwen3.5 (QK-norm + gated attention).
     """
     def patched_forward(
         self,
@@ -55,33 +56,63 @@ def make_patched_qwen_attention_forward(original_forward):
         past_key_values=None,
         **kwargs,
     ):
-        # If custom static cache is attached to self or passed in kwargs
         static_cache = getattr(self, "_sword_static_cache", None) or kwargs.get("sword_static_cache", None)
         layer_idx = getattr(self, "layer_idx", 0)
 
         bsz, q_len, _ = hidden_states.shape
+        input_shape = hidden_states.shape[:-1]
 
-        # Linear projections (works transparently with bitsandbytes Linear4bit / Linear8bitLt or standard Linear)
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
+        # -------------------------------------------------------------
+        # 1. Qwen 3.5 vs Standard Qwen Projections
+        # -------------------------------------------------------------
+        if hasattr(self, "q_norm") and hasattr(self, "head_dim"):
+            # Qwen 3.5 architecture: q_proj produces [query, gate], plus q_norm & k_norm
+            head_dim = self.head_dim
+            hidden_shape = (*input_shape, -1, head_dim)
+            
+            query_states, gate = torch.chunk(
+                self.q_proj(hidden_states).view(*input_shape, -1, head_dim * 2), 2, dim=-1
+            )
+            gate = gate.reshape(*input_shape, -1)
 
-        cfg = getattr(self, "config", None)
-        num_heads = getattr(self, "num_heads", getattr(self, "num_attention_heads", getattr(cfg, "num_attention_heads", 16)))
-        num_kv_heads = getattr(self, "num_key_value_heads", getattr(cfg, "num_key_value_heads", num_heads))
-        head_dim = getattr(self, "head_dim", getattr(cfg, "head_dim", query_states.shape[-1] // num_heads))
+            query_states = self.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
+            key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+            value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
-        query_states = query_states.view(bsz, q_len, num_heads, head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, num_kv_heads, head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, num_kv_heads, head_dim).transpose(1, 2)
+            num_heads = query_states.shape[1]
+            num_kv_heads = key_states.shape[1]
+        else:
+            # Standard Qwen / Qwen2 / Qwen2.5 architecture
+            gate = None
+            cfg = getattr(self, "config", None)
+            t_cfg = getattr(cfg, "text_config", cfg)
 
-        # Apply RoPE if position_embeddings provided
+            num_heads = getattr(self, "num_heads", getattr(self, "num_attention_heads", getattr(t_cfg, "num_attention_heads", 16)))
+            num_kv_heads = getattr(self, "num_key_value_heads", getattr(t_cfg, "num_key_value_heads", num_heads))
+            head_dim = getattr(self, "head_dim", getattr(t_cfg, "head_dim", None))
+
+            query_states = self.q_proj(hidden_states)
+            key_states = self.k_proj(hidden_states)
+            value_states = self.v_proj(hidden_states)
+
+            if head_dim is None:
+                head_dim = query_states.shape[-1] // num_heads
+
+            query_states = query_states.view(bsz, q_len, num_heads, head_dim).transpose(1, 2)
+            key_states = key_states.view(bsz, q_len, num_kv_heads, head_dim).transpose(1, 2)
+            value_states = value_states.view(bsz, q_len, num_kv_heads, head_dim).transpose(1, 2)
+
+        # -------------------------------------------------------------
+        # 2. Rotary Position Embeddings (RoPE)
+        # -------------------------------------------------------------
         if position_embeddings is not None:
             cos, sin = position_embeddings
             from .attention import apply_rotary_pos_emb
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        # Handle static KV Cache if active
+        # -------------------------------------------------------------
+        # 3. KV Cache update (Static zero-allocation or dynamic fallback)
+        # -------------------------------------------------------------
         is_causal = (q_len > 1)
         if static_cache is not None:
             start_pos = kwargs.get("start_pos", 0)
@@ -91,13 +122,17 @@ def make_patched_qwen_attention_forward(original_forward):
         elif past_key_values is not None and hasattr(past_key_values, "update"):
             key_states, value_states = past_key_values.update(key_states, value_states, layer_idx, kwargs)
 
-        # GQA expansion
+        # -------------------------------------------------------------
+        # 4. Grouped-Query Attention (GQA) KV Expansion
+        # -------------------------------------------------------------
         num_groups = num_heads // num_kv_heads
         if num_groups > 1:
             key_states = key_states.repeat_interleave(num_groups, dim=1)
             value_states = value_states.repeat_interleave(num_groups, dim=1)
 
-        # Dispatch via our Pure FlashAttention SDPA
+        # -------------------------------------------------------------
+        # 5. Pure FlashAttention SDPA Kernel
+        # -------------------------------------------------------------
         attn_output = _fast_sdpa_attention(
             query_states,
             key_states,
@@ -107,8 +142,12 @@ def make_patched_qwen_attention_forward(original_forward):
         )
 
         attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, q_len, -1)
-        attn_output = self.o_proj(attn_output)
 
+        # Apply Qwen 3.5 sigmoid gate if present
+        if gate is not None:
+            attn_output = attn_output * torch.sigmoid(gate)
+
+        attn_output = self.o_proj(attn_output)
         return (attn_output, None)
 
     return patched_forward
@@ -116,7 +155,7 @@ def make_patched_qwen_attention_forward(original_forward):
 
 def patch_qwen(model):
     """
-    Patches all attention layers of a Qwen (Qwen2, Qwen2.5, Qwen3, Qwen3.5) model
+    Patches all full attention layers of Qwen (Qwen2, Qwen2.5, Qwen3, Qwen3.5)
     with Sword's pure FlashAttention SDPA kernel.
     Preserves all weights and quantization (bitsandbytes 4-bit/8-bit).
     """

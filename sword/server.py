@@ -23,17 +23,20 @@ class FastQwenServer:
     ):
         self.model = model
         self.tokenizer = tokenizer
+        if hasattr(self.tokenizer, "padding_side"):
+            self.tokenizer.padding_side = "left"
         self.max_concurrency = max_concurrency
         self.max_seq_len = max_seq_len
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
-        # Model configuration attributes
+        # Model configuration attributes (support both standard and multimodal text_config)
         cfg = getattr(model, "config", None)
-        num_layers = getattr(cfg, "num_hidden_layers", 16)
-        num_kv_heads = getattr(cfg, "num_key_value_heads", getattr(cfg, "num_attention_heads", 16))
-        hidden_size = getattr(cfg, "hidden_size", 2048)
-        num_heads = getattr(cfg, "num_attention_heads", 16)
-        head_dim = getattr(cfg, "head_dim", hidden_size // num_heads)
+        t_cfg = getattr(cfg, "text_config", cfg)
+        num_layers = getattr(t_cfg, "num_hidden_layers", 16)
+        num_kv_heads = getattr(t_cfg, "num_key_value_heads", getattr(t_cfg, "num_attention_heads", 16))
+        hidden_size = getattr(t_cfg, "hidden_size", 4096)
+        num_heads = getattr(t_cfg, "num_attention_heads", 16)
+        head_dim = getattr(t_cfg, "head_dim", hidden_size // num_heads)
         dtype = getattr(model, "dtype", torch.bfloat16)
 
         # Allocate Static KV Cache for zero-allocation decode
