@@ -70,7 +70,7 @@ def load_qwen_model(
             model_name_or_path,
             quantization_config=quant_config,
             device_map=device_map if torch.cuda.is_available() else None,
-            torch_dtype=dtype,
+            dtype=dtype,
             trust_remote_code=True,
         )
 
