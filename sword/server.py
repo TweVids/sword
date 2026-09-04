@@ -319,6 +319,11 @@ class FastServer:
             if hasattr(module, "q_proj") and hasattr(module, "k_proj"):
                 module._sword_static_cache = self.static_cache
 
+        # Warm up Sword Speed Engine so first-call JIT kernel initialization does not distort metrics
+        if self.device.type == "cuda":
+            _ = self.serve(prompts, max_new_tokens=2, temperature=0.0)
+            torch.cuda.synchronize()
+
         after_results = self.serve(prompts, max_new_tokens=max_new_tokens, temperature=0.0)
         after_time = after_results["latency_s"]
         after_tokens = after_results["total_tokens"]

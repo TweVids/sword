@@ -29,11 +29,12 @@ def _fast_sdpa_attention(
     dropout_p: float = 0.0,
     is_causal: bool = True,
     scale: Optional[float] = None,
+    enable_gqa: bool = False,
 ) -> torch.Tensor:
     """
     Pure-PyTorch Fast SDPA Attention kernel.
     Dispatches directly to FLASH_ATTENTION / EFFICIENT_ATTENTION on modern hardware (e.g. Blackwell).
-    Eliminates context-manager overhead and avoids redundant memory copies.
+    Supports native zero-allocation GQA on PyTorch 2.6+.
     """
     if not query.is_contiguous():
         query = query.contiguous()
@@ -43,6 +44,19 @@ def _fast_sdpa_attention(
         value = value.contiguous()
     if attention_mask is not None and not attention_mask.is_contiguous():
         attention_mask = attention_mask.contiguous()
+
+    if enable_gqa:
+        try:
+            return F.scaled_dot_product_attention(
+                query, key, value,
+                attn_mask=attention_mask,
+                dropout_p=dropout_p,
+                is_causal=is_causal and attention_mask is None,
+                scale=scale,
+                enable_gqa=True,
+            )
+        except TypeError:
+            pass
 
     return F.scaled_dot_product_attention(
         query, key, value,
@@ -201,18 +215,14 @@ def make_patched_attention_forward(original_forward):
                 is_causal = False
 
         # -------------------------------------------------------------
-        # 4. Grouped-Query Attention (GQA) KV Expansion
+        # 4. Pure FlashAttention SDPA (with Native Zero-Copy GQA)
         # -------------------------------------------------------------
         num_groups = num_heads // num_kv_heads
-        if num_groups > 1:
-            key_states = repeat_kv(key_states, num_groups)
-            value_states = repeat_kv(value_states, num_groups)
-
-        # -------------------------------------------------------------
-        # 5. Pure FlashAttention SDPA vs Quadratic Vanilla Attention
-        # -------------------------------------------------------------
         attn_mode = getattr(self, "_sword_attn_mode", "flash")
         if attn_mode == "vanilla":
+            if num_groups > 1:
+                key_states = repeat_kv(key_states, num_groups)
+                value_states = repeat_kv(value_states, num_groups)
             attn_output = _vanilla_quadratic_attention(
                 query_states,
                 key_states,
@@ -222,14 +232,30 @@ def make_patched_attention_forward(original_forward):
                 scale=getattr(self, "scaling", None),
             )
         else:
-            attn_output = _fast_sdpa_attention(
-                query_states,
-                key_states,
-                value_states,
-                attention_mask=attention_mask,
-                is_causal=is_causal and attention_mask is None,
-                scale=getattr(self, "scaling", None),
-            )
+            try:
+                # Native GQA in PyTorch SDPA (zero tensor allocations/copies)
+                attn_output = _fast_sdpa_attention(
+                    query_states,
+                    key_states,
+                    value_states,
+                    attention_mask=attention_mask,
+                    is_causal=is_causal and attention_mask is None,
+                    scale=getattr(self, "scaling", None),
+                    enable_gqa=(num_groups > 1),
+                )
+            except Exception:
+                # Fallback to repeat_kv if enable_gqa is unavailable
+                if num_groups > 1:
+                    key_states = repeat_kv(key_states, num_groups)
+                    value_states = repeat_kv(value_states, num_groups)
+                attn_output = _fast_sdpa_attention(
+                    query_states,
+                    key_states,
+                    value_states,
+                    attention_mask=attention_mask,
+                    is_causal=is_causal and attention_mask is None,
+                    scale=getattr(self, "scaling", None),
+                )
 
         attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, q_len, -1)
 
@@ -332,19 +358,33 @@ def make_fast_moe_forward(original_forward):
 def patch_moe_experts(model):
     """
     Patches MoE expert routing layers (FP8Experts, HYV3Experts)
-    with Sword's Zero-Sync Fast MoE Forward.
-    Eliminates PCIe host-device synchronization stalls (nonzero & torch.where).
+    with Sword's Zero-Sync Fast MoE Forward ONLY when running in eager mode.
+    When grouped_mm, batched_mm, or deepgemm is active, preserves the fused
+    kernel which executes all experts in a single GPU launch per layer.
     """
     patched_count = 0
+    fused_count = 0
     for name, module in model.named_modules():
         mod_type = module.__class__.__name__
         if mod_type in ("FP8Experts", "HYV3Experts") or name.endswith(".experts"):
+            cfg = getattr(module, "config", getattr(model, "config", None))
+            impl = getattr(cfg, "_experts_implementation", None)
+            # Fused kernels (grouped_mm, batched_mm, deepgemm) run at hardware speed!
+            if impl in ("grouped_mm", "batched_mm", "deepgemm", "deepgemm_megamoe"):
+                # Always register fast fallback in case fused kernel throws at runtime
+                if not hasattr(module, "_sword_fast_forward"):
+                    module._sword_fast_forward = types.MethodType(make_fast_moe_forward(module.forward), module)
+                fused_count += 1
+                continue
+
             if not hasattr(module, "_sword_original_forward"):
                 module._sword_original_forward = module.forward
             module.forward = types.MethodType(make_fast_moe_forward(module._sword_original_forward), module)
             patched_count += 1
+    if fused_count > 0:
+        print(f"[Sword] Preserving {fused_count} MoE layers with fused '{impl}' kernels (hardware tensor core speed).")
     if patched_count > 0:
-        print(f"[Sword] Patched {patched_count} MoE expert routing modules with Zero-Sync Fast Dispatch (172x faster routing).")
+        print(f"[Sword] Patched {patched_count} MoE expert routing modules with Zero-Sync Fast Dispatch (eager mode).")
     return model
 
 
