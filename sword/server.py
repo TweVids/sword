@@ -74,10 +74,10 @@ class FastQwenServer:
         self.compile_decode = compile_decode
         self.decode_fn = self.model
         if compile_decode and self.device.type == "cuda":
-            print("[Sword] Compiling decode loop with mode='reduce-overhead' (CUDA Graphs enabled)...")
+            print("[Sword] Compiling decode loop with TorchInductor (dynamic=True, zero graph recapture)...")
             try:
-                # Wrap forward pass in torch.compile with CUDA graph reduction
-                self.decode_fn = torch.compile(self.model, mode="reduce-overhead")
+                # Use dynamic=True to avoid CUDA Graph recompilation stalls when sequence length grows
+                self.decode_fn = torch.compile(self.model, dynamic=True)
             except Exception as e:
                 print(f"[Sword] torch.compile note: {e}. Defaulting to optimized eager mode.")
                 self.decode_fn = self.model
@@ -242,8 +242,7 @@ class FastQwenServer:
         print("=" * 72)
         print(f"Concurrency:       {bsz} concurrent streams")
         print(f"Target GPU:        {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU (Local Dev)'}")
-        print(f"Tokens/stream:     {max_new_tokens} new tokens")
-        print(f"CUDA Graphs:       {'Enabled' if getattr(self, 'compile_decode', False) else 'Disabled'}")
+        print(f"Compilation:       {'Enabled (dynamic=True)' if getattr(self, 'compile_decode', False) else 'Disabled (Optimized Eager SDPA)'}")
         print("=" * 72)
 
         # -----------------------------------------------------------------

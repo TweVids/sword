@@ -30,7 +30,7 @@ from .patcher import patch_qwen
 from .loader import load_qwen_model
 from .server import FastQwenServer
 
-__version__ = "0.1.9"
+__version__ = "0.2.0"
 print(f"[Sword] Version {__version__} loaded successfully.")
 
 __all__ = [
