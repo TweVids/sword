@@ -63,44 +63,49 @@ def make_patched_qwen_attention_forward(original_forward):
         input_shape = hidden_states.shape[:-1]
 
         # -------------------------------------------------------------
-        # 1. Qwen 3.5 vs Standard Qwen Projections
+        # 1. Dynamic Q/K/V Projections (handles standard Qwen and Qwen3.5)
         # -------------------------------------------------------------
-        if hasattr(self, "q_norm") and hasattr(self, "head_dim"):
-            # Qwen 3.5 architecture: q_proj produces [query, gate], plus q_norm & k_norm
-            head_dim = self.head_dim
-            hidden_shape = (*input_shape, -1, head_dim)
-            
-            query_states, gate = torch.chunk(
-                self.q_proj(hidden_states).view(*input_shape, -1, head_dim * 2), 2, dim=-1
-            )
+        query_raw = self.q_proj(hidden_states)
+        key_raw = self.k_proj(hidden_states)
+        value_raw = self.v_proj(hidden_states)
+
+        cfg = getattr(self, "config", None)
+        t_cfg = getattr(cfg, "text_config", cfg)
+
+        num_heads = getattr(self, "num_heads", getattr(self, "num_attention_heads", getattr(t_cfg, "num_attention_heads", 16)))
+        num_kv_heads = getattr(self, "num_key_value_heads", getattr(t_cfg, "num_key_value_heads", num_heads))
+        head_dim = getattr(self, "head_dim", getattr(t_cfg, "head_dim", None))
+
+        if head_dim is None:
+            head_dim = key_raw.shape[-1] // num_kv_heads
+
+        expected_q_dim = num_heads * head_dim
+        gate = None
+        # Qwen 3.5 has dual projection [query, gate] where output features == 2 * num_heads * head_dim
+        if query_raw.shape[-1] == expected_q_dim * 2:
+            query_states, gate = torch.chunk(query_raw, 2, dim=-1)
             gate = gate.reshape(*input_shape, -1)
-
-            query_states = self.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
-            key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-            value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-
-            num_heads = query_states.shape[1]
-            num_kv_heads = key_states.shape[1]
         else:
-            # Standard Qwen / Qwen2 / Qwen2.5 architecture
-            gate = None
-            cfg = getattr(self, "config", None)
-            t_cfg = getattr(cfg, "text_config", cfg)
+            query_states = query_raw
 
-            num_heads = getattr(self, "num_heads", getattr(self, "num_attention_heads", getattr(t_cfg, "num_attention_heads", 16)))
-            num_kv_heads = getattr(self, "num_key_value_heads", getattr(t_cfg, "num_key_value_heads", num_heads))
-            head_dim = getattr(self, "head_dim", getattr(t_cfg, "head_dim", None))
+        # Apply QK normalization if present
+        hidden_shape_q = (*input_shape, -1, head_dim)
+        if hasattr(self, "q_norm"):
+            query_states = self.q_norm(query_states.view(hidden_shape_q))
+        else:
+            query_states = query_states.view(hidden_shape_q)
 
-            query_states = self.q_proj(hidden_states)
-            key_states = self.k_proj(hidden_states)
-            value_states = self.v_proj(hidden_states)
+        hidden_shape_k = (*input_shape, -1, head_dim)
+        if hasattr(self, "k_norm"):
+            key_states = self.k_norm(key_raw.view(hidden_shape_k))
+        else:
+            key_states = key_raw.view(hidden_shape_k)
 
-            if head_dim is None:
-                head_dim = query_states.shape[-1] // num_heads
+        value_states = value_raw.view(*input_shape, -1, head_dim)
 
-            query_states = query_states.view(bsz, q_len, num_heads, head_dim).transpose(1, 2)
-            key_states = key_states.view(bsz, q_len, num_kv_heads, head_dim).transpose(1, 2)
-            value_states = value_states.view(bsz, q_len, num_kv_heads, head_dim).transpose(1, 2)
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
 
         # -------------------------------------------------------------
         # 2. Rotary Position Embeddings (RoPE)
