@@ -144,10 +144,11 @@ class PureFlashAttention(nn.Module):
             if seq_len == 1 and start_pos > 0:
                 is_causal = False
 
-        # Grouped-Query Attention (GQA) KV head expansion
+        # Grouped-Query Attention (GQA) KV head expansion — zero-copy expand+reshape
         if self.num_key_value_groups > 1:
-            k = k.repeat_interleave(self.num_key_value_groups, dim=1)
-            v = v.repeat_interleave(self.num_key_value_groups, dim=1)
+            bsz_, num_kv, slen, hdim = k.shape
+            k = k[:, :, None, :, :].expand(bsz_, num_kv, self.num_key_value_groups, slen, hdim).reshape(bsz_, num_kv * self.num_key_value_groups, slen, hdim)
+            v = v[:, :, None, :, :].expand(bsz_, num_kv, self.num_key_value_groups, slen, hdim).reshape(bsz_, num_kv * self.num_key_value_groups, slen, hdim)
 
         # Fast Attention via PyTorch Native SDPA
         # Enforce FlashAttention backend on CUDA when available

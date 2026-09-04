@@ -75,7 +75,8 @@ def load_qwen_model(
             model_name_or_path,
             quantization_config=quant_config,
             device_map=device_map if torch.cuda.is_available() else None,
-            dtype=dtype,
+            # Only pass torch_dtype for non-quantized loads; quantization_config controls dtype for 4/8-bit
+            torch_dtype=dtype if quant_config is None else None,
             trust_remote_code=True,
         )
 

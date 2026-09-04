@@ -164,7 +164,6 @@ class FastQwenServer:
         generated = [next_token]
         curr_pos = prompt_len
         self.static_cache.set_pos(curr_pos)
-        tokens_per_stream = [1] * bsz
         eos_id = getattr(self.tokenizer, "eos_token_id", None)
         active_mask = torch.ones((bsz, 1), dtype=torch.bool, device=self.device)
 
@@ -197,8 +196,9 @@ class FastQwenServer:
 
             if eos_id is not None:
                 active_mask = active_mask & (next_token != eos_id)
-                # Check for all streams finished every 16 tokens to avoid interrupting GPU pipeline
-                if step % 16 == 0 and not active_mask.any():
+                # Check every 8 steps to amortize GPU→CPU sync cost while
+                # limiting max wasted tokens per stream to 7 (vs 15 at interval=16)
+                if step % 8 == 0 and not active_mask.any():
                     break
 
         if self.device.type == "cuda":

@@ -3,6 +3,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.attention import sdpa_kernel, SDPBackend
 from typing import Optional, Tuple
+from .attention import apply_rotary_pos_emb
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -160,7 +161,6 @@ def make_patched_qwen_attention_forward(original_forward):
         # -------------------------------------------------------------
         if position_embeddings is not None:
             cos, sin = position_embeddings
-            from .attention import apply_rotary_pos_emb
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
         elif hasattr(self, "rotary_emb"):
             start_pos_val = kwargs.get("start_pos", getattr(static_cache, "current_pos", 0) if static_cache else 0)
@@ -171,7 +171,6 @@ def make_patched_qwen_attention_forward(original_forward):
                 cos, sin = self.rotary_emb(value_states, pos_ids)
             except TypeError:
                 cos, sin = self.rotary_emb(value_states, seq_len=start_pos_val + q_len)
-            from .attention import apply_rotary_pos_emb
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         # -------------------------------------------------------------
@@ -187,15 +186,15 @@ def make_patched_qwen_attention_forward(original_forward):
                 start_pos = getattr(static_cache, "current_pos", 0)
 
             key_states, value_states = static_cache.update(layer_idx, key_states, value_states, start_pos)
+            # Single-token decode: Q attends to all cached K/V, causal mask is not needed
             if q_len == 1:
                 is_causal = False
                 attention_mask = None
         elif past_key_values is not None and hasattr(past_key_values, "update"):
             key_states, value_states = past_key_values.update(key_states, value_states, layer_idx, kwargs)
-
-        if q_len == 1:
-            is_causal = False
-            attention_mask = None
+            # Also safe to drop causal mask in single-token decode with HF cache
+            if q_len == 1:
+                is_causal = False
 
         # -------------------------------------------------------------
         # 4. Grouped-Query Attention (GQA) KV Expansion

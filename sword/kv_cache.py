@@ -18,8 +18,10 @@ class StaticKVCache:
         max_seq_len: int,
         head_dim: int,
         dtype: torch.dtype = torch.bfloat16,
-        device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+        device: Optional[torch.device] = None,
     ):
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.num_layers = num_layers
         self.max_batch_size = max_batch_size
         self.num_kv_heads = num_kv_heads

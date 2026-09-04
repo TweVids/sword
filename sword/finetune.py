@@ -65,7 +65,7 @@ def apply_lora_to_model(model: nn.Module, r: int = 16, lora_alpha: int = 32) -> 
             task_type="CAUSAL_LM",
         )
         peft_model = get_peft_model(model, config)
-        print("[Sword] Applied LoRA via PEFT (r=16, alpha=32).")
+        print(f"[Sword] Applied LoRA via PEFT (r={r}, alpha={lora_alpha}).")
         return peft_model
     except Exception:
         pass
