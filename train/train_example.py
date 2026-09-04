@@ -192,14 +192,26 @@ def main():
         seed=CFG["seed"],
     )
 
-    trainer = SFTTrainer(
-        model=model,
-        tokenizer=tokenizer,
-        train_dataset=train_ds,
-        eval_dataset=eval_ds,
-        args=training_args,
-        callbacks=[checkpoint_cb],
-    )
+    # TRL ≥0.12 renamed `tokenizer` → `processing_class`; support both versions
+    try:
+        trainer = SFTTrainer(
+            model=model,
+            processing_class=tokenizer,
+            train_dataset=train_ds,
+            eval_dataset=eval_ds,
+            args=training_args,
+            callbacks=[checkpoint_cb],
+        )
+    except TypeError:
+        # Fallback for older TRL that still uses `tokenizer`
+        trainer = SFTTrainer(
+            model=model,
+            tokenizer=tokenizer,
+            train_dataset=train_ds,
+            eval_dataset=eval_ds,
+            args=training_args,
+            callbacks=[checkpoint_cb],
+        )
     checkpoint_cb.trainer = trainer
 
     # Apply instruction/response masking

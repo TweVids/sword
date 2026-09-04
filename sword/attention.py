@@ -3,7 +3,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
-from torch.nn.attention import sdpa_kernel, SDPBackend
 from .kv_cache import StaticKVCache
 
 
@@ -150,33 +149,21 @@ class PureFlashAttention(nn.Module):
             k = k[:, :, None, :, :].expand(bsz_, num_kv, self.num_key_value_groups, slen, hdim).reshape(bsz_, num_kv * self.num_key_value_groups, slen, hdim)
             v = v[:, :, None, :, :].expand(bsz_, num_kv, self.num_key_value_groups, slen, hdim).reshape(bsz_, num_kv * self.num_key_value_groups, slen, hdim)
 
-        # Fast Attention via PyTorch Native SDPA
-        # Enforce FlashAttention backend on CUDA when available
-        if hidden_states.is_cuda:
-            try:
-                with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]):
-                    attn_output = F.scaled_dot_product_attention(
-                        q, k, v,
-                        attn_mask=attn_mask,
-                        dropout_p=self.dropout_p if self.training else 0.0,
-                        is_causal=is_causal and attn_mask is None,
-                    )
-            except Exception:
-                # Graceful fallback if specific kernel constraints (e.g. sequence alignment) fail
-                attn_output = F.scaled_dot_product_attention(
-                    q, k, v,
-                    attn_mask=attn_mask,
-                    dropout_p=self.dropout_p if self.training else 0.0,
-                    is_causal=is_causal and attn_mask is None,
-                )
-        else:
-            # Fallback for CPU / development
-            attn_output = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=attn_mask,
-                dropout_p=self.dropout_p if self.training else 0.0,
-                is_causal=is_causal and attn_mask is None,
-            )
+        # Fast Attention via PyTorch Native SDPA.
+        # Let PyTorch's own dispatcher pick the best backend (FlashAttention, efficient, math).
+        # Matches patcher.py behavior — no backend constraint needed; contiguous ensures FA2 eligibility.
+        if not q.is_contiguous():
+            q = q.contiguous()
+        if not k.is_contiguous():
+            k = k.contiguous()
+        if not v.is_contiguous():
+            v = v.contiguous()
+        attn_output = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attn_mask,
+            dropout_p=self.dropout_p if self.training else 0.0,
+            is_causal=is_causal and attn_mask is None,
+        )
 
         # Reshape back: [bsz, seq_len, num_attention_heads * head_dim]
         attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
