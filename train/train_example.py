@@ -60,10 +60,10 @@ DATASET_DRIVE_URL = os.environ.get("DATASET_DRIVE_URL", "")
 RESUME_FROM_HF_CHECKPOINT = ""
 
 CFG = dict(
-    model_id="huihui-ai/Huihui-Qwen3.8-27B-abliterated",  # Or your target Qwen model
-    dataset_main="/marimo/dataset_3_8_formatted_offline.jsonl",
+    model_id="model-name",  # Or your target Qwen model
+    dataset_main="whenever is this as a path",
     output_dir="sft-qat-27b",
-    max_seq_len=7500,
+    max_seq_len=7500, # how much token you want to train w
     num_epochs=1,
     per_device_bs=4,
     grad_accum=8,
@@ -202,7 +202,7 @@ def main():
     sft_config_kwargs = dict(
         dataset_text_field="text",
         packing=True,
-        max_seq_length=CFG["max_seq_len"],
+        max_length=CFG["max_seq_len"], #max_length instead
         output_dir=CFG["output_dir"],
         num_train_epochs=CFG["num_epochs"],
         per_device_train_batch_size=CFG["per_device_bs"],
