@@ -30,7 +30,7 @@ from .patcher import patch_qwen
 from .loader import load_qwen_model
 from .server import FastQwenServer
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 __all__ = [
     "PureFlashAttention",

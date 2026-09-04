@@ -65,7 +65,7 @@ structlog==26.1.0
 sympy==1.14.0
 tokenizers==0.22.2
 tqdm==4.70.0
-transformers==5.5.0
+git+https://github.com/huggingface/transformers.git
 trl==0.24.0
 typeguard==4.6.0
 typer==0.27.2
