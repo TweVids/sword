@@ -45,6 +45,20 @@ def _fix_transformers_fp8_quantizer_bug():
     except Exception:
         pass
 
+    try:
+        from transformers.integrations import finegrained_fp8
+        if hasattr(finegrained_fp8, "fp8_grouped_mm_experts_forward"):
+            orig_grouped_mm = finegrained_fp8.fp8_grouped_mm_experts_forward
+            if not getattr(orig_grouped_mm, "_sword_patched", False):
+                def safe_grouped_mm(self, *args, **kwargs):
+                    if getattr(self, "activation_scheme", None) == "static":
+                        self.activation_scheme = "dynamic"
+                    return orig_grouped_mm(self, *args, **kwargs)
+                safe_grouped_mm._sword_patched = True
+                finegrained_fp8.fp8_grouped_mm_experts_forward = safe_grouped_mm
+    except Exception:
+        pass
+
 
 _fix_transformers_fp8_quantizer_bug()
 
