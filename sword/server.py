@@ -174,17 +174,20 @@ class FastServer:
         # Prefill phase
         self.static_cache.reset(list(range(bsz)))
         self.static_cache.set_pos(0)
-        prefill_pos_ids = torch.arange(0, prompt_len, dtype=torch.long, device=self.device).unsqueeze(0).expand(bsz, -1)
+        if attention_mask is not None:
+            prefill_pos_ids = (attention_mask.long().cumsum(-1) - 1).clamp_min(0)
+        else:
+            prefill_pos_ids = torch.arange(0, prompt_len, dtype=torch.long, device=self.device).unsqueeze(0).expand(bsz, -1)
+
         outputs = self.model(
             input_ids=input_ids,
             position_ids=prefill_pos_ids,
             attention_mask=attention_mask,
             sword_static_cache=self.static_cache,
             start_pos=0,
-            use_cache=True,
+            use_cache=False,
         )
         logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
-        past_key_values = getattr(outputs, "past_key_values", None)
         next_token_logits = logits[:, -1, :]
 
         if temperature > 0.0:
@@ -211,11 +214,9 @@ class FastServer:
                 position_ids=decode_pos_ids,
                 sword_static_cache=self.static_cache,
                 start_pos=curr_pos,
-                past_key_values=past_key_values,
-                use_cache=True,
+                use_cache=False,
             )
             step_logits = out.logits[:, -1, :] if hasattr(out, "logits") else out[0][:, -1, :]
-            past_key_values = getattr(out, "past_key_values", past_key_values)
 
             if temperature > 0.0:
                 probs = F.softmax(step_logits / temperature, dim=-1)

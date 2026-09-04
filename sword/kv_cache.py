@@ -30,18 +30,24 @@ class StaticKVCache:
         self.dtype = dtype
         self.device = device
 
-        # Pre-allocate contiguous static memory for all layers
-        # Shape: [num_layers, max_batch_size, num_kv_heads, max_seq_len, head_dim]
-        self.k_cache = torch.zeros(
-            (num_layers, max_batch_size, num_kv_heads, max_seq_len, head_dim),
-            dtype=dtype,
-            device=device,
-        )
-        self.v_cache = torch.zeros(
-            (num_layers, max_batch_size, num_kv_heads, max_seq_len, head_dim),
-            dtype=dtype,
-            device=device,
-        )
+        # Pre-allocate contiguous static memory per layer (list of 4D tensors for faster CUDA indexing)
+        # Shape per layer: [max_batch_size, num_kv_heads, max_seq_len, head_dim]
+        self.k_cache = [
+            torch.zeros(
+                (max_batch_size, num_kv_heads, max_seq_len, head_dim),
+                dtype=dtype,
+                device=device,
+            )
+            for _ in range(num_layers)
+        ]
+        self.v_cache = [
+            torch.zeros(
+                (max_batch_size, num_kv_heads, max_seq_len, head_dim),
+                dtype=dtype,
+                device=device,
+            )
+            for _ in range(num_layers)
+        ]
 
         # Current length tracking per sequence in batch
         self.seq_lengths = torch.zeros((max_batch_size,), dtype=torch.long, device=device)
@@ -64,15 +70,7 @@ class StaticKVCache:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Updates cache for a single layer without reallocation.
-        
-        Args:
-            layer_idx: index of transformer layer
-            k: [batch_size, num_kv_heads, seq_len, head_dim]
-            v: [batch_size, num_kv_heads, seq_len, head_dim]
-            start_pos: write offset along the sequence dimension (defaults to self.current_pos)
-            
-        Returns:
-            Tuple of views into k_cache and v_cache up to (start_pos + seq_len).
+        Fast 4D slice write eliminates 5D pointer-arithmetic overhead.
         """
         if start_pos is None:
             start_pos = self.current_pos
@@ -80,13 +78,13 @@ class StaticKVCache:
         end_pos = start_pos + seq_len
 
         # In-place slice copy (zero allocation)
-        self.k_cache[layer_idx, :bsz, :, start_pos:end_pos, :] = k
-        self.v_cache[layer_idx, :bsz, :, start_pos:end_pos, :] = v
+        self.k_cache[layer_idx][:bsz, :, start_pos:end_pos, :] = k
+        self.v_cache[layer_idx][:bsz, :, start_pos:end_pos, :] = v
 
         # Return view up to the current end position
         return (
-            self.k_cache[layer_idx, :bsz, :, :end_pos, :],
-            self.v_cache[layer_idx, :bsz, :, :end_pos, :],
+            self.k_cache[layer_idx][:bsz, :, :end_pos, :],
+            self.v_cache[layer_idx][:bsz, :, :end_pos, :],
         )
 
     def get_layer_cache(
@@ -97,20 +95,22 @@ class StaticKVCache:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Returns sliced view of current cache for given layer."""
         return (
-            self.k_cache[layer_idx, :batch_size, :, :total_len, :],
-            self.v_cache[layer_idx, :batch_size, :, :total_len, :],
+            self.k_cache[layer_idx][:batch_size, :, :total_len, :],
+            self.v_cache[layer_idx][:batch_size, :, :total_len, :],
         )
 
     def reset(self, batch_indices: Optional[List[int]] = None):
         """Reset sequence lengths and clear positions for specified batches."""
         if batch_indices is None:
-            self.k_cache.zero_()
-            self.v_cache.zero_()
+            for k, v in zip(self.k_cache, self.v_cache):
+                k.zero_()
+                v.zero_()
             self.seq_lengths.zero_()
             self.current_pos = 0
         else:
             for b in batch_indices:
-                self.k_cache[:, b].zero_()
-                self.v_cache[:, b].zero_()
+                for k, v in zip(self.k_cache, self.v_cache):
+                    k[b].zero_()
+                    v[b].zero_()
                 self.seq_lengths[b] = 0
             self.current_pos = 0
