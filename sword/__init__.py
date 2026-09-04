@@ -30,8 +30,16 @@ from .patcher import patch_qwen, unpatch_qwen, set_attention_mode
 from .loader import load_qwen_model
 from .server import FastQwenServer
 from .finetune import benchmark_finetune_8k, apply_lora_to_model
+from .trainer import (
+    setup_blackwell_environment,
+    download_from_drive,
+    download_hf_checkpoint,
+    is_valid_checkpoint,
+    load_offline_dataset,
+    FullCheckpointCallback,
+)
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 print(f"[Sword] Version {__version__} loaded successfully.")
 
 __all__ = [
@@ -48,5 +56,11 @@ __all__ = [
     "FastQwenServer",
     "benchmark_finetune_8k",
     "apply_lora_to_model",
+    "setup_blackwell_environment",
+    "download_from_drive",
+    "download_hf_checkpoint",
+    "is_valid_checkpoint",
+    "load_offline_dataset",
+    "FullCheckpointCallback",
     "__version__",
 ]

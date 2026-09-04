@@ -1,0 +1,284 @@
+"""
+Sword + Unsloth High-Throughput SFT Fine-Tuning Pipeline.
+
+Accelerated by Sword Pure-PyTorch FlashAttention SDPA for NVIDIA Blackwell (SM100).
+Supports:
+- Auto dataset download from Google Drive
+- Automated checkpoint resumption from HuggingFace Hub
+- Pure-PyTorch FlashAttention attention patching (bypasses broken xformers/FA2 wheels)
+- Safe HuggingFace sync and automated local checkpoint pruning
+"""
+
+import os
+import gc
+import glob
+import shutil
+import torch
+from pathlib import Path
+
+# ── 1. Initialize Sword Blackwell Optimizations ───────────────
+import sword
+from sword import (
+    setup_blackwell_environment,
+    download_from_drive,
+    download_hf_checkpoint,
+    is_valid_checkpoint,
+    load_offline_dataset,
+    FullCheckpointCallback,
+    patch_qwen,
+)
+
+setup_blackwell_environment()
+
+from transformers import AutoTokenizer
+from trl import SFTTrainer, SFTConfig
+
+try:
+    from unsloth import FastModel
+    from unsloth.chat_templates import train_on_responses_only
+except ImportError:
+    from unsloth import FastLanguageModel as FastModel
+    try:
+        from unsloth.chat_templates import train_on_responses_only
+    except ImportError:
+        train_on_responses_only = None
+
+from huggingface_hub import HfApi
+
+
+# =========================================================
+# 🔐 CONFIGURATION & SECRETS (Fill your credentials below)
+# =========================================================
+# Provide via environment variable OR fill directly in the strings below
+HF_TOKEN = os.environ.get("HF_TOKEN", "")  # e.g., "hf_..."
+HF_REPO_ID = os.environ.get("HF_REPO_ID", "")  # e.g., "your-username/your-model-repo"
+
+# Google Drive link for dataset (leave blank if dataset is already local)
+DATASET_DRIVE_URL = os.environ.get("DATASET_DRIVE_URL", "")
+
+# Checkpoint resumption: set to folder name (e.g., "checkpoint-1100") to resume from HF Hub
+# Leave as "" to start fresh
+RESUME_FROM_HF_CHECKPOINT = ""
+
+CFG = dict(
+    model_id="huihui-ai/Huihui-Qwen3.8-27B-abliterated",  # Or your target Qwen model
+    dataset_main="/marimo/dataset_3_8_formatted_offline.jsonl",
+    output_dir="sft-qat-27b",
+    max_seq_len=7500,
+    num_epochs=1,
+    per_device_bs=4,
+    grad_accum=8,
+    lr=5e-5,
+    warmup_steps=449,
+    seed=42,
+    save_steps=100,
+    save_limit=2,
+)
+
+
+# =========================================================
+# 🚀 MAIN TRAINING PIPELINE
+# =========================================================
+def main():
+    if torch.cuda.is_available():
+        torch.cuda.set_device(0)
+        print(f"[*] GPU : {torch.cuda.get_device_name(0)}")
+        print(f"[*] VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+
+    # 1. Load Tokenizer
+    print(f"\n[*] Loading tokenizer for {CFG['model_id']}...")
+    tokenizer = AutoTokenizer.from_pretrained(
+        CFG["model_id"],
+        token=HF_TOKEN if HF_TOKEN else None,
+        trust_remote_code=True,
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    print(f"[*] Tokenizer loaded. Vocab size: {len(tokenizer)}")
+
+    # 2. Load 4-bit Base Model
+    print(f"\n[*] Loading model in 4-bit QLoRA mode via FastModel...")
+    model, _ = FastModel.from_pretrained(
+        model_name=CFG["model_id"],
+        max_seq_length=CFG["max_seq_len"],
+        dtype=torch.bfloat16,
+        load_in_4bit=True,
+        load_in_8bit=False,
+        device_map={"": 0} if torch.cuda.is_available() else None,
+        token=HF_TOKEN if HF_TOKEN else None,
+    )
+
+    # Freeze vision/multimodal layers if present
+    for name, param in model.named_parameters():
+        if "visual" in name.lower():
+            param.requires_grad_(False)
+
+    # 3. Attach LoRA Adapters
+    print("\n[*] Attaching LoRA adapters (r=64, alpha=128, rsLoRA)...")
+    model = FastModel.get_peft_model(
+        model,
+        finetune_vision_layers=False,
+        finetune_language_layers=True,
+        finetune_attention_modules=True,
+        finetune_mlp_modules=True,
+        r=64,
+        lora_alpha=128,
+        lora_dropout=0,
+        bias="none",
+        random_state=CFG["seed"],
+        use_rslora=True,
+        use_gradient_checkpointing="unsloth",
+        target_modules="all-linear",
+    )
+
+    # 4. ⚡ INJECT SWORD PURE FLASHATTENTION SDPA SPEED ENGINE ⚡
+    # Replaces attention layers with pure-PyTorch O(N) SDPA to eliminate
+    # broken xformers / flash-attn C++ wheel dependencies on Blackwell SM100!
+    print("\n[*] Injecting Sword Pure FlashAttention SDPA Speed Engine...")
+    model = patch_qwen(model, mode="flash")
+
+    # 5. Resolve & Download Dataset
+    dataset_path = CFG["dataset_main"]
+    if not os.path.exists(dataset_path):
+        # Look in script directory as alternative
+        script_dir_candidate = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.path.basename(dataset_path))
+        if os.path.exists(script_dir_candidate):
+            dataset_path = script_dir_candidate
+            CFG["dataset_main"] = dataset_path
+
+    if DATASET_DRIVE_URL and not os.path.exists(dataset_path):
+        print(f"\n[*] Downloading dataset from Google Drive...")
+        download_from_drive(DATASET_DRIVE_URL, dataset_path)
+    elif not os.path.exists(dataset_path):
+        raise FileNotFoundError(
+            f"Dataset not found at {dataset_path}. Please set DATASET_DRIVE_URL or place the dataset at {dataset_path}."
+        )
+
+    # 6. Load Dataset & Train/Test Split
+    train_ds, eval_ds = load_offline_dataset(dataset_path, seed=CFG["seed"], test_size=700)
+
+    # 7. Checkpoint Callback with automated HuggingFace upload & pruning
+    checkpoint_cb = FullCheckpointCallback(
+        tokenizer=tokenizer,
+        output_dir=CFG["output_dir"],
+        save_steps=CFG["save_steps"],
+        save_limit=CFG["save_limit"],
+        hf_repo_id=HF_REPO_ID if HF_REPO_ID else None,
+        hf_token=HF_TOKEN if HF_TOKEN else None,
+    )
+
+    # 8. SFT Training Arguments
+    training_args = SFTConfig(
+        dataset_text_field="text",
+        packing=True,
+        max_seq_length=CFG["max_seq_len"],
+        output_dir=CFG["output_dir"],
+        num_train_epochs=CFG["num_epochs"],
+        per_device_train_batch_size=CFG["per_device_bs"],
+        gradient_accumulation_steps=CFG["grad_accum"],
+        learning_rate=CFG["lr"],
+        max_grad_norm=0.5,
+        warmup_steps=CFG["warmup_steps"],
+        lr_scheduler_type="cosine",
+        fp16=False,
+        bf16=True,
+        optim="paged_adamw_8bit",
+        gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
+        dataloader_pin_memory=True,
+        dataloader_num_workers=0,
+        logging_steps=10,
+        save_strategy="no",  # Managed by FullCheckpointCallback
+        eval_strategy="steps",
+        eval_steps=150,
+        report_to="none",
+        seed=CFG["seed"],
+    )
+
+    trainer = SFTTrainer(
+        model=model,
+        tokenizer=tokenizer,
+        train_dataset=train_ds,
+        eval_dataset=eval_ds,
+        args=training_args,
+        callbacks=[checkpoint_cb],
+    )
+    checkpoint_cb.trainer = trainer
+
+    # Apply instruction/response masking
+    if train_on_responses_only is not None:
+        trainer = train_on_responses_only(
+            trainer,
+            instruction_part="<|im_start|>user\n",
+            response_part="<|im_start|>assistant\n",
+        )
+
+    # 9. Pre-Training Sanity Inspection
+    print("\n" + "=" * 70)
+    print("🔍 [Sword] PRE-TRAINING SANITY CHECK & TENSOR INSPECTION")
+    print("=" * 70)
+    sample_batch = next(iter(trainer.get_train_dataloader()))
+    input_ids = sample_batch["input_ids"]
+    labels = sample_batch["labels"]
+
+    actual_batch_size = input_ids.shape[0]
+    actual_seq_len = input_ids.shape[1]
+    active_tokens = (labels != -100).sum().item()
+    total_tokens = labels.numel()
+    active_pct = (active_tokens / total_tokens) * 100
+
+    print(f"[*] Configured max_seq_len        : {CFG['max_seq_len']:,} tokens")
+    print(f"[*] Actual Dataloader Tensor Shape: {list(input_ids.shape)} (batch={actual_batch_size}, seq_len={actual_seq_len:,})")
+    print(f"[*] Active Trained Tokens in Batch: {active_tokens:,} / {total_tokens:,} ({active_pct:.2f}% unmasked)")
+
+    decoded_sample = tokenizer.decode(input_ids[0][:250], skip_special_tokens=False)
+    print("\n📄 Raw Token Sample (first 250 tokens):")
+    print("-" * 70)
+    print(decoded_sample)
+    print("-" * 70 + "\n")
+
+    # 10. Execute Training (Resume or Fresh)
+    if RESUME_FROM_HF_CHECKPOINT and HF_REPO_ID:
+        ckpt_dir = download_hf_checkpoint(
+            hf_repo_id=HF_REPO_ID,
+            checkpoint_name=RESUME_FROM_HF_CHECKPOINT,
+            local_output_dir=CFG["output_dir"],
+            hf_token=HF_TOKEN if HF_TOKEN else None,
+        )
+        print(f"\n▶️  Resuming training from verified checkpoint: {ckpt_dir} ...")
+        trainer.train(resume_from_checkpoint=ckpt_dir)
+    else:
+        print("\n▶️  Starting fresh training with Sword Pure FlashAttention...")
+        trainer.train()
+
+    # 11. Final Save & Export
+    final_dir = os.path.join(CFG["output_dir"], "final_model")
+    print(f"\n[*] Saving final model to {final_dir}...")
+    if hasattr(model, "save_pretrained_merged"):
+        model.save_pretrained_merged(final_dir, tokenizer, save_method="merged_16bit")
+    else:
+        model.save_pretrained(final_dir)
+        tokenizer.save_pretrained(final_dir)
+    print(f"✅ Local final model saved: {final_dir}")
+
+    # Optional final upload to HF Hub
+    if HF_REPO_ID and HF_TOKEN:
+        print(f"☁️  Uploading final model to {HF_REPO_ID}/final_model ...")
+        try:
+            api = HfApi(endpoint=os.environ.get("HF_ENDPOINT", "https://huggingface.co"), token=HF_TOKEN)
+            api.upload_folder(
+                folder_path=final_dir,
+                repo_id=HF_REPO_ID,
+                path_in_repo="final_model",
+                repo_type="model",
+                commit_message="Sword final merged model",
+            )
+            print(f"✅ Final model uploaded successfully to {HF_REPO_ID}/final_model")
+        except Exception as e:
+            print(f"⚠️  Final HF upload failed (model is safely saved locally): {e}")
+
+    print("\n🎉 [Sword] Fine-tuning completed successfully!")
+
+
+if __name__ == "__main__":
+    main()
