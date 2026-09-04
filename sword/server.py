@@ -132,8 +132,10 @@ class FastQwenServer:
             attention_mask=attention_mask,
             sword_static_cache=self.static_cache,
             start_pos=0,
+            use_cache=True,
         )
         logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
+        past_key_values = getattr(outputs, "past_key_values", None)
         next_token_logits = logits[:, -1, :]
 
         if temperature > 0.0:
@@ -154,8 +156,11 @@ class FastQwenServer:
                 input_ids=next_token,
                 sword_static_cache=self.static_cache,
                 start_pos=curr_pos,
+                past_key_values=past_key_values,
+                use_cache=True,
             )
             step_logits = out.logits[:, 0, :] if hasattr(out, "logits") else out[0][:, 0, :]
+            past_key_values = getattr(out, "past_key_values", past_key_values)
 
             if temperature > 0.0:
                 probs = F.softmax(step_logits / temperature, dim=-1)
