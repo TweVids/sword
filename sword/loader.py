@@ -110,15 +110,29 @@ def _fix_transformers_fp8_quantizer_bug():
 
     try:
         from transformers.integrations import finegrained_fp8
-        if hasattr(finegrained_fp8, "fp8_grouped_mm_experts_forward"):
-            orig_grouped_mm = finegrained_fp8.fp8_grouped_mm_experts_forward
-            if not getattr(orig_grouped_mm, "_sword_patched", False):
-                def safe_grouped_mm(self, *args, **kwargs):
-                    if getattr(self, "activation_scheme", None) == "static":
-                        self.activation_scheme = "dynamic"
-                    return orig_grouped_mm(self, *args, **kwargs)
-                safe_grouped_mm._sword_patched = True
-                finegrained_fp8.fp8_grouped_mm_experts_forward = safe_grouped_mm
+        for fn_name in ("fp8_grouped_mm_experts_forward", "fp8_batched_mm_experts_forward"):
+            if hasattr(finegrained_fp8, fn_name):
+                orig_fn = getattr(finegrained_fp8, fn_name)
+                if not getattr(orig_fn, "_sword_patched", False):
+                    def make_safe_wrapper(target_fn):
+                        def safe_wrapper(self, *args, **kwargs):
+                            if getattr(self, "activation_scheme", None) == "static":
+                                self.activation_scheme = "dynamic"
+                            try:
+                                return target_fn(self, *args, **kwargs)
+                            except (ImportError, NotImplementedError):
+                                # Seamless fallback to Sword's Zero-Sync Fast MoE Forward
+                                fast_fwd = getattr(self, "_sword_fast_forward", None)
+                                if fast_fwd is not None:
+                                    return fast_fwd(*args, **kwargs)
+                                orig_fwd = getattr(self, "_sword_original_forward", None)
+                                if orig_fwd is not None:
+                                    return orig_fwd(*args, **kwargs)
+                                raise
+                        return safe_wrapper
+                    wrapped_fn = make_safe_wrapper(orig_fn)
+                    wrapped_fn._sword_patched = True
+                    setattr(finegrained_fp8, fn_name, wrapped_fn)
     except Exception:
         pass
 
@@ -130,21 +144,24 @@ def load_moe_model(
     max_seq_length: int = 8192,
     patch_sword: bool = True,
     attn_mode: str = "flash",
+    experts_implementation: str = "grouped_mm",
 ) -> Tuple[object, object]:
     """
     Loads MoE (Mixture of Experts) models, including FP8 pre-quantized models
     such as tencent/Hy-MT2-30B-A3B-FP8, Qwen2-MoE, DeepSeek, etc.
     
     Directly leverages native FP8 Tensor Cores without bitsandbytes overhead.
-    Applies Sword's pure FlashAttention SDPA speed engine for high-throughput serving.
+    Applies Sword's pure FlashAttention SDPA speed engine and Zero-Sync Fast MoE
+    dispatch for maximum throughput serving.
     
     Args:
         model_name_or_path: HuggingFace model repo id or local checkpoint path
         device_map: Hardware placement ('auto', 'cuda', etc.)
         torch_dtype: Compute precision (defaults to 'auto' for FP8 safetensors)
         max_seq_length: Maximum sequence context length
-        patch_sword: Whether to automatically inject Sword FlashAttention SDPA
+        patch_sword: Whether to automatically inject Sword FlashAttention SDPA & Fast MoE
         attn_mode: 'flash' or 'vanilla'
+        experts_implementation: 'grouped_mm' (fused kernel), 'batched_mm', or 'eager'
         
     Returns:
         Tuple of (patched_model, tokenizer)
@@ -160,19 +177,17 @@ def load_moe_model(
     from transformers import AutoConfig
     config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
 
-    # Adjust activation_scheme and experts implementation to avoid static grouped_mm conflict
+    # Adjust activation_scheme and experts implementation for high-throughput serving
     if hasattr(config, "quantization_config"):
         if isinstance(config.quantization_config, dict):
-            if config.quantization_config.get("activation_scheme") == "static":
-                config.quantization_config["activation_scheme"] = "dynamic"
+            config.quantization_config["activation_scheme"] = "dynamic"
         elif hasattr(config.quantization_config, "activation_scheme"):
-            if config.quantization_config.activation_scheme == "static":
-                config.quantization_config.activation_scheme = "dynamic"
+            config.quantization_config.activation_scheme = "dynamic"
 
-    # Set eager dispatch fallback as recommended by Transformers MoE integration
-    config._experts_implementation = "eager"
+    # Default to grouped_mm (Cutlass/Triton grouped GEMM fused per layer)
+    config._experts_implementation = experts_implementation
     if hasattr(config, "use_grouped_mm"):
-        config.use_grouped_mm = False
+        config.use_grouped_mm = (experts_implementation == "grouped_mm")
 
     model = AutoModelForCausalLM.from_pretrained(
         model_name_or_path,
@@ -189,8 +204,8 @@ def load_moe_model(
 
     if patch_sword:
         from .patcher import patch_model
-        model = patch_model(model, mode=attn_mode)
+        model = patch_model(model, mode=attn_mode, patch_moe=True)
 
     model.eval()
-    print(f"[Sword] MoE model ready for serving.")
+    print(f"[Sword] MoE model ready for high-speed serving.")
     return model, tokenizer

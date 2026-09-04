@@ -47,15 +47,28 @@ def _fix_transformers_fp8_quantizer_bug():
 
     try:
         from transformers.integrations import finegrained_fp8
-        if hasattr(finegrained_fp8, "fp8_grouped_mm_experts_forward"):
-            orig_grouped_mm = finegrained_fp8.fp8_grouped_mm_experts_forward
-            if not getattr(orig_grouped_mm, "_sword_patched", False):
-                def safe_grouped_mm(self, *args, **kwargs):
-                    if getattr(self, "activation_scheme", None) == "static":
-                        self.activation_scheme = "dynamic"
-                    return orig_grouped_mm(self, *args, **kwargs)
-                safe_grouped_mm._sword_patched = True
-                finegrained_fp8.fp8_grouped_mm_experts_forward = safe_grouped_mm
+        for fn_name in ("fp8_grouped_mm_experts_forward", "fp8_batched_mm_experts_forward"):
+            if hasattr(finegrained_fp8, fn_name):
+                orig_fn = getattr(finegrained_fp8, fn_name)
+                if not getattr(orig_fn, "_sword_patched", False):
+                    def make_safe_wrapper(target_fn):
+                        def safe_wrapper(self, *args, **kwargs):
+                            if getattr(self, "activation_scheme", None) == "static":
+                                self.activation_scheme = "dynamic"
+                            try:
+                                return target_fn(self, *args, **kwargs)
+                            except (ImportError, NotImplementedError):
+                                fast_fwd = getattr(self, "_sword_fast_forward", None)
+                                if fast_fwd is not None:
+                                    return fast_fwd(*args, **kwargs)
+                                orig_fwd = getattr(self, "_sword_original_forward", None)
+                                if orig_fwd is not None:
+                                    return orig_fwd(*args, **kwargs)
+                                raise
+                        return safe_wrapper
+                    wrapped_fn = make_safe_wrapper(orig_fn)
+                    wrapped_fn._sword_patched = True
+                    setattr(finegrained_fp8, fn_name, wrapped_fn)
     except Exception:
         pass
 
@@ -69,6 +82,7 @@ from .engine import SpeedEngine
 from .patcher import (
     patch_model,
     patch_moe,
+    patch_moe_experts,
     patch_qwen,
     unpatch_model,
     unpatch_moe,
@@ -99,6 +113,7 @@ __all__ = [
     "SpeedEngine",
     "patch_model",
     "patch_moe",
+    "patch_moe_experts",
     "patch_qwen",
     "unpatch_model",
     "unpatch_moe",

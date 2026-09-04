@@ -281,13 +281,11 @@ class FastServer:
         print("=" * 72)
 
         # -----------------------------------------------------------------
-        # 1. BEFORE: Standard Generation (Dynamic allocation / standard cache)
+        # 1. BEFORE: Standard Generation (Stock HuggingFace baseline)
         # -----------------------------------------------------------------
-        print("\n[*] Running [BEFORE] baseline (standard generation)...")
-        # Temporarily detach static cache to measure baseline
-        for module in self.model.modules():
-            if hasattr(module, "_sword_static_cache"):
-                module._sword_static_cache = None
+        print("\n[*] Running [BEFORE] baseline (standard HuggingFace generation)...")
+        from .patcher import unpatch_model, patch_model
+        unpatch_model(self.model)
 
         enc = self.tokenizer(prompts, padding=True, return_tensors="pt")
         enc = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in enc.items()}
@@ -313,9 +311,10 @@ class FastServer:
         before_stream_tps = [before_tps / bsz] * bsz
 
         # -----------------------------------------------------------------
-        # 2. AFTER: Sword Speed Engine (Flash SDPA + Static KV + Async Pipeline)
+        # 2. AFTER: Sword Speed Engine (Flash SDPA + Static KV + Fast MoE + Async Pipeline)
         # -----------------------------------------------------------------
-        print("[*] Running [AFTER] with Sword Speed Engine (Flash SDPA + Static KV + Pipeline)...")
+        print("[*] Running [AFTER] with Sword Speed Engine (Flash SDPA + Static KV + Fast MoE + Pipeline)...")
+        patch_model(self.model, mode="flash", patch_moe=True)
         for module in self.model.modules():
             if hasattr(module, "q_proj") and hasattr(module, "k_proj"):
                 module._sword_static_cache = self.static_cache
