@@ -5,6 +5,21 @@ from torch.nn.attention import sdpa_kernel, SDPBackend
 from typing import Optional, Tuple
 
 
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    Equivalent to torch.repeat_interleave(hidden_states, n_rep, dim=1),
+    but uses expand and reshape to avoid redundant memory copies.
+    """
+    if n_rep == 1:
+        return hidden_states
+    batch, num_kv_heads, slen, head_dim = hidden_states.shape
+    return (
+        hidden_states[:, :, None, :, :]
+        .expand(batch, num_kv_heads, n_rep, slen, head_dim)
+        .reshape(batch, num_kv_heads * n_rep, slen, head_dim)
+    )
+
+
 def _fast_sdpa_attention(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -16,41 +31,25 @@ def _fast_sdpa_attention(
 ) -> torch.Tensor:
     """
     Pure-PyTorch Fast SDPA Attention kernel.
-    Dispatches to FLASH_ATTENTION / EFFICIENT_ATTENTION on modern hardware (e.g. Blackwell).
-    Ensures contiguous memory for all inputs and bias masks.
+    Dispatches directly to FLASH_ATTENTION / EFFICIENT_ATTENTION on modern hardware (e.g. Blackwell).
+    Eliminates context-manager overhead and avoids redundant memory copies.
     """
-    query = query.contiguous()
-    key = key.contiguous()
-    value = value.contiguous()
-    if attention_mask is not None:
+    if not query.is_contiguous():
+        query = query.contiguous()
+    if not key.is_contiguous():
+        key = key.contiguous()
+    if not value.is_contiguous():
+        value = value.contiguous()
+    if attention_mask is not None and not attention_mask.is_contiguous():
         attention_mask = attention_mask.contiguous()
 
-    if query.is_cuda:
-        try:
-            with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]):
-                return F.scaled_dot_product_attention(
-                    query, key, value,
-                    attn_mask=attention_mask,
-                    dropout_p=dropout_p,
-                    is_causal=is_causal and attention_mask is None,
-                    scale=scale,
-                )
-        except Exception:
-            return F.scaled_dot_product_attention(
-                query, key, value,
-                attn_mask=attention_mask,
-                dropout_p=dropout_p,
-                is_causal=is_causal and attention_mask is None,
-                scale=scale,
-            )
-    else:
-        return F.scaled_dot_product_attention(
-            query, key, value,
-            attn_mask=attention_mask,
-            dropout_p=dropout_p,
-            is_causal=is_causal and attention_mask is None,
-            scale=scale,
-        )
+    return F.scaled_dot_product_attention(
+        query, key, value,
+        attn_mask=attention_mask,
+        dropout_p=dropout_p,
+        is_causal=is_causal and attention_mask is None,
+        scale=scale,
+    )
 
 
 def make_patched_qwen_attention_forward(original_forward):
@@ -167,8 +166,8 @@ def make_patched_qwen_attention_forward(original_forward):
         # -------------------------------------------------------------
         num_groups = num_heads // num_kv_heads
         if num_groups > 1:
-            key_states = key_states.repeat_interleave(num_groups, dim=1)
-            value_states = value_states.repeat_interleave(num_groups, dim=1)
+            key_states = repeat_kv(key_states, num_groups)
+            value_states = repeat_kv(value_states, num_groups)
 
         # -------------------------------------------------------------
         # 5. Pure FlashAttention SDPA Kernel

@@ -168,10 +168,13 @@ class FastQwenServer:
         eos_id = getattr(self.tokenizer, "eos_token_id", None)
         active_mask = torch.ones((bsz, 1), dtype=torch.bool, device=self.device)
 
+        # Pre-allocate decode_pos_ids buffer (zero allocation per step)
+        decode_pos_ids = torch.empty((bsz, 1), dtype=torch.long, device=self.device)
+
         # High-Speed Async Decode Loop (zero CPU-GPU sync stalls per token)
         for step in range(1, max_new_tokens):
             self.static_cache.set_pos(curr_pos)
-            decode_pos_ids = torch.full((bsz, 1), curr_pos, dtype=torch.long, device=self.device)
+            decode_pos_ids.fill_(curr_pos)
             out = self.decode_fn(
                 input_ids=next_token,
                 position_ids=decode_pos_ids,
@@ -257,7 +260,9 @@ class FastQwenServer:
         enc = self.tokenizer(prompts, padding=True, return_tensors="pt")
         enc = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in enc.items()}
         
+        # Warm up GPU kernels so initial initialization does not distort metrics
         if self.device.type == "cuda":
+            _ = self.model.generate(**enc, max_new_tokens=2, do_sample=False, pad_token_id=self.tokenizer.pad_token_id)
             torch.cuda.synchronize()
         t0 = time.perf_counter()
         
