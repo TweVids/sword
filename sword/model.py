@@ -165,13 +165,10 @@ class FastTransformerModel(nn.Module):
         hidden_states = self.norm(hidden_states)
 
         if return_logits:
-            # During decode (seq_len==1), only project the last token to avoid
-            # vocab_size * seq_len unnecessary FLOPs in lm_head
-            if seq_len == 1:
-                return self.lm_head(hidden_states)
-            else:
-                # During prefill / training, return full sequence logits
-                return self.lm_head(hidden_states[:, -1:, :])
+            # Always return full-sequence logits [bsz, seq_len, vocab].
+            # Training needs every position for causal LM cross-entropy loss.
+            # Generation callers (engine.py) slice [:, -1, :] themselves.
+            return self.lm_head(hidden_states)
         return hidden_states
 
     @classmethod
