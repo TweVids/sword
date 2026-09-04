@@ -1,18 +1,19 @@
 import time
+import re
 from typing import List, Optional, Tuple, Dict, Any
 import torch
 import torch.nn.functional as F
 
-from .loader import load_qwen_model
-from .patcher import patch_qwen
+from .loader import load_qwen_model, load_moe_model
+from .patcher import patch_model, patch_qwen
 from .kv_cache import StaticKVCache
 
 
-class FastQwenServer:
+class FastServer:
     """
-    High-Throughput Server for Qwen (Qwen2, Qwen2.5, Qwen3, Qwen3.5) models.
-    Supports 4+ concurrent rollout streams with Unsloth / BitsAndBytes + Sword Pure FlashAttention.
-    Includes CUDA graph compilation (mode='reduce-overhead') and async decode pipelining.
+    High-Throughput Server for MoE (Hunyuan HYV3, Qwen2-MoE, DeepSeek) and Dense (Qwen2.5/3.5, LLaMA) models.
+    Supports 4+ concurrent rollout streams with native FP8 / Unsloth / BitsAndBytes + Sword Pure FlashAttention.
+    Includes zero-allocation Static KV caching and async decode pipelining.
     """
     def __init__(
         self,
@@ -45,15 +46,21 @@ class FastQwenServer:
         else:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Model configuration attributes (support both standard and multimodal text_config)
+        # Model configuration attributes (supports HYV3 MoE, Qwen, multimodal text_config)
         cfg = getattr(model, "config", None)
         t_cfg = getattr(cfg, "text_config", cfg)
         num_layers = getattr(t_cfg, "num_hidden_layers", 16)
         num_kv_heads = getattr(t_cfg, "num_key_value_heads", getattr(t_cfg, "num_attention_heads", 16))
-        hidden_size = getattr(t_cfg, "hidden_size", 4096)
+        hidden_size = getattr(t_cfg, "hidden_size", 2048)
         num_heads = getattr(t_cfg, "num_attention_heads", 16)
         head_dim = getattr(t_cfg, "head_dim", hidden_size // num_heads)
-        dtype = getattr(model, "dtype", torch.bfloat16)
+        
+        # In FP8 models, use bfloat16/float16 for KV Cache to preserve precision and Flash SDPA compatibility
+        raw_dtype = getattr(model, "dtype", torch.bfloat16)
+        if raw_dtype is None or "float8" in str(raw_dtype):
+            dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
+        else:
+            dtype = raw_dtype
 
         # Allocate Static KV Cache for zero-allocation decode
         self.static_cache = StaticKVCache(
@@ -66,10 +73,18 @@ class FastQwenServer:
             device=self.device,
         )
 
-        # Attach cache to attention layers
-        for module in self.model.modules():
+        # Attach cache to attention layers and guarantee layer_idx
+        cur_layer = 0
+        for name, module in self.model.named_modules():
             if hasattr(module, "q_proj") and hasattr(module, "k_proj"):
                 module._sword_static_cache = self.static_cache
+                if not hasattr(module, "layer_idx") or module.layer_idx is None:
+                    m = re.search(r"layers?\.(\d+)", name)
+                    if m:
+                        module.layer_idx = int(m.group(1))
+                    else:
+                        module.layer_idx = cur_layer
+                        cur_layer += 1
 
         self.compile_decode = compile_decode
         self.decode_fn = self.model
@@ -85,19 +100,36 @@ class FastQwenServer:
     @classmethod
     def from_pretrained(
         cls,
-        model_name_or_path: str = "Qwen/Qwen2.5-7B-Instruct",
-        load_in_4bit: bool = True,
+        model_name_or_path: str = "tencent/Hy-MT2-30B-A3B-FP8",
+        load_in_4bit: bool = False,
         load_in_8bit: bool = False,
         max_concurrency: int = 4,
         max_seq_len: int = 2048,
         compile_decode: bool = False,
+        device_map: str = "auto",
+        torch_dtype: Optional[torch.dtype] = None,
     ):
-        """Clean one-line factory method for Colab / Modal cells."""
-        model, tokenizer = load_qwen_model(
-            model_name_or_path=model_name_or_path,
-            load_in_4bit=load_in_4bit,
-            load_in_8bit=load_in_8bit,
-        )
+        """
+        Clean one-line factory method for serving MoE or Dense models:
+        - For FP8 MoE (e.g. tencent/Hy-MT2-30B-A3B-FP8): uses load_moe_model
+        - For 4-bit/8-bit models: uses load_qwen_model
+        """
+        is_moe_or_fp8 = any(x in model_name_or_path.lower() for x in ["fp8", "moe", "hy-", "hy_", "hunyuan", "deepseek"])
+        if is_moe_or_fp8 and not (load_in_4bit or load_in_8bit):
+            model, tokenizer = load_moe_model(
+                model_name_or_path=model_name_or_path,
+                device_map=device_map,
+                torch_dtype=torch_dtype,
+                max_seq_length=max_seq_len,
+            )
+        else:
+            model, tokenizer = load_qwen_model(
+                model_name_or_path=model_name_or_path,
+                load_in_4bit=load_in_4bit,
+                load_in_8bit=load_in_8bit,
+                device_map=device_map,
+                max_seq_length=max_seq_len,
+            )
         return cls(
             model=model,
             tokenizer=tokenizer,
@@ -318,3 +350,8 @@ class FastQwenServer:
             "after_stream_tps": after_stream_tps,
             "speedup": total_speedup,
         }
+
+
+# Aliases for architecture-specific imports and backward compatibility
+FastMoEServer = FastServer
+FastQwenServer = FastServer

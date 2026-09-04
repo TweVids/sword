@@ -89,11 +89,15 @@ def _vanilla_quadratic_attention(
     return torch.matmul(attn_probs, value)
 
 
-def make_patched_qwen_attention_forward(original_forward):
+def make_patched_attention_forward(original_forward):
     """
-    Wraps Qwen attention forward to route through our pure-PyTorch FlashAttention SDPA
-    and support static KV caching, preserving bitsandbytes 4-bit/8-bit linear projections.
-    Natively supports both standard Qwen (Qwen2/2.5) and Qwen3.5 (QK-norm + gated attention).
+    Wraps causal self-attention forward to route through our pure-PyTorch FlashAttention SDPA
+    and support static zero-allocation KV caching.
+    Natively supports dense and MoE architectures:
+    - HYV3 / Hunyuan-3 (MoE with QK-norm, GQA)
+    - Qwen2, Qwen2.5, Qwen2-MoE, Qwen3, Qwen3.5 (QK-norm, dual-projection gating)
+    - DeepSeek-V2/V3, LLaMA, Mistral, Mixtral
+    Preserves all weights and quantization (native FP8, bitsandbytes 4-bit/8-bit).
     """
     def patched_forward(
         self,
@@ -234,9 +238,14 @@ def make_patched_qwen_attention_forward(original_forward):
             attn_output = attn_output * torch.sigmoid(gate)
 
         attn_output = self.o_proj(attn_output)
+        if past_key_values is not None and static_cache is None:
+            return (attn_output, None, past_key_values)
         return (attn_output, None)
 
     return patched_forward
+
+
+make_patched_qwen_attention_forward = make_patched_attention_forward
 
 
 def set_attention_mode(model, mode: str = "flash"):
@@ -253,13 +262,16 @@ def set_attention_mode(model, mode: str = "flash"):
     return count
 
 
-def patch_qwen(model, mode: str = "flash"):
+def patch_model(model, mode: str = "flash"):
     """
-    Patches all full attention layers of Qwen (Qwen2, Qwen2.5, Qwen3, Qwen3.5)
-    with Sword's pure FlashAttention SDPA kernel.
-    Preserves all weights and quantization (bitsandbytes 4-bit/8-bit).
+    Universal patcher for all Transformer & MoE causal attention modules
+    (HYV3/Hunyuan-3, Qwen, Qwen2-MoE, DeepSeek, LLaMA, Mistral, etc.)
+    with Sword's pure FlashAttention SDPA kernel and Static KV cache routing.
+    Preserves all weights and quantization (native FP8, bitsandbytes 4-bit/8-bit, etc.).
     """
+    import re
     patched_count = 0
+    cur_layer_idx = 0
     for name, module in model.named_modules():
         mod_type = module.__class__.__name__.lower()
         if "attention" in mod_type or "attn" in mod_type:
@@ -267,13 +279,27 @@ def patch_qwen(model, mode: str = "flash"):
                 if not hasattr(module, "_sword_original_forward"):
                     module._sword_original_forward = module.forward
                 module._sword_attn_mode = mode
-                module.forward = types.MethodType(make_patched_qwen_attention_forward(module._sword_original_forward), module)
+
+                # Infer layer_idx if missing
+                if not hasattr(module, "layer_idx") or module.layer_idx is None:
+                    m = re.search(r"layers?\.(\d+)", name)
+                    if m:
+                        module.layer_idx = int(m.group(1))
+                    else:
+                        module.layer_idx = cur_layer_idx
+                        cur_layer_idx += 1
+
+                module.forward = types.MethodType(make_patched_attention_forward(module._sword_original_forward), module)
                 patched_count += 1
     print(f"[Sword] Patched {patched_count} attention modules with Pure FlashAttention SDPA (mode='{mode}').")
     return model
 
 
-def unpatch_qwen(model):
+patch_qwen = patch_model
+patch_moe = patch_model
+
+
+def unpatch_model(model):
     """
     Restores all attention modules back to original unpatched forward methods.
     """
@@ -289,3 +315,7 @@ def unpatch_qwen(model):
             unpatched_count += 1
     print(f"[Sword] Unpatched {unpatched_count} attention modules to original forward.")
     return model
+
+
+unpatch_qwen = unpatch_model
+unpatch_moe = unpatch_model

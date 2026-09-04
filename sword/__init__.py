@@ -26,9 +26,17 @@ from .attention import PureFlashAttention, apply_rotary_pos_emb
 from .kv_cache import StaticKVCache
 from .model import FastTransformerModel, FastTransformerConfig
 from .engine import SpeedEngine
-from .patcher import patch_qwen, unpatch_qwen, set_attention_mode
-from .loader import load_qwen_model
-from .server import FastQwenServer
+from .patcher import (
+    patch_model,
+    patch_moe,
+    patch_qwen,
+    unpatch_model,
+    unpatch_moe,
+    unpatch_qwen,
+    set_attention_mode,
+)
+from .loader import load_qwen_model, load_moe_model
+from .server import FastServer, FastMoEServer, FastQwenServer
 from .finetune import benchmark_finetune_8k, apply_lora_to_model
 from .trainer import (
     setup_blackwell_environment,
@@ -39,7 +47,7 @@ from .trainer import (
     FullCheckpointCallback,
 )
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 print(f"[Sword] Version {__version__} loaded successfully.")
 
 __all__ = [
@@ -49,10 +57,17 @@ __all__ = [
     "FastTransformerModel",
     "FastTransformerConfig",
     "SpeedEngine",
+    "patch_model",
+    "patch_moe",
     "patch_qwen",
+    "unpatch_model",
+    "unpatch_moe",
     "unpatch_qwen",
     "set_attention_mode",
     "load_qwen_model",
+    "load_moe_model",
+    "FastServer",
+    "FastMoEServer",
     "FastQwenServer",
     "benchmark_finetune_8k",
     "apply_lora_to_model",

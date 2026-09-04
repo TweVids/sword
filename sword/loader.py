@@ -85,3 +85,52 @@ def load_qwen_model(
     model.eval()
 
     return model, tokenizer
+
+
+def load_moe_model(
+    model_name_or_path: str = "tencent/Hy-MT2-30B-A3B-FP8",
+    device_map: str = "auto",
+    torch_dtype: Optional[torch.dtype] = None,
+    max_seq_length: int = 8192,
+    patch_sword: bool = True,
+    attn_mode: str = "flash",
+) -> Tuple[object, object]:
+    """
+    Loads MoE (Mixture of Experts) models, including FP8 pre-quantized models
+    such as tencent/Hy-MT2-30B-A3B-FP8, Qwen2-MoE, DeepSeek, etc.
+    
+    Directly leverages native FP8 Tensor Cores without bitsandbytes overhead.
+    Applies Sword's pure FlashAttention SDPA speed engine for high-throughput serving.
+    
+    Args:
+        model_name_or_path: HuggingFace model repo id or local checkpoint path
+        device_map: Hardware placement ('auto', 'cuda', etc.)
+        torch_dtype: Compute precision (defaults to 'auto' for FP8 safetensors)
+        max_seq_length: Maximum sequence context length
+        patch_sword: Whether to automatically inject Sword FlashAttention SDPA
+        attn_mode: 'flash' or 'vanilla'
+        
+    Returns:
+        Tuple of (patched_model, tokenizer)
+    """
+    print(f"\n[Sword] Loading MoE model: {model_name_or_path}...")
+    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=True)
+    tokenizer.padding_side = "left"
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    print(f"[Sword] Loading weights with native FP8/Tensor-Core acceleration (device_map='{device_map}')...")
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name_or_path,
+        device_map=device_map if torch.cuda.is_available() else None,
+        torch_dtype=torch_dtype or "auto",
+        trust_remote_code=True,
+    )
+
+    if patch_sword:
+        from .patcher import patch_model
+        model = patch_model(model, mode=attn_mode)
+
+    model.eval()
+    print(f"[Sword] MoE model ready for serving.")
+    return model, tokenizer
