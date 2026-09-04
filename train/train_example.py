@@ -46,9 +46,6 @@ except ImportError:
 from huggingface_hub import HfApi
 
 
-# =========================================================
-# 🔐 CONFIGURATION & SECRETS (Fill your credentials below)
-# =========================================================
 # Provide via environment variable OR fill directly in the strings below
 HF_TOKEN = os.environ.get("HF_TOKEN", "")  # e.g., "hf_..."
 HF_REPO_ID = os.environ.get("HF_REPO_ID", "")  # e.g., "your-username/your-model-repo"
