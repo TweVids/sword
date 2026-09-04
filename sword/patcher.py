@@ -238,8 +238,6 @@ def make_patched_attention_forward(original_forward):
             attn_output = attn_output * torch.sigmoid(gate)
 
         attn_output = self.o_proj(attn_output)
-        if past_key_values is not None and static_cache is None:
-            return (attn_output, None, past_key_values)
         return (attn_output, None)
 
     return patched_forward
