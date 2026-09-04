@@ -16,7 +16,14 @@ def _fast_sdpa_attention(
     """
     Pure-PyTorch Fast SDPA Attention kernel.
     Dispatches to FLASH_ATTENTION / EFFICIENT_ATTENTION on modern hardware (e.g. Blackwell).
+    Ensures contiguous memory for all inputs and bias masks.
     """
+    query = query.contiguous()
+    key = key.contiguous()
+    value = value.contiguous()
+    if attention_mask is not None:
+        attention_mask = attention_mask.contiguous()
+
     if query.is_cuda:
         try:
             with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]):
@@ -122,10 +129,15 @@ def make_patched_qwen_attention_forward(original_forward):
         if static_cache is not None:
             start_pos = kwargs.get("start_pos", 0)
             key_states, value_states = static_cache.update(layer_idx, key_states, value_states, start_pos)
-            if q_len == 1 and start_pos > 0:
+            if q_len == 1:
                 is_causal = False
+                attention_mask = None
         elif past_key_values is not None and hasattr(past_key_values, "update"):
             key_states, value_states = past_key_values.update(key_states, value_states, layer_idx, kwargs)
+
+        if q_len == 1:
+            is_causal = False
+            attention_mask = None
 
         # -------------------------------------------------------------
         # 4. Grouped-Query Attention (GQA) KV Expansion
