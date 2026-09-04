@@ -27,11 +27,13 @@ def run_colab_serving():
     )
     parser.add_argument("--load-in-4bit", action="store_true", default=True, help="Load with bitsandbytes 4-bit NF4")
     parser.add_argument("--max-new-tokens", type=int, default=64, help="Number of new tokens to generate per stream")
+    parser.add_argument("--concurrency", type=int, default=4, help="Concurrent streams (e.g. 4 or 8)")
+    parser.add_argument("--compile", action="store_true", help="Enable torch.compile with CUDA graphs (mode='reduce-overhead')")
     parser.add_argument("--mock-test", action="store_true", help="Run with synthetic weights for quick verification")
     args = parser.parse_args()
 
     print("=" * 72)
-    print(" SWORD SPEED ENGINE - QWEN 3.5 4-CONCURRENCY SERVING")
+    print(f" SWORD SPEED ENGINE - QWEN 3.5 {args.concurrency}-CONCURRENCY SERVING")
     print("=" * 72)
     print(f"Device:           {'cuda' if torch.cuda.is_available() else 'cpu'}")
     if torch.cuda.is_available():
@@ -39,16 +41,22 @@ def run_colab_serving():
         print(f"VRAM Available:   {torch.cuda.get_device_properties(0).total_memory / (1024**3):.1f} GB")
     print(f"Model ID:         {args.model_id}")
     print(f"BitsAndBytes 4-bit: {args.load_in_4bit}")
-    print(f"Concurrency:      4 streams")
+    print(f"Concurrency:      {args.concurrency} streams")
+    print(f"CUDA Graphs:      {'Enabled' if args.compile else 'Disabled'}")
     print("=" * 72)
 
-    # 4 concurrent rollout prompts
-    prompts = [
+    # Concurrency prompts
+    base_prompts = [
         "What are the main performance advantages of NVIDIA Blackwell architecture?",
         "Explain how pure-PyTorch SDPA achieves FlashAttention performance without external wheels.",
         "How does static KV caching eliminate tensor allocation bottlenecks in high-concurrency decode?",
         "Write a Python function to demonstrate Grouped-Query Attention (GQA) head expansion.",
+        "Describe the 2nd generation Transformer Engine in Blackwell GPUs.",
+        "How does Gated DeltaNet provide linear-time sequence modeling?",
+        "Explain the benefit of compiling inference forward loops with reduce-overhead.",
+        "What is the mathematical formulation of RMSNorm compared to LayerNorm?",
     ]
+    prompts = [base_prompts[i % len(base_prompts)] for i in range(args.concurrency)]
 
     if not args.mock_test and torch.cuda.is_available():
         print(f"\n[*] Loading {args.model_id} with Unsloth / BitsAndBytes + Sword Pure FlashAttention...")
@@ -59,7 +67,8 @@ def run_colab_serving():
         server = FastQwenServer(
             model=model,
             tokenizer=tokenizer,
-            max_concurrency=4,
+            max_concurrency=args.concurrency,
+            compile_decode=args.compile,
         )
     else:
         print("\n[*] Initializing synthetic test harness (local or --mock-test mode)...")
