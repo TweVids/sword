@@ -16,7 +16,20 @@ import shutil
 import torch
 from pathlib import Path
 
-# ── 1. Initialize Sword Blackwell Optimizations ───────────────
+# ── 1. Unsloth MUST be imported before transformers / trl ────────
+try:
+    import unsloth
+    from unsloth import FastModel
+    from unsloth.chat_templates import train_on_responses_only
+except ImportError:
+    try:
+        from unsloth import FastLanguageModel as FastModel
+        from unsloth.chat_templates import train_on_responses_only
+    except ImportError:
+        FastModel = None
+        train_on_responses_only = None
+
+# ── 2. Initialize Sword Blackwell Optimizations ───────────────
 import sword
 from sword import (
     setup_blackwell_environment,
@@ -32,17 +45,6 @@ setup_blackwell_environment()
 
 from transformers import AutoTokenizer
 from trl import SFTTrainer, SFTConfig
-
-try:
-    from unsloth import FastModel
-    from unsloth.chat_templates import train_on_responses_only
-except ImportError:
-    from unsloth import FastLanguageModel as FastModel
-    try:
-        from unsloth.chat_templates import train_on_responses_only
-    except ImportError:
-        train_on_responses_only = None
-
 from huggingface_hub import HfApi
 
 
@@ -82,35 +84,57 @@ def main():
         print(f"[*] GPU : {torch.cuda.get_device_name(0)}")
         print(f"[*] VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
 
-    # 1. Load Tokenizer
-    print(f"\n[*] Loading tokenizer for {CFG['model_id']}...")
-    tokenizer = AutoTokenizer.from_pretrained(
-        CFG["model_id"],
-        token=HF_TOKEN if HF_TOKEN else None,
-        trust_remote_code=True,
-    )
+    # 1. Load Model & Tokenizer
+    print(f"\n[*] Loading model and tokenizer in 4-bit QLoRA mode via FastModel...")
+    if FastModel is not None:
+        model, tokenizer = FastModel.from_pretrained(
+            model_name=CFG["model_id"],
+            max_seq_length=CFG["max_seq_len"],
+            dtype=torch.bfloat16,
+            load_in_4bit=True,
+            load_in_8bit=False,
+            device_map={"": 0} if torch.cuda.is_available() else None,
+            token=HF_TOKEN if HF_TOKEN else None,
+        )
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(
+            CFG["model_id"],
+            token=HF_TOKEN if HF_TOKEN else None,
+            trust_remote_code=True,
+        )
+        from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+        quant_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            CFG["model_id"],
+            quantization_config=quant_config,
+            device_map={"": 0} if torch.cuda.is_available() else None,
+            trust_remote_code=True,
+            token=HF_TOKEN if HF_TOKEN else None,
+        )
+
+    # Ensure valid EOS and PAD tokens exist in tokenizer vocabulary
+    vocab = tokenizer.get_vocab() if hasattr(tokenizer, "get_vocab") else {}
+    if tokenizer.eos_token is None or (vocab and tokenizer.eos_token not in vocab):
+        if "<|im_end|>" in vocab:
+            tokenizer.eos_token = "<|im_end|>"
+        elif "<|endoftext|>" in vocab:
+            tokenizer.eos_token = "<|endoftext|>"
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    print(f"[*] Tokenizer loaded. Vocab size: {len(tokenizer)}")
 
-    # 2. Load 4-bit Base Model
-    print(f"\n[*] Loading model in 4-bit QLoRA mode via FastModel...")
-    model, _ = FastModel.from_pretrained(
-        model_name=CFG["model_id"],
-        max_seq_length=CFG["max_seq_len"],
-        dtype=torch.bfloat16,
-        load_in_4bit=True,
-        load_in_8bit=False,
-        device_map={"": 0} if torch.cuda.is_available() else None,
-        token=HF_TOKEN if HF_TOKEN else None,
-    )
+    print(f"[*] Tokenizer loaded. Vocab size: {len(tokenizer)}, EOS token: {tokenizer.eos_token}")
 
     # Freeze vision/multimodal layers if present
     for name, param in model.named_parameters():
         if "visual" in name.lower():
             param.requires_grad_(False)
 
-    # 3. Attach LoRA Adapters
+    # 2. Attach LoRA Adapters
     print("\n[*] Attaching LoRA adapters (r=64, alpha=128, rsLoRA)...")
     model = FastModel.get_peft_model(
         model,
@@ -165,7 +189,7 @@ def main():
     )
 
     # 8. SFT Training Arguments
-    training_args = SFTConfig(
+    sft_config_kwargs = dict(
         dataset_text_field="text",
         packing=True,
         max_seq_length=CFG["max_seq_len"],
@@ -191,6 +215,24 @@ def main():
         report_to="none",
         seed=CFG["seed"],
     )
+
+    # Explicitly set eos_token to tokenizer's actual vocabulary token
+    # (Prevents TRL packing ValueError: '<EOS_TOKEN>' is not found in vocabulary)
+    if hasattr(tokenizer, "eos_token") and tokenizer.eos_token:
+        sft_config_kwargs["eos_token"] = tokenizer.eos_token
+
+    try:
+        training_args = SFTConfig(**sft_config_kwargs)
+    except TypeError:
+        # For older TRL versions where eos_token is not a parameter of SFTConfig
+        sft_config_kwargs.pop("eos_token", None)
+        training_args = SFTConfig(**sft_config_kwargs)
+
+    # Ensure training_args.eos_token matches a valid token in tokenizer vocabulary
+    if hasattr(training_args, "eos_token"):
+        vocab = tokenizer.get_vocab() if hasattr(tokenizer, "get_vocab") else {}
+        if not training_args.eos_token or (vocab and training_args.eos_token not in vocab):
+            training_args.eos_token = tokenizer.eos_token
 
     # TRL ≥0.12 renamed `tokenizer` → `processing_class`; support both versions
     try:
