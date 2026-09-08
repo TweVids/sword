@@ -78,8 +78,11 @@ _fix_transformers_fp8_quantizer_bug()
 
 def _fix_transformers_bailing_compatibility():
     """
-    Fixes upstream Transformers (v4.46+) where `is_torch_fx_available` was removed
-    from `transformers.utils.import_utils`, breaking HuggingFace dynamic imports for Ling-3.0.
+    Hotfixes upstream Transformers (v4.46+) compatibility:
+    1. `is_torch_fx_available` was removed from `transformers.utils.import_utils`, which causes
+       `modeling_bailing_moe_v3.py` to fail with ImportError.
+    2. In modern transformers, `rope_scaling` property returns a default dict without 'factor',
+       which causes `BailingMoeV3MultiLatentAttention` to fail with KeyError: 'factor'.
     """
     try:
         import transformers.utils.import_utils as import_utils
@@ -99,6 +102,51 @@ def _fix_transformers_bailing_compatibility():
         import transformers
         if not hasattr(transformers, "is_torch_fx_available"):
             transformers.is_torch_fx_available = import_utils.is_torch_fx_available
+    except Exception:
+        pass
+
+    try:
+        # Patch dynamic module loading to intercept Bailing classes and sanitize config.rope_scaling
+        import transformers.dynamic_module_utils as dyn_utils
+        if not getattr(dyn_utils, "_sword_bailing_hooked", False):
+            orig_get_class = dyn_utils.get_class_from_dynamic_module
+            def patched_get_class(class_reference, pretrained_model_name_or_path, **kwargs):
+                cls = orig_get_class(class_reference, pretrained_model_name_or_path, **kwargs)
+                if cls is not None and hasattr(cls, "__name__"):
+                    if "BailingMoeV3" in cls.__name__ or "MultiLatentAttention" in cls.__name__:
+                        if not getattr(cls, "_sword_rope_patched", False):
+                            orig_init = cls.__init__
+                            def safe_init(self, *args, **kw):
+                                cfg = args[0] if args else kw.get("config", getattr(self, "config", None))
+                                if cfg is not None and hasattr(cfg, "rope_scaling") and isinstance(cfg.rope_scaling, dict):
+                                    if cfg.rope_scaling.get("rope_type") == "default":
+                                        cfg.rope_scaling = None
+                                    elif "factor" not in cfg.rope_scaling:
+                                        cfg.rope_scaling["factor"] = 1.0
+                                return orig_init(self, *args, **kw)
+                            cls.__init__ = safe_init
+                            cls._sword_rope_patched = True
+                return cls
+            dyn_utils.get_class_from_dynamic_module = patched_get_class
+            dyn_utils._sword_bailing_hooked = True
+    except Exception:
+        pass
+
+    try:
+        from transformers import AutoConfig
+        if not getattr(AutoConfig, "_sword_bailing_hooked", False):
+            orig_config_from_pretrained = AutoConfig.from_pretrained
+            @classmethod
+            def safe_config_from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
+                cfg = orig_config_from_pretrained.__func__(cls, pretrained_model_name_or_path, *args, **kwargs)
+                if getattr(cfg, "rope_scaling", None) is not None:
+                    if isinstance(cfg.rope_scaling, dict) and cfg.rope_scaling.get("rope_type") == "default":
+                        cfg.rope_scaling = None
+                    elif isinstance(cfg.rope_scaling, dict) and "factor" not in cfg.rope_scaling:
+                        cfg.rope_scaling["factor"] = 1.0
+                return cfg
+            AutoConfig.from_pretrained = safe_config_from_pretrained
+            AutoConfig._sword_bailing_hooked = True
     except Exception:
         pass
 
