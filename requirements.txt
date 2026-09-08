@@ -81,3 +81,4 @@ xxhash==4.0.1
 yarl==1.24.5
 zipp==4.1.0
 gdown>=5.0.0
+einops>=0.8.0

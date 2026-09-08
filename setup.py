@@ -7,10 +7,12 @@ setup(
     author="TweVids",
     packages=find_packages(),
     install_requires=[
-        "transformers>=5.3.0",
+        "transformers>=4.45.0",
         "accelerate",
         "bitsandbytes",
         "numpy",
+        "einops",
     ],
     python_requires=">=3.10",
+
 )

@@ -75,7 +75,38 @@ def _fix_transformers_fp8_quantizer_bug():
 
 _fix_transformers_fp8_quantizer_bug()
 
+
+def _fix_transformers_bailing_compatibility():
+    """
+    Fixes upstream Transformers (v4.46+) where `is_torch_fx_available` was removed
+    from `transformers.utils.import_utils`, breaking HuggingFace dynamic imports for Ling-3.0.
+    """
+    try:
+        import transformers.utils.import_utils as import_utils
+        if not hasattr(import_utils, "is_torch_fx_available"):
+            def is_torch_fx_available():
+                try:
+                    import torch.fx
+                    return True
+                except Exception:
+                    return False
+            import_utils.is_torch_fx_available = is_torch_fx_available
+
+        import transformers.utils as utils
+        if not hasattr(utils, "is_torch_fx_available"):
+            utils.is_torch_fx_available = import_utils.is_torch_fx_available
+
+        import transformers
+        if not hasattr(transformers, "is_torch_fx_available"):
+            transformers.is_torch_fx_available = import_utils.is_torch_fx_available
+    except Exception:
+        pass
+
+
+_fix_transformers_bailing_compatibility()
+
 from .attention import PureFlashAttention, apply_rotary_pos_emb
+
 from .kv_cache import StaticKVCache
 from .model import FastTransformerModel, FastTransformerConfig
 from .engine import SpeedEngine

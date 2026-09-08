@@ -250,6 +250,84 @@ def setup_fla_compatibility():
 setup_fla_compatibility()
 
 
+def _fix_transformers_bailing_compatibility():
+    """
+    Hotfixes upstream Transformers (v4.46+) compatibility where `is_torch_fx_available`
+    was removed from `transformers.utils.import_utils`, which causes
+    `modeling_bailing_moe_v3.py` downloaded from HuggingFace to fail with
+    ImportError: cannot import name 'is_torch_fx_available' from 'transformers.utils.import_utils'.
+    """
+    try:
+        import transformers.utils.import_utils as import_utils
+        if not hasattr(import_utils, "is_torch_fx_available"):
+            def is_torch_fx_available():
+                try:
+                    import torch.fx
+                    return True
+                except Exception:
+                    return False
+            import_utils.is_torch_fx_available = is_torch_fx_available
+
+        import transformers.utils as utils
+        if not hasattr(utils, "is_torch_fx_available"):
+            utils.is_torch_fx_available = import_utils.is_torch_fx_available
+
+        import transformers
+        if not hasattr(transformers, "is_torch_fx_available"):
+            transformers.is_torch_fx_available = import_utils.is_torch_fx_available
+    except Exception:
+        pass
+
+
+_fix_transformers_bailing_compatibility()
+
+
+def setup_einops_compatibility():
+    """
+    Provides pure-PyTorch fallbacks for `einops.rearrange` and `einops.repeat`
+    if `einops` is not installed.
+    """
+    if "einops" in sys.modules:
+        return
+    try:
+        import einops
+        return
+    except ImportError:
+        pass
+
+    einops_mod = types.ModuleType("einops")
+
+    def rearrange(tensor, pattern, **axes_lengths):
+        if "(h d)" in pattern and "-> ... h d" in pattern:
+            d = axes_lengths.get("d")
+            shape = list(tensor.shape[:-1]) + [-1, d]
+            return tensor.view(*shape)
+        elif "-> b t (h d)" in pattern:
+            b, t, h, d = tensor.shape
+            return tensor.reshape(b, t, h * d)
+        elif "b ... -> b (...)" in pattern:
+            return tensor.reshape(tensor.shape[0], -1)
+        elif "b s ... -> (b s) ..." in pattern:
+            return tensor.reshape(-1, *tensor.shape[2:])
+        elif "(b s) ... -> b s ..." in pattern:
+            b = axes_lengths.get("b", 1)
+            return tensor.reshape(b, -1, *tensor.shape[1:])
+        raise NotImplementedError(f"Pattern '{pattern}' not implemented in fallback einops.")
+
+    def repeat(tensor, pattern, **axes_lengths):
+        if "z -> z d" in pattern:
+            d = axes_lengths.get("d")
+            return tensor.unsqueeze(-1).expand(*tensor.shape, d)
+        raise NotImplementedError(f"Pattern '{pattern}' not implemented in fallback einops.")
+
+    einops_mod.rearrange = rearrange
+    einops_mod.repeat = repeat
+    sys.modules["einops"] = einops_mod
+
+
+setup_einops_compatibility()
+
+
 # =====================================================================
 # 2. Pure-PyTorch FlashAttention SDPA for Ling-3.0 MLA Attention
 # =====================================================================
@@ -523,8 +601,11 @@ def load_ling_model(
     and Sword Pure FlashAttention + Fast MoE speed engine.
     """
     setup_fla_compatibility()
+    _fix_transformers_bailing_compatibility()
+    setup_einops_compatibility()
 
     print(f"\n[Sword] Loading Ling-3.0-tiny model: {model_name_or_path}...")
+
     tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=True)
     tokenizer.padding_side = "left"
     if tokenizer.pad_token is None:
