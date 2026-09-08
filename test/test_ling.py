@@ -233,6 +233,13 @@ class TestSwordLingSupport(unittest.TestCase):
         out = server.fast_generate(input_ids, attention_mask=attn_mask, max_new_tokens=8, temperature=0.0)
         self.assertEqual(out.shape, (2, 3 + 8))
 
+    def test_from_pretrained_signature(self):
+        import inspect
+        sig = inspect.signature(FastLingServer.from_pretrained)
+        self.assertIn("patch_sword", sig.parameters)
+        self.assertIn("patch_moe", sig.parameters)
+        self.assertIn("kwargs", sig.parameters)
+
     def test_rope_scaling_compatibility(self):
         # Verify that a config with default rope_scaling (missing factor) is handled without KeyError
         cfg = MockBailingConfig()

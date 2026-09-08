@@ -752,6 +752,7 @@ class FastLingServer:
         max_concurrency: int = 4,
         max_seq_len: int = 4096,
         device: Optional[str] = None,
+        **kwargs,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -782,19 +783,26 @@ class FastLingServer:
         max_seq_len: int = 4096,
         device_map: str = "auto",
         torch_dtype: Optional[torch.dtype] = None,
+        patch_sword: bool = True,
+        patch_moe: bool = True,
+        device: Optional[str] = None,
+        **kwargs,
     ):
         model, tokenizer = load_ling_model(
             model_name_or_path=model_name_or_path,
             device_map=device_map,
             torch_dtype=torch_dtype,
             max_seq_length=max_seq_len,
-            patch_sword=True,
+            patch_sword=patch_sword,
+            patch_moe=patch_moe,
+            **kwargs,
         )
         return cls(
             model=model,
             tokenizer=tokenizer,
             max_concurrency=max_concurrency,
             max_seq_len=max_seq_len,
+            device=device,
         )
 
     def format_prompt(self, user_prompt: str, enable_thinking: bool = True) -> str:
