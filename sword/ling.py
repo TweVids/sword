@@ -369,17 +369,6 @@ def _fix_transformers_bailing_compatibility():
                                     return orig_init(self, *args, **kw)
                                 cls.__init__ = safe_init
                                 cls._sword_rope_patched = True
-
-                            mod = sys.modules.get(cls.__module__)
-                            if mod and not getattr(mod, "_sword_mask_hooked", False):
-                                orig_sdpa_mask = getattr(mod, "_prepare_4d_causal_attention_mask_for_sdpa", None)
-                                if orig_sdpa_mask is not None:
-                                    def safe_sdpa_mask(attention_mask, sequence_shape, inputs_embeds, past_key_values_length=0):
-                                        if sequence_shape[1] == 1 and (attention_mask is None or (isinstance(attention_mask, torch.Tensor) and attention_mask.all())):
-                                            return None
-                                        return orig_sdpa_mask(attention_mask, sequence_shape, inputs_embeds, past_key_values_length)
-                                    mod._prepare_4d_causal_attention_mask_for_sdpa = safe_sdpa_mask
-                                mod._sword_mask_hooked = True
                 return cls
             dyn_utils.get_class_from_dynamic_module = patched_get_class
             dyn_utils._sword_bailing_hooked = True
@@ -489,11 +478,22 @@ def fast_attention_forward(
         val_padded = value_states
 
     is_causal = (query.shape[-2] > 1 and attention_mask is None)
+    attn_mask = None
+    if attention_mask is not None and not is_causal:
+        if attention_mask.dim() == 4:
+            attn_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+        elif attention_mask.dim() == 2:
+            attn_mask = attention_mask[:, None, None, : key_states.shape[-2]]
+        else:
+            attn_mask = attention_mask
+        if attn_mask.dtype not in (torch.bool, torch.float16, torch.bfloat16, torch.float32):
+            attn_mask = (attn_mask > 0)
+
     out = F.scaled_dot_product_attention(
         query,
         key_states,
         val_padded,
-        attn_mask=attention_mask if not is_causal else None,
+        attn_mask=attn_mask,
         dropout_p=dropout if module.training else 0.0,
         is_causal=is_causal,
         scale=scaling,
@@ -861,9 +861,15 @@ class FastLingServer:
         unfinished = torch.ones(bsz, dtype=torch.bool, device=self.device)
 
         # 2. Fast Decode Loop
+        curr_attention_mask = attention_mask
         for _ in range(1, max_new_tokens):
+            if curr_attention_mask is not None:
+                curr_attention_mask = torch.cat(
+                    [curr_attention_mask, curr_attention_mask.new_ones((bsz, 1))], dim=-1
+                )
             outputs = self.model(
                 input_ids=next_token,
+                attention_mask=curr_attention_mask,
                 past_key_values=past_key_values,
                 use_cache=True,
             )
