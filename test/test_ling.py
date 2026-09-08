@@ -240,6 +240,12 @@ class TestSwordLingSupport(unittest.TestCase):
         self.assertIn("patch_moe", sig.parameters)
         self.assertIn("kwargs", sig.parameters)
 
+        from sword.ling import load_ling_model
+        load_sig = inspect.signature(load_ling_model)
+        self.assertIn("patch_sword", load_sig.parameters)
+        self.assertIn("patch_moe", load_sig.parameters)
+        self.assertIn("kwargs", load_sig.parameters)
+
     def test_rope_scaling_compatibility(self):
         # Verify that a config with default rope_scaling (missing factor) is handled without KeyError
         cfg = MockBailingConfig()

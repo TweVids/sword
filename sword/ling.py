@@ -677,7 +677,9 @@ def load_ling_model(
     torch_dtype: Optional[torch.dtype] = None,
     max_seq_length: int = 8192,
     patch_sword: bool = True,
+    patch_moe: bool = True,
     attn_mode: str = "flash",
+    **kwargs,
 ) -> Tuple[object, object]:
     """
     Loads inclusionAI/Ling-3.0-tiny, inclusionAI/Ling-3.0-tiny-fp8, or
@@ -729,7 +731,7 @@ def load_ling_model(
     )
 
     if patch_sword:
-        model = patch_ling(model, mode=attn_mode, patch_moe=True)
+        model = patch_ling(model, mode=attn_mode, patch_moe=patch_moe)
 
     model.eval()
     print(f"[Sword] Ling-3.0-tiny model ready for high-throughput inference & RL rollout.\n")
