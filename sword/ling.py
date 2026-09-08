@@ -68,31 +68,29 @@ def setup_fla_compatibility():
     simple_gla_rec_mod = types.ModuleType("fla.ops.simple_gla.fused_recurrent")
     simple_gla_chunk_mod = types.ModuleType("fla.ops.simple_gla.chunk")
 
-    class ShortConvolution(nn.Module):
-        """Pure-PyTorch 1D Causal Convolution for KDA."""
+    class ShortConvolution(nn.Conv1d):
+        """
+        Pure-PyTorch 1D Causal Convolution for KDA matching FLA.
+        Uses depthwise conv (groups=hidden_size) with bias=False by default.
+        """
         def __init__(
             self,
             hidden_size: int,
             kernel_size: int = 4,
-            activation: str = "silu",
-            bias: bool = True,
+            bias: bool = False,
+            activation: str | None = "silu",
             **kwargs,
         ):
-            super().__init__()
+            super().__init__(
+                in_channels=hidden_size,
+                out_channels=hidden_size,
+                kernel_size=kernel_size,
+                groups=hidden_size,
+                bias=bias,
+                padding=0,
+            )
             self.hidden_size = hidden_size
-            self.kernel_size = kernel_size
             self.activation = activation
-            self.weight = nn.Parameter(torch.empty(hidden_size, 1, kernel_size))
-            if bias:
-                self.bias = nn.Parameter(torch.zeros(hidden_size))
-            else:
-                self.register_parameter("bias", None)
-            self.reset_parameters()
-
-        def reset_parameters(self):
-            nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
-            if self.bias is not None:
-                nn.init.zeros_(self.bias)
 
         def forward(
             self,
@@ -100,27 +98,40 @@ def setup_fla_compatibility():
             cache: Optional[torch.Tensor] = None,
             output_final_state: bool = False,
             cu_seqlens: Optional[torch.Tensor] = None,
+            **kwargs,
         ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
             # x shape: [B, T, D]
-            bsz, seq_len, dim = x.shape
+            B, T, D = x.shape
+            W = self.kernel_size[0] if isinstance(self.kernel_size, (tuple, list)) else self.kernel_size
+
+            # Fast path for single-token decode with existing cache
+            if T == 1 and cache is not None:
+                # cache shape: [B, D, W]
+                cache = cache.roll(shifts=-1, dims=-1)
+                cache[..., -1] = x.squeeze(1)
+                w = self.weight.squeeze(1)  # [D, W]
+                y = (cache * w).sum(dim=-1, keepdim=True)  # [B, D, 1]
+                if self.bias is not None:
+                    y = y + self.bias.unsqueeze(-1)
+                if self.activation in ["silu", "swish"]:
+                    y = F.silu(y)
+                return y.transpose(1, 2), cache
+
+            # Prefill or multi-token forward
             x_t = x.transpose(1, 2)  # [B, D, T]
-
-            if cache is not None:
-                # Prepend cached tokens along time dimension
-                x_cat = torch.cat([cache, x_t], dim=-1)
-            else:
-                # Causal padding of (kernel_size - 1) zeros on left
-                x_cat = F.pad(x_t, (self.kernel_size - 1, 0))
-
-            out = F.conv1d(x_cat, self.weight, self.bias, groups=self.hidden_size)
-            if self.activation == "silu":
+            x_pad = F.pad(x_t, (W - 1, 0))
+            out = F.conv1d(x_pad, self.weight, self.bias, groups=self.hidden_size)
+            if self.activation in ["silu", "swish"]:
                 out = F.silu(out)
 
-            new_cache = None
+            final_state = None
             if output_final_state:
-                new_cache = x_cat[..., -(self.kernel_size - 1):]
+                if T >= W:
+                    final_state = x_t[..., -W:].contiguous()
+                else:
+                    final_state = F.pad(x_t, (W - T, 0))
 
-            return out.transpose(1, 2), new_cache
+            return out.transpose(1, 2), final_state
 
     class FusedRMSNormGated(nn.Module):
         """Pure-PyTorch Gated RMSNorm: RMSNorm(x) * sigmoid(g)."""
@@ -146,63 +157,93 @@ def setup_fla_compatibility():
         v: torch.Tensor,
         g: torch.Tensor,
         beta: torch.Tensor,
-        A_log: torch.Tensor,
-        dt_bias: torch.Tensor,
+        A_log: Optional[torch.Tensor] = None,
+        dt_bias: Optional[torch.Tensor] = None,
         recurrent_state: Optional[torch.Tensor] = None,
-        lower_bound: float = -5.0,
+        lower_bound: Optional[float] = -5.0,
+        scale: Optional[float] = None,
+        **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Pure-PyTorch single-step recurrence for Kimi Delta Attention (KDA).
-        S: [B, H, K, V]
+        Pure-PyTorch implementation of Kimi Delta Attention (KDA) recurrence.
+        Matches FLA kernel:
+          gk = lower_bound * sigmoid(exp(A_log) * (g + dt_bias))
+          h_t = h_{t-1} * exp(gk)
+          pred = k_t @ h_t
+          v_t = (v_t - pred) * beta_t
+          h_t = h_t + k_t outer v_t
+          o_t = q_t @ h_t
         """
         B, T, H, K = q.shape
         V = v.shape[-1]
-        if recurrent_state is None:
-            recurrent_state = torch.zeros(B, H, K, V, device=q.device, dtype=torch.float32)
-        else:
-            recurrent_state = recurrent_state.to(torch.float32)
+        scale = scale or (K ** -0.5)
 
-        outs = []
-        q_fp32 = F.normalize(q.float(), p=2, dim=-1)
-        k_fp32 = F.normalize(k.float(), p=2, dim=-1)
+        q_norm = F.normalize(q.float(), p=2, dim=-1) * scale
+        k_norm = F.normalize(k.float(), p=2, dim=-1)
         v_fp32 = v.float()
         g_fp32 = g.float()
-        beta_fp32 = beta.float()
+        beta_fp32 = beta.float().unsqueeze(-1) if beta.ndim == 3 else beta.float()
 
-        # Reshape dt_bias to [H, V]
-        dt_bias_2d = dt_bias.view(H, -1)
-        exp_A = torch.exp(A_log).unsqueeze(-1)  # [H, 1]
+        if A_log is not None:
+            A = torch.exp(A_log).view(1, 1, H, 1)
+        else:
+            A = 1.0
 
+        if dt_bias is not None:
+            dt = dt_bias.view(1, 1, H, K)
+            g_val = g_fp32 + dt
+        else:
+            g_val = g_fp32
+
+        if lower_bound is not None:
+            gk = lower_bound * torch.sigmoid(A * g_val)
+        else:
+            gk = -A * F.softplus(g_val)
+        decay = torch.exp(gk)  # [B, T, H, K]
+
+        if recurrent_state is None:
+            h = torch.zeros(B, H, K, V, device=q.device, dtype=torch.float32)
+        else:
+            h = recurrent_state.to(device=q.device, dtype=torch.float32)
+
+        if T == 1:
+            # Fully vectorized single-step decode
+            dec = decay.squeeze(1).unsqueeze(-1)  # [B, H, K, 1]
+            h = h * dec
+            kt = k_norm.squeeze(1)  # [B, H, K]
+            vt = v_fp32.squeeze(1)  # [B, H, V]
+            b_pred = torch.einsum("bhk,bhkv->bhv", kt, h)
+            bt = beta_fp32.squeeze(1)  # [B, H, 1] or [B, H, V]
+            delta_v = (vt - b_pred) * bt
+            h = h + torch.einsum("bhk,bhv->bhkv", kt, delta_v)
+            qt = q_norm.squeeze(1)  # [B, H, K]
+            ot = torch.einsum("bhk,bhkv->bhv", qt, h)
+            return ot.unsqueeze(1).to(q.dtype), h
+
+        # Multi-token prefill
+        outs = []
         for t in range(T):
-            qt = q_fp32[:, t]  # [B, H, K]
-            kt = k_fp32[:, t]  # [B, H, K]
-            vt = v_fp32[:, t]  # [B, H, V]
-            gt = g_fp32[:, t]  # [B, H, V]
-            bt = beta_fp32[:, t]  # [B, H]
-
-            decay = -exp_A * F.softplus(gt + dt_bias_2d.unsqueeze(0))
-            if lower_bound is not None:
-                decay = torch.clamp(decay, min=lower_bound)
-            alpha = torch.exp(decay)  # [B, H, V]
-
-            # Error: e_t = v_t - S_{t-1} @ k_t
-            pred = torch.einsum("bhk,bhkv->bhv", kt, recurrent_state)
-            delta = vt - pred
-            delta_S = bt[:, :, None, None] * torch.einsum("bhk,bhv->bhkv", kt, delta)
-
-            recurrent_state = alpha.unsqueeze(2) * recurrent_state + delta_S
-            ot = torch.einsum("bhk,bhkv->bhv", qt, recurrent_state)
+            dec_t = decay[:, t].unsqueeze(-1)  # [B, H, K, 1]
+            h = h * dec_t
+            kt = k_norm[:, t]
+            vt = v_fp32[:, t]
+            b_pred = torch.einsum("bhk,bhkv->bhv", kt, h)
+            bt = beta_fp32[:, t]
+            delta_v = (vt - b_pred) * bt
+            h = h + torch.einsum("bhk,bhv->bhkv", kt, delta_v)
+            qt = q_norm[:, t]
+            ot = torch.einsum("bhk,bhkv->bhv", qt, h)
             outs.append(ot.unsqueeze(1))
 
         out = torch.cat(outs, dim=1).to(q.dtype)
-        return out, recurrent_state
+        return out, h
 
     def fused_recurrent_kda(
         q, k, v, g, beta, A_log=None, dt_bias=None, initial_state=None, output_final_state=True, **kwargs
     ):
         return pure_recurrent_kda_step(
             q=q, k=k, v=v, g=g, beta=beta, A_log=A_log, dt_bias=dt_bias,
-            recurrent_state=initial_state,
+            recurrent_state=initial_state, **kwargs
         )
 
     def chunk_kda(
@@ -210,7 +251,7 @@ def setup_fla_compatibility():
     ):
         return pure_recurrent_kda_step(
             q=q, k=k, v=v, g=g, beta=beta, A_log=A_log, dt_bias=dt_bias,
-            recurrent_state=initial_state,
+            recurrent_state=initial_state, **kwargs
         )
 
     def tensor_cache(fn):
@@ -406,140 +447,64 @@ setup_einops_compatibility()
 # 2. Pure-PyTorch FlashAttention SDPA for Ling-3.0 MLA Attention
 # =====================================================================
 
+def fast_attention_forward(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    scaling: float,
+    dropout: float = 0.0,
+    **kwargs,
+):
+    """
+    Pure-PyTorch Flash SDPA attention interface for BailingMoeV3MultiLatentAttention.
+    Replaces eager torch.matmul + softmax with hardware-accelerated scaled_dot_product_attention.
+    """
+    mod = sys.modules.get(module.__class__.__module__)
+    repeat_fn = getattr(mod, "repeat_kv2", None) if mod else None
+    if repeat_fn is not None:
+        key_states = repeat_fn(key, module.num_key_value_groups)
+        value_states = repeat_fn(value, module.num_key_value_groups)
+    else:
+        key_states = torch.repeat_interleave(key, module.num_key_value_groups, dim=1)
+        value_states = torch.repeat_interleave(value, module.num_key_value_groups, dim=1)
+
+    # Pad value from 128 to 192 along head_dim to enable Flash SDPA
+    pad_dim = query.shape[-1] - value_states.shape[-1]
+    if pad_dim > 0:
+        val_padded = F.pad(value_states, (0, pad_dim))
+    else:
+        val_padded = value_states
+
+    is_causal = (query.shape[-2] > 1 and attention_mask is None)
+    out = F.scaled_dot_product_attention(
+        query,
+        key_states,
+        val_padded,
+        attn_mask=attention_mask if not is_causal else None,
+        dropout_p=dropout if module.training else 0.0,
+        is_causal=is_causal,
+        scale=scaling,
+    )
+    if pad_dim > 0:
+        out = out[..., :value_states.shape[-1]]
+
+    return out.transpose(1, 2).contiguous(), None
+
+
 def make_patched_bailing_mla_forward(original_forward):
     """
     Wraps BailingMoeV3MultiLatentAttention forward with Sword's pure-PyTorch
-    FlashAttention SDPA speed engine.
-
-    Solves the qk_head_dim (192) vs v_head_dim (128) mismatch by zero-padding V
-    to 192, enabling PyTorch's native FLASH_ATTENTION / EFFICIENT_ATTENTION kernel
-    on NVIDIA Blackwell / Hopper / Ada GPUs, then slicing back to 128.
+    FlashAttention SDPA speed engine while preserving exact RoPE, KV cache, and gating.
     """
-    def patched_mla_forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
-        attention_mask: Optional[torch.Tensor] = None,
-        past_key_values=None,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs,
-    ):
-        batch_size, seq_length = hidden_states.shape[:-1]
-        query_shape = (batch_size, seq_length, -1, self.qk_head_dim)
-        key_shape = (batch_size, seq_length, -1, self.qk_nope_head_dim + self.v_head_dim)
-
-        # 1. Project Query
-        if self.q_lora_rank is None:
-            q_states = self.q_proj(hidden_states)
-        else:
-            q_states = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
-        q_states = q_states.view(query_shape).transpose(1, 2)
-        q_pass, q_rot = torch.split(q_states, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-
-        # 2. Project Compressed Key-Value
-        compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
-        k_pass, k_rot = torch.split(compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-
-        k_pass = self.kv_b_proj(self.kv_a_layernorm(k_pass)).view(key_shape).transpose(1, 2)
-        k_pass, value_states = torch.split(k_pass, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-
-        k_rot = k_rot.view(batch_size, 1, seq_length, self.qk_rope_head_dim)
-
-        # 3. RoPE
-        cos, sin = position_embeddings
-        if getattr(self.config, "rope_interleave", True):
-            # Ling-3 interleaved RoPE
-            b, h, s, d = q_rot.shape
-            q_rot_view = q_rot.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
-            b, h, s, d = k_rot.shape
-            k_rot_view = k_rot.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
-            cos_u = cos.unsqueeze(1)
-            sin_u = sin.unsqueeze(1)
-            def rotate_half(x):
-                x1 = x[..., : x.shape[-1] // 2]
-                x2 = x[..., x.shape[-1] // 2 :]
-                return torch.cat((-x2, x1), dim=-1)
-            q_rot = (q_rot_view * cos_u) + (rotate_half(q_rot_view) * sin_u)
-            k_rot = (k_rot_view * cos_u) + (rotate_half(k_rot_view) * sin_u)
-        else:
-            cos_u = cos.unsqueeze(1)
-            sin_u = sin.unsqueeze(1)
-            def rotate_half(x):
-                x1 = x[..., : x.shape[-1] // 2]
-                x2 = x[..., x.shape[-1] // 2 :]
-                return torch.cat((-x2, x1), dim=-1)
-            q_rot = (q_rot * cos_u) + (rotate_half(q_rot) * sin_u)
-            k_rot = (k_rot * cos_u) + (rotate_half(k_rot) * sin_u)
-
-        k_rot = k_rot.expand(*k_pass.shape[:-1], -1)
-
-        query_states = torch.cat((q_pass, q_rot), dim=-1)  # [B, H, S, 192]
-        key_states = torch.cat((k_pass, k_rot), dim=-1)    # [B, H, S, 192]
-
-        # 4. KV Cache Update
-        static_cache = getattr(self, "_sword_static_cache", None) or kwargs.get("sword_static_cache", None)
-        is_causal = (seq_length > 1)
-
-        if static_cache is not None:
-            start_pos = kwargs.get("start_pos", getattr(static_cache, "current_pos", 0))
-            key_states, value_states = static_cache.update(self.layer_idx, key_states, value_states, start_pos)
-            if seq_length == 1:
-                is_causal = False
-                attention_mask = None
-        elif past_key_values is not None:
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
-            if seq_length == 1:
-                is_causal = False
-
-        # 5. Pure FlashAttention SDPA
-        # Pad value_states along head_dim from 128 to 192 to match query/key dimension
-        pad_dim = self.qk_head_dim - self.v_head_dim  # 192 - 128 = 64
-        if pad_dim > 0:
-            value_states_padded = F.pad(value_states, [0, pad_dim])
-        else:
-            value_states_padded = value_states
-
-        attn_mode = getattr(self, "_sword_attn_mode", "flash")
-        scale = getattr(self, "scaling", None)
-
-        if attn_mode == "vanilla":
-            # Quadratic O(N^2) reference path
-            scores = torch.matmul(query_states, key_states.transpose(-1, -2)) * (scale or (self.qk_head_dim ** -0.5))
-            if is_causal and seq_length > 1:
-                mask = torch.triu(torch.full((seq_length, key_states.shape[2]), float("-inf"), device=query_states.device, dtype=query_states.dtype), diagonal=1)
-                scores = scores + mask
-            if attention_mask is not None:
-                scores = scores + attention_mask
-            probs = F.softmax(scores, dim=-1, dtype=torch.float32).to(query_states.dtype)
-            attn_output = torch.matmul(probs, value_states)
-            attn_output = attn_output.transpose(1, 2).contiguous()
-        else:
-            # Pure FlashAttention SDPA hardware kernel
-            attn_out_padded = F.scaled_dot_product_attention(
-                query_states,
-                key_states,
-                value_states_padded,
-                attn_mask=attention_mask if not (is_causal and attention_mask is None) else None,
-                dropout_p=0.0 if not self.training else getattr(self, "attention_dropout", 0.0),
-                is_causal=(is_causal and attention_mask is None),
-                scale=scale,
-            )
-            # Slice back from 192 to 128 (mathematically identical to A @ V)
-            attn_output = attn_out_padded[:, :, :, : self.v_head_dim].transpose(1, 2).contiguous()
-
-        # 6. Gated Attention Projections
-        if getattr(self, "g_proj", None) is not None:
-            gate = self.g_proj(hidden_states)
-            gate = torch.sigmoid(gate.float()).to(hidden_states.dtype)
-            if getattr(self, "gated_attention_proj_granularity_type", "head_wise") == "head_wise":
-                attn_output = attn_output * gate[:, :, :, None]
-            else:
-                attn_output = attn_output * gate.view(batch_size, seq_length, self.num_heads, self.v_head_dim)
-
-        attn_output = attn_output.reshape(batch_size, seq_length, -1).contiguous()
-        attn_output = self.dense(attn_output)
-        return attn_output, None, past_key_values
+    def patched_mla_forward(self, *args, **kwargs):
+        mod = sys.modules.get(self.__class__.__module__)
+        if mod and not getattr(mod, "_sword_mla_sdpa_installed", False):
+            mod._sword_original_eager_attention_forward = getattr(mod, "eager_attention_forward", None)
+            mod.eager_attention_forward = fast_attention_forward
+            mod._sword_mla_sdpa_installed = True
+        return original_forward(*args, **kwargs)
 
     return patched_mla_forward
 
@@ -550,54 +515,42 @@ def make_patched_bailing_mla_forward(original_forward):
 
 def make_fast_bailing_moe_infer(original_moe_infer):
     """
-    Replaces stock HuggingFace BailingMoeV3SparseMoeBlock.moe_infer
-    with Sword's Zero-Sync Fast MoE Dispatch.
-
-    Stock HF executes:
-        tokens_per_expert = cnts.sum(dim=0).cpu().numpy() # FORCED SYNC PER TOKEN!
-        for i, num_tokens in enumerate(tokens_per_expert):  # 128 LOOP ITERATIONS!
-    Inducing 1,000+ host-device synchronization roundtrips during rollout generation.
-
-    Sword replaces this with a zero-sync dispatch that:
-    1. Evaluates ONLY activated experts (up to 4x fewer expert evaluations).
-    2. Completely eliminates .cpu().numpy() GPU stalls.
-    3. Seamlessly supports BF16, native FP8, and INT4 weights.
+    Optimized MoE dispatch that visits only active experts and avoids per-token syncs.
+    Output is 100% bit-for-bit identical to stock HuggingFace moe_infer.
     """
     def fast_moe_infer(self, x: torch.Tensor, topk_ids: torch.Tensor, topk_weight: torch.Tensor) -> torch.Tensor:
-        num_tokens, hidden_dim = x.shape
-        num_experts = len(self.experts)
+        cnts = topk_ids.new_zeros((topk_ids.shape[0], len(self.experts)))
+        cnts.scatter_(1, topk_ids, 1)
+        tokens_per_expert = cnts.sum(dim=0)
+        idxs = topk_ids.view(-1).argsort()
+        sorted_tokens = x[idxs // topk_ids.shape[1]]
 
-        # In single-token decode or small batch RL rollout (num_tokens <= 64):
-        # Single D2H copy of topk_ids avoids all GPU synchronization stalls
-        topk_cpu = topk_ids.tolist()
-        expert_to_tokens = {}
-        for tok_i, exp_ids in enumerate(topk_cpu):
-            for k_pos, exp_id in enumerate(exp_ids):
-                if exp_id < num_experts:
-                    expert_to_tokens.setdefault(exp_id, []).append((tok_i, k_pos))
+        # Only iterate over experts that have at least one token assigned
+        active_mask = tokens_per_expert > 0
+        active_exp_ids = active_mask.nonzero(as_tuple=True)[0]
+        cum = torch.cumsum(tokens_per_expert, dim=0)
+        starts = (cum - tokens_per_expert)[active_exp_ids].tolist()
+        counts = tokens_per_expert[active_exp_ids].tolist()
+        exp_list = active_exp_ids.tolist()
 
-        final_out = torch.zeros_like(x, dtype=torch.float32)
-
-        for exp_id, pairs in expert_to_tokens.items():
+        outputs = []
+        for exp_id, s_idx, n_tok in zip(exp_list, starts, counts):
             expert = self.experts[exp_id]
-            if len(pairs) == 1:
-                tok_i, k_pos = pairs[0]
-                current_token = x[tok_i:tok_i + 1]
-                expert_out = expert(current_token)
-                weight = topk_weight[tok_i, k_pos]
-                final_out[tok_i] += (expert_out[0] * weight).float()
-            else:
-                tok_indices = [p[0] for p in pairs]
-                k_positions = [p[1] for p in pairs]
-                idx_tensor = torch.tensor(tok_indices, dtype=torch.long, device=x.device)
-                k_tensor = torch.tensor(k_positions, dtype=torch.long, device=x.device)
-                current_tokens = x[idx_tensor]
-                expert_out = expert(current_tokens)
-                weights = topk_weight[idx_tensor, k_tensor, None].to(expert_out.dtype)
-                weighted_out = expert_out * weights
-                final_out.index_add_(0, idx_tensor, weighted_out.float())
+            tokens_for_this_expert = sorted_tokens[s_idx:s_idx + n_tok]
+            expert_out = expert(tokens_for_this_expert)
+            outputs.append(expert_out.to(x.device))
 
-        return final_out.to(x.dtype)
+        outs = torch.cat(outputs, dim=0) if len(outputs) else sorted_tokens.new_empty(0)
+        new_x = torch.empty_like(outs)
+        new_x[idxs] = outs
+        final_out = (
+            new_x.view(*topk_ids.shape, -1)
+            .type(topk_weight.dtype)
+            .mul_(topk_weight.unsqueeze(dim=-1))
+            .sum(dim=1)
+            .type(new_x.dtype)
+        )
+        return final_out
 
     return fast_moe_infer
 
@@ -613,6 +566,13 @@ def patch_ling(model, mode: str = "flash", patch_moe: bool = True):
     """
     mla_patched = 0
     moe_patched = 0
+
+    # Ensure dynamic module has fast_attention_forward registered
+    mod = sys.modules.get(model.__class__.__module__)
+    if mod and not getattr(mod, "_sword_mla_sdpa_installed", False):
+        mod._sword_original_eager_attention_forward = getattr(mod, "eager_attention_forward", None)
+        mod.eager_attention_forward = fast_attention_forward
+        mod._sword_mla_sdpa_installed = True
 
     for name, module in model.named_modules():
         mod_cls_name = module.__class__.__name__
@@ -653,6 +613,13 @@ def unpatch_ling(model):
             module.moe_infer = module._sword_original_moe_infer
             delattr(module, "_sword_original_moe_infer")
             restored += 1
+
+        mod = sys.modules.get(module.__class__.__module__)
+        if mod and getattr(mod, "_sword_mla_sdpa_installed", False):
+            if hasattr(mod, "_sword_original_eager_attention_forward") and mod._sword_original_eager_attention_forward is not None:
+                mod.eager_attention_forward = mod._sword_original_eager_attention_forward
+            mod._sword_mla_sdpa_installed = False
+
     print(f"[Sword] Unpatched {restored} Ling-3.0-tiny modules.")
     return model
 

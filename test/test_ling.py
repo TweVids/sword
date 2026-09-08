@@ -125,19 +125,33 @@ class TestSwordLingSupport(unittest.TestCase):
         x = torch.randn(2, 8, 128)
         out, cache = conv(x, output_final_state=True)
         self.assertEqual(out.shape, (2, 8, 128))
-        self.assertEqual(cache.shape, (2, 128, 3))
+        self.assertEqual(cache.shape, (2, 128, 4))
 
         # Test single-token decode with cache
         x_tok = torch.randn(2, 1, 128)
         out_tok, new_cache = conv(x_tok, cache=cache, output_final_state=True)
         self.assertEqual(out_tok.shape, (2, 1, 128))
-        self.assertEqual(new_cache.shape, (2, 128, 3))
+        self.assertEqual(new_cache.shape, (2, 128, 4))
 
         # Test FusedRMSNormGated
         norm_gate = FusedRMSNormGated(hidden_size=128)
         g = torch.randn(2, 8, 128)
         norm_out = norm_gate(out, g)
         self.assertEqual(norm_out.shape, (2, 8, 128))
+
+        # Test fused_recurrent_kda step (T=1 decode)
+        B, H, K, V = 2, 4, 32, 32
+        q = torch.randn(B, 1, H, K)
+        k = torch.randn(B, 1, H, K)
+        v = torch.randn(B, 1, H, V)
+        g = torch.randn(B, 1, H, K)
+        beta = torch.sigmoid(torch.randn(B, 1, H))
+        prev_h = torch.randn(B, H, K, V)
+        kda_out, next_h = fused_recurrent_kda(q, k, v, g, beta=beta, initial_state=prev_h, output_final_state=True)
+        self.assertEqual(kda_out.shape, (B, 1, H, V))
+        self.assertEqual(next_h.shape, (B, H, K, V))
+        self.assertFalse(torch.isnan(kda_out).any())
+        self.assertFalse(torch.isnan(next_h).any())
 
     def test_mla_pure_flash_sdpa(self):
         mla = MockBailingMLA(self.config)
