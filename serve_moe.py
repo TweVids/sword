@@ -35,12 +35,12 @@ setup_blackwell_environment()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Sword MoE High-Throughput Serving Engine")
+    parser = argparse.ArgumentParser(description="Sword MoE High-Throughput Serving & RL Rollout Engine")
     parser.add_argument(
         "--model",
         type=str,
-        default="tencent/Hy-MT2-30B-A3B-FP8",
-        help="HuggingFace model ID or local path (default: tencent/Hy-MT2-30B-A3B-FP8)",
+        default="inclusionAI/Ling-3.0-tiny",
+        help="HuggingFace model ID or local path (default: inclusionAI/Ling-3.0-tiny, supports -fp8, -int4, Hy-MT2)",
     )
     parser.add_argument(
         "--concurrency",
@@ -51,20 +51,50 @@ def main():
     parser.add_argument(
         "--max-new-tokens",
         type=int,
-        default=64,
-        help="Maximum tokens generated per stream (default: 64)",
+        default=128,
+        help="Maximum tokens generated per stream (default: 128)",
     )
     parser.add_argument(
         "--max-seq-len",
         type=int,
-        default=2048,
-        help="Maximum sequence context length for Static KV Cache (default: 2048)",
+        default=4096,
+        help="Maximum sequence context length for Static KV Cache (default: 4096)",
     )
     parser.add_argument(
         "--temperature",
         type=float,
-        default=0.7,
-        help="Sampling temperature (0.0 for greedy, >0.0 for sampling)",
+        default=1.0,
+        help="Sampling temperature (Ling-3.0 recommended: 1.0, 0.0 for greedy)",
+    )
+    parser.add_argument(
+        "--top-p",
+        type=float,
+        default=0.95,
+        help="Top-p nucleus sampling (Ling-3.0 recommended: 0.95)",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=20,
+        help="Top-k sampling (Ling-3.0 recommended: 20)",
+    )
+    parser.add_argument(
+        "--enable-thinking",
+        action="store_true",
+        default=True,
+        help="Enable Ling-3.0 native thinking mode (default: True)",
+    )
+    parser.add_argument(
+        "--disable-thinking",
+        action="store_false",
+        dest="enable_thinking",
+        help="Disable Ling-3.0 thinking mode for fast routine answers",
+    )
+    parser.add_argument(
+        "--rl-rollouts",
+        type=int,
+        default=0,
+        help="Run high-speed RL rollout generation with N trajectories per prompt (e.g. 4 for PPO/GRPO)",
     )
     parser.add_argument(
         "--benchmark",
@@ -78,16 +108,20 @@ def main():
     )
     args = parser.parse_args()
 
+    is_ling = any(x in args.model.lower() for x in ["ling", "bailing"])
+
     print("=" * 72)
-    print(" ⚡ SWORD HIGH-THROUGHPUT MoE SERVING ENGINE ⚡")
+    print(" ⚡ SWORD HIGH-THROUGHPUT MoE & RL ROLLOUT ENGINE ⚡")
     print("=" * 72)
     print(f"Model ID:          {args.model}")
+    print(f"Architecture:      {'Bailing Hybrid (KDA + MLA + Sparse MoE)' if is_ling else 'MoE Standard'}")
     print(f"Target GPU:        {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
     print(f"Concurrency:       {args.concurrency} concurrent streams")
     print(f"Max New Tokens:    {args.max_new_tokens} tokens/stream")
     print(f"Max Sequence Len:  {args.max_seq_len} tokens")
-    print(f"Precision:         Native FP8 (Tensor Cores) + BF16 Static KV Cache")
+    print(f"Thinking Mode:     {'Enabled (<think> active)' if args.enable_thinking else 'Disabled'}")
     print("=" * 72)
+
 
     # 1. Initialize Server (loads FP8 model, patches attention with Flash SDPA, sets up Static KV Cache)
     print("\n[*] Initializing FastMoEServer with Sword Speed Engine...")
@@ -120,7 +154,49 @@ def main():
         )
         return
 
-    # 3. Standard Serving Mode
+    # 3. RL Rollout Mode (e.g. GRPO / PPO multi-trajectory generation)
+    if args.rl_rollouts > 0:
+        rl_prompts = [
+            "Calculate 17 * 23 and output only the final result.",
+            "Write a fast Python script for zero-copy tensor slicing.",
+        ]
+        num_trajectories = args.rl_rollouts
+        total_streams = len(rl_prompts) * num_trajectories
+        print(f"[*] Executing RL Rollout Phase: {len(rl_prompts)} prompts x {num_trajectories} trajectories = {total_streams} streams...")
+        t0 = time.perf_counter()
+        if hasattr(server, "generate_rollouts"):
+            rollouts = server.generate_rollouts(
+                prompts=rl_prompts,
+                num_rollouts_per_prompt=num_trajectories,
+                max_new_tokens=args.max_new_tokens,
+                enable_thinking=args.enable_thinking,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                top_k=args.top_k,
+            )
+        else:
+            flat_prompts = [p for p in rl_prompts for _ in range(num_trajectories)]
+            res = server.serve(flat_prompts, max_new_tokens=args.max_new_tokens, temperature=args.temperature)
+            rollouts = [res["responses"][i * num_trajectories : (i + 1) * num_trajectories] for i in range(len(rl_prompts))]
+        elapsed = time.perf_counter() - t0
+        total_tokens = sum(len(r.split()) for group in rollouts for r in group)
+
+        print("\n" + "=" * 72)
+        print(" 🎯 RL ROLLOUT GENERATION SUMMARY (GRPO / PPO)")
+        print("=" * 72)
+        print(f"Prompts:                {len(rl_prompts)}")
+        print(f"Trajectories / Prompt:  {num_trajectories}")
+        print(f"Total Rollout Streams:  {total_streams}")
+        print(f"Elapsed Time:           {elapsed:.3f} s")
+        print(f"Rollout Output Speed:   {total_tokens / elapsed:.2f} words/sec")
+        print("=" * 72)
+        for p_i, group in enumerate(rollouts):
+            print(f"\n[Prompt {p_i + 1}]: {rl_prompts[p_i]}")
+            for t_i, traj in enumerate(group):
+                print(f"  --> Trajectory {t_i + 1}: {traj[:120].strip()}...")
+        return
+
+    # 4. Standard Serving Mode
     test_prompts = [
         "Translate to Chinese: 'Sword is a pure-PyTorch high-throughput attention and generation engine.'",
         "Translate to English: '混合专家模型在保持高参数容量的同时，显著降低了每个token的计算成本。'",
@@ -133,11 +209,14 @@ def main():
         test_prompts = test_prompts[: args.concurrency]
 
     print(f"[*] Serving {len(test_prompts)} concurrent requests with Sword Speed Engine...")
-    results = server.serve(
-        prompts=test_prompts,
-        max_new_tokens=args.max_new_tokens,
-        temperature=args.temperature,
-    )
+    serve_kwargs = {"prompts": test_prompts, "max_new_tokens": args.max_new_tokens, "temperature": args.temperature}
+    if is_ling and hasattr(server, "format_prompt"):
+        serve_kwargs["enable_thinking"] = args.enable_thinking
+        serve_kwargs["top_p"] = args.top_p
+        serve_kwargs["top_k"] = args.top_k
+
+    results = server.serve(**serve_kwargs)
+
 
     print("\n" + "=" * 72)
     print(" 🚀 SERVING PERFORMANCE SUMMARY")

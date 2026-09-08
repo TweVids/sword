@@ -168,6 +168,18 @@ def load_moe_model(
         Tuple of (patched_model, tokenizer)
     """
     _fix_transformers_fp8_quantizer_bug()
+    # If Ling-3.0-tiny model requested, delegate to specialized load_ling_model
+    if any(k in model_name_or_path.lower() for k in ("ling", "bailing")):
+        from .ling import load_ling_model as _load_ling_model
+        return _load_ling_model(
+            model_name_or_path=model_name_or_path,
+            device_map=device_map,
+            torch_dtype=torch_dtype,
+            max_seq_length=max_seq_length,
+            patch_sword=patch_sword,
+            attn_mode=attn_mode,
+        )
+
     print(f"\n[Sword] Loading MoE model: {model_name_or_path}...")
     tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=True)
     tokenizer.padding_side = "left"
@@ -210,3 +222,28 @@ def load_moe_model(
     model.eval()
     print(f"[Sword] MoE model ready for high-speed serving.")
     return model, tokenizer
+
+
+def load_ling_model(
+    model_name_or_path: str = "inclusionAI/Ling-3.0-tiny",
+    device_map: str = "auto",
+    torch_dtype: Optional[torch.dtype] = None,
+    max_seq_length: int = 8192,
+    patch_sword: bool = True,
+    attn_mode: str = "flash",
+) -> Tuple[object, object]:
+    """
+    Loads inclusionAI/Ling-3.0-tiny, inclusionAI/Ling-3.0-tiny-fp8, or
+    inclusionAI/Ling-3.0-tiny-int4 with native hardware acceleration
+    and Sword Pure FlashAttention + Fast MoE speed engine.
+    """
+    from .ling import load_ling_model as _load_ling_model
+    return _load_ling_model(
+        model_name_or_path=model_name_or_path,
+        device_map=device_map,
+        torch_dtype=torch_dtype,
+        max_seq_length=max_seq_length,
+        patch_sword=patch_sword,
+        attn_mode=attn_mode,
+    )
+

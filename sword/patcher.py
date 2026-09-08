@@ -410,11 +410,28 @@ def patch_model(model, mode: str = "flash", patch_moe: bool = True):
     if patch_moe:
         patch_moe_experts(model)
 
+    # Check for Ling-3.0-tiny (BailingMoeV3) hybrid architecture
+    try:
+        from .ling import patch_ling as _patch_ling
+        _patch_ling(model, mode=mode, patch_moe=patch_moe)
+    except Exception as e:
+        pass
+
     return model
 
 
 patch_qwen = patch_model
 patch_moe = patch_model
+
+
+def patch_ling(model, mode: str = "flash", patch_moe: bool = True):
+    from .ling import patch_ling as _patch_ling
+    return _patch_ling(model, mode=mode, patch_moe=patch_moe)
+
+
+def unpatch_ling(model):
+    from .ling import unpatch_ling as _unpatch_ling
+    return _unpatch_ling(model)
 
 
 def unpatch_model(model):
@@ -430,9 +447,15 @@ def unpatch_model(model):
                 if hasattr(module, attr):
                     delattr(module, attr)
             unpatched_count += 1
+    try:
+        from .ling import unpatch_ling as _unpatch_ling
+        _unpatch_ling(model)
+    except Exception:
+        pass
     print(f"[Sword] Unpatched {unpatched_count} modules to original forward.")
     return model
 
 
 unpatch_qwen = unpatch_model
 unpatch_moe = unpatch_model
+

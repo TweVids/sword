@@ -114,6 +114,17 @@ class FastServer:
         - For FP8 MoE (e.g. tencent/Hy-MT2-30B-A3B-FP8): uses load_moe_model
         - For 4-bit/8-bit models: uses load_qwen_model
         """
+        is_ling = any(x in model_name_or_path.lower() for x in ["ling", "bailing"])
+        if is_ling:
+            from .ling import FastLingServer
+            return FastLingServer.from_pretrained(
+                model_name_or_path=model_name_or_path,
+                max_concurrency=max_concurrency,
+                max_seq_len=max_seq_len,
+                device_map=device_map,
+                torch_dtype=torch_dtype,
+            )
+
         is_moe_or_fp8 = any(x in model_name_or_path.lower() for x in ["fp8", "moe", "hy-", "hy_", "hunyuan", "deepseek"])
         if is_moe_or_fp8 and not (load_in_4bit or load_in_8bit):
             model, tokenizer = load_moe_model(
@@ -137,6 +148,7 @@ class FastServer:
             max_seq_len=max_seq_len,
             compile_decode=compile_decode,
         )
+
 
     @torch.inference_mode()
     def serve(
@@ -359,3 +371,9 @@ class FastServer:
 # Aliases for architecture-specific imports and backward compatibility
 FastMoEServer = FastServer
 FastQwenServer = FastServer
+
+
+def get_fast_ling_server():
+    from .ling import FastLingServer
+    return FastLingServer
+

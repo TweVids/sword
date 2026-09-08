@@ -84,12 +84,15 @@ from .patcher import (
     patch_moe,
     patch_moe_experts,
     patch_qwen,
+    patch_ling,
     unpatch_model,
     unpatch_moe,
     unpatch_qwen,
+    unpatch_ling,
     set_attention_mode,
 )
-from .loader import load_qwen_model, load_moe_model
+from .loader import load_qwen_model, load_moe_model, load_ling_model
+from .ling import FastLingServer, setup_fla_compatibility
 from .server import FastServer, FastMoEServer, FastQwenServer
 from .finetune import benchmark_finetune_8k, apply_lora_to_model
 from .trainer import (
@@ -115,15 +118,20 @@ __all__ = [
     "patch_moe",
     "patch_moe_experts",
     "patch_qwen",
+    "patch_ling",
     "unpatch_model",
     "unpatch_moe",
     "unpatch_qwen",
+    "unpatch_ling",
     "set_attention_mode",
     "load_qwen_model",
     "load_moe_model",
+    "load_ling_model",
     "FastServer",
     "FastMoEServer",
     "FastQwenServer",
+    "FastLingServer",
+    "setup_fla_compatibility",
     "benchmark_finetune_8k",
     "apply_lora_to_model",
     "setup_blackwell_environment",
@@ -134,3 +142,4 @@ __all__ = [
     "FullCheckpointCallback",
     "__version__",
 ]
+
