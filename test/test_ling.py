@@ -204,6 +204,35 @@ class TestSwordLingSupport(unittest.TestCase):
 
         prompt_direct = server.format_prompt("What is 17 * 23?", enable_thinking=False)
         self.assertNotIn("<think>", prompt_direct)
+
+    def test_fast_generate_engine(self):
+        class MockOutput:
+            def __init__(self, logits, past_key_values):
+                self.logits = logits
+                self.past_key_values = past_key_values
+
+        class MockCausalLM(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.vocab_size = 100
+
+            def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=True, **kwargs):
+                B, S = input_ids.shape
+                logits = torch.randn(B, S, self.vocab_size)
+                cache = (past_key_values or 0) + S
+                return MockOutput(logits=logits, past_key_values=cache)
+
+        class MockTokenizer:
+            eos_token_id = 99
+            pad_token_id = 98
+
+        model = MockCausalLM()
+        server = FastLingServer(model=model, tokenizer=MockTokenizer(), device="cpu")
+        input_ids = torch.tensor([[1, 2, 3], [4, 5, 6]])
+        attn_mask = torch.ones_like(input_ids)
+        out = server.fast_generate(input_ids, attention_mask=attn_mask, max_new_tokens=8, temperature=0.0)
+        self.assertEqual(out.shape, (2, 3 + 8))
+
     def test_rope_scaling_compatibility(self):
         # Verify that a config with default rope_scaling (missing factor) is handled without KeyError
         cfg = MockBailingConfig()

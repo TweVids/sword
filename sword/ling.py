@@ -932,7 +932,8 @@ class FastLingServer:
                     eos_token_id=self.tokenizer.eos_token_id,
                     pad_token_id=self.tokenizer.pad_token_id,
                 )
-            except Exception:
+            except Exception as e:
+                print(f"[Sword] fast_generate fallback to stock generate: {e}")
                 outputs = None
 
         if outputs is None:
