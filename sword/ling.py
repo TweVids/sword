@@ -250,6 +250,20 @@ def setup_fla_compatibility():
 setup_fla_compatibility()
 
 
+def _compute_default_rope_parameters(config=None, device=None, seq_len=None, layer_type=None):
+    """Fallback standard RoPE parameter computation for default rope_type."""
+    base = getattr(config, "rope_theta", 10000.0)
+    partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
+    head_dim = getattr(config, "head_dim", None)
+    if head_dim is None:
+        hidden_size = getattr(config, "hidden_size", 1536)
+        num_heads = getattr(config, "num_attention_heads", 16)
+        head_dim = hidden_size // num_heads
+    dim = int(head_dim * partial_rotary_factor)
+    inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim))
+    return inv_freq, 1.0
+
+
 def _fix_transformers_bailing_compatibility():
     """
     Hotfixes upstream Transformers (v4.46+) compatibility:
@@ -257,6 +271,8 @@ def _fix_transformers_bailing_compatibility():
        `modeling_bailing_moe_v3.py` to fail with ImportError.
     2. In modern transformers, `rope_scaling` property returns a default dict without 'factor',
        which causes `BailingMoeV3MultiLatentAttention` to fail with KeyError: 'factor'.
+    3. `ROPE_INIT_FUNCTIONS` in transformers does not contain 'default', which causes
+       `BailingMoeV3RotaryEmbedding` to fail with KeyError: 'default'.
     """
     try:
         import transformers.utils.import_utils as import_utils
@@ -280,26 +296,38 @@ def _fix_transformers_bailing_compatibility():
         pass
 
     try:
+        # Register 'default' in ROPE_INIT_FUNCTIONS to prevent KeyError: 'default'
+        import transformers.modeling_rope_utils as rope_utils
+        if hasattr(rope_utils, "ROPE_INIT_FUNCTIONS") and "default" not in rope_utils.ROPE_INIT_FUNCTIONS:
+            rope_utils.ROPE_INIT_FUNCTIONS["default"] = _compute_default_rope_parameters
+    except Exception:
+        pass
+
+    try:
         # Patch dynamic module loading to intercept Bailing classes and sanitize config.rope_scaling
         import transformers.dynamic_module_utils as dyn_utils
         if not getattr(dyn_utils, "_sword_bailing_hooked", False):
             orig_get_class = dyn_utils.get_class_from_dynamic_module
             def patched_get_class(class_reference, pretrained_model_name_or_path, **kwargs):
                 cls = orig_get_class(class_reference, pretrained_model_name_or_path, **kwargs)
-                if cls is not None and hasattr(cls, "__name__"):
-                    if "BailingMoeV3" in cls.__name__ or "MultiLatentAttention" in cls.__name__:
-                        if not getattr(cls, "_sword_rope_patched", False):
-                            orig_init = cls.__init__
-                            def safe_init(self, *args, **kw):
-                                cfg = args[0] if args else kw.get("config", getattr(self, "config", None))
-                                if cfg is not None and hasattr(cfg, "rope_scaling") and isinstance(cfg.rope_scaling, dict):
-                                    if cfg.rope_scaling.get("rope_type") == "default":
-                                        cfg.rope_scaling = None
-                                    elif "factor" not in cfg.rope_scaling:
-                                        cfg.rope_scaling["factor"] = 1.0
-                                return orig_init(self, *args, **kw)
-                            cls.__init__ = safe_init
-                            cls._sword_rope_patched = True
+                if cls is not None:
+                    mod = sys.modules.get(cls.__module__)
+                    if mod and hasattr(mod, "ROPE_INIT_FUNCTIONS") and "default" not in mod.ROPE_INIT_FUNCTIONS:
+                        mod.ROPE_INIT_FUNCTIONS["default"] = _compute_default_rope_parameters
+                    if hasattr(cls, "__name__"):
+                        if "BailingMoeV3" in cls.__name__ or "MultiLatentAttention" in cls.__name__:
+                            if not getattr(cls, "_sword_rope_patched", False):
+                                orig_init = cls.__init__
+                                def safe_init(self, *args, **kw):
+                                    cfg = args[0] if args else kw.get("config", getattr(self, "config", None))
+                                    if cfg is not None and hasattr(cfg, "rope_scaling") and isinstance(cfg.rope_scaling, dict):
+                                        if cfg.rope_scaling.get("rope_type") == "default":
+                                            cfg.rope_scaling = None
+                                        elif "factor" not in cfg.rope_scaling:
+                                            cfg.rope_scaling["factor"] = 1.0
+                                    return orig_init(self, *args, **kw)
+                                cls.__init__ = safe_init
+                                cls._sword_rope_patched = True
                 return cls
             dyn_utils.get_class_from_dynamic_module = patched_get_class
             dyn_utils._sword_bailing_hooked = True
