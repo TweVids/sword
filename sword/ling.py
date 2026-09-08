@@ -115,7 +115,7 @@ def setup_fla_compatibility():
                     y = y + self.bias.unsqueeze(-1)
                 if self.activation in ["silu", "swish"]:
                     y = F.silu(y)
-                return y.transpose(1, 2), cache
+                return y.transpose(1, 2).to(x.dtype), cache
 
             # Prefill or multi-token forward
             x_t = x.transpose(1, 2)  # [B, D, T]
@@ -149,7 +149,7 @@ def setup_fla_compatibility():
             x_norm = (x_fp32 * torch.rsqrt(variance + self.eps)).to(input_dtype) * self.weight
             if self.activation == "sigmoid":
                 return x_norm * torch.sigmoid(g.float()).to(input_dtype)
-            return x_norm * g
+            return x_norm * g.to(input_dtype)
 
     def pure_recurrent_kda_step(
         q: torch.Tensor,
@@ -501,7 +501,7 @@ def fast_attention_forward(
     if pad_dim > 0:
         out = out[..., :value_states.shape[-1]]
 
-    return out.transpose(1, 2).contiguous(), None
+    return out.transpose(1, 2).contiguous().to(query.dtype), None
 
 
 def make_patched_bailing_mla_forward(original_forward):
@@ -560,7 +560,7 @@ def make_fast_bailing_moe_infer(original_moe_infer):
             act_out = F.silu(gate_out) * up_out
 
             exp_out = torch.bmm(sel_down, act_out).view(num_tokens, num_topk, hidden_dim)
-            return (exp_out * topk_weight.unsqueeze(-1)).sum(dim=1)
+            return (exp_out * topk_weight.to(x.dtype).unsqueeze(-1)).sum(dim=1).to(x.dtype)
 
         cnts = topk_ids.new_zeros((topk_ids.shape[0], len(self.experts)))
         cnts.scatter_(1, topk_ids, 1)
@@ -591,7 +591,7 @@ def make_fast_bailing_moe_infer(original_moe_infer):
             .type(topk_weight.dtype)
             .mul_(topk_weight.unsqueeze(dim=-1))
             .sum(dim=1)
-            .type(new_x.dtype)
+            .type(x.dtype)
         )
         return final_out
 

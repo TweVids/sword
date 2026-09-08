@@ -186,6 +186,14 @@ class TestSwordLingSupport(unittest.TestCase):
         self.assertEqual(out.shape, (N, D))
         self.assertFalse(torch.isnan(out).any())
 
+        # Test bfloat16 input with float32 topk_weight (replicates HF router behavior)
+        x_bf16 = torch.randn(N, D, dtype=torch.bfloat16)
+        moe_bf16 = MockBailingMoE(self.config).to(dtype=torch.bfloat16)
+        moe_bf16.moe_infer = types.MethodType(make_fast_bailing_moe_infer(orig_infer), moe_bf16)
+        out_bf16 = moe_bf16.moe_infer(x_bf16, topk_ids, topk_weight.float())
+        self.assertEqual(out_bf16.dtype, torch.bfloat16)
+        self.assertEqual(out_bf16.shape, (N, D))
+
     def test_fast_ling_server_formatting(self):
         server = FastLingServer(model=None, tokenizer=None)
 
