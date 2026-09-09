@@ -211,6 +211,15 @@ from .trainer import (
     load_offline_dataset,
     FullCheckpointCallback,
 )
+from .rl import (
+    start_grpo,
+    GRPOTrainer,
+    ContinuousStreamingQueue,
+    PrimaryScorer,
+    ExternalVerifier,
+    MoERouterMonitor,
+    ChunkedGRPOLoss,
+)
 
 __version__ = "0.5.0"
 print(f"[Sword] Version {__version__} loaded successfully.")
@@ -248,6 +257,14 @@ __all__ = [
     "is_valid_checkpoint",
     "load_offline_dataset",
     "FullCheckpointCallback",
+    "start_grpo",
+    "GRPOTrainer",
+    "ContinuousStreamingQueue",
+    "PrimaryScorer",
+    "ExternalVerifier",
+    "MoERouterMonitor",
+    "ChunkedGRPOLoss",
     "__version__",
 ]
+
 
