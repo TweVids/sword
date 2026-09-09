@@ -260,6 +260,62 @@ class TestRLEngine(unittest.TestCase):
         self.assertTrue(scored.audit_log["midi"]["playability_passed"])
         self.assertTrue(scored.audit_log["midi"]["duration_math_passed"])
 
+    def test_reasoning_sentence_cap_and_structure(self):
+        problem = DatasetRow(problem_id="r1", user_problem="Solve physics problem", domain=DomainType.SCIENCE)
+
+        # 1. Correctly paced: 4 sentences in a single paragraph (between 3 and 5)
+        good_reasoning = (
+            "We first identify the initial velocity of the object. "
+            "Next we apply the conservation of energy equation to find height. "
+            "Then we substitute the gravitational constant into the formula. "
+            "Finally we compute the terminal velocity accurately."
+        )
+        traj_good = Trajectory(prompt="p", full_text=good_reasoning, reasoning_trace=good_reasoning, final_answer="v=10")
+        scored_good = self.scorer.score_trajectory(problem, traj_good)
+        self.assertEqual(scored_good.component_scores["reasoning_structure"], 0.1)
+        self.assertTrue(scored_good.audit_log["reasoning_structure"]["well_structured_reasoning"])
+
+        # 2. Wall of text (> 5 sentences in one block without \n breaks) -> -0.2 penalty
+        wall_of_text = (
+            "First sentence explains the setup. "
+            "Second sentence analyzes the constraints. "
+            "Third sentence considers alternative formulas. "
+            "Fourth sentence evaluates momentum. "
+            "Fifth sentence checks unit consistency. "
+            "Sixth sentence overshoots the sentence cap."
+        )
+        traj_wall = Trajectory(prompt="p", full_text=wall_of_text, reasoning_trace=wall_of_text, final_answer="10")
+        scored_wall = self.scorer.score_trajectory(problem, traj_wall)
+        self.assertEqual(scored_wall.component_scores["reasoning_structure"], -0.2)
+        self.assertTrue(scored_wall.audit_log["reasoning_structure"]["wall_of_text_violation"])
+
+        # 3. Gaming attempt: splitting numbers or trivial fragments into \n lines -> NO point gain (0.0)
+        gaming_split = "1.\n2.\n3.\n4.\n5.\n6."
+        traj_split = Trajectory(prompt="p", full_text=gaming_split, reasoning_trace=gaming_split, final_answer="10")
+        scored_split = self.scorer.score_trajectory(problem, traj_split)
+        self.assertEqual(scored_split.component_scores["reasoning_structure"], 0.0)
+
+    def test_reasoning_loop_and_spam_penalty(self):
+        problem = DatasetRow(problem_id="loop_test", user_problem="Calculate math problem", domain=DomainType.MATH)
+
+        # Repetitive loop: model actively spams identical reasoning sentence
+        looping_trace = (
+            "Let us check the first step carefully here.\n"
+            "Let us check the first step carefully here.\n"
+            "Therefore the result is complete."
+        )
+        traj_loop = Trajectory(prompt="p", full_text=looping_trace, reasoning_trace=looping_trace, final_answer="42")
+        scored_loop = self.scorer.score_trajectory(problem, traj_loop)
+        self.assertEqual(scored_loop.component_scores["reasoning_structure"], -0.5)
+        self.assertEqual(scored_loop.failure_reason, FailureReason.REASONING_LOOP)
+        self.assertTrue(scored_loop.audit_log["reasoning_structure"]["repetitive_loop_detected"])
+
+        # Advisory Verifier also catches looping and penalizes -0.5
+        v_delta, v_answers = self.verifier.evaluate_trajectory(problem, traj_loop)
+        self.assertIn("looping", v_answers)
+        self.assertTrue(v_answers["looping"].answer)
+        self.assertEqual(v_delta, -0.5)
+
     # =========================================================
     # 4. System 2 Advisory Verifier (Section 19)
     # =========================================================

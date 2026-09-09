@@ -64,6 +64,7 @@ class FailureReason(str, Enum):
     BUDGET_EXCEEDED = "budget_exceeded"
     DOMAIN_MISMATCH = "domain_mismatch"
     ROUTER_COLLAPSE = "router_collapse"
+    REASONING_LOOP = "reasoning_loop"
 
 
 @dataclass

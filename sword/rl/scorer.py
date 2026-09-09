@@ -130,6 +130,15 @@ class PrimaryScorer:
             failure_reason = FailureReason.FORMAT_VIOLATION
 
         # =========================================================
+        # 4a. Reasoning Structure: 3-5 Sentence Cap & Anti-Spam Loop
+        # =========================================================
+        reasoning_score, reasoning_audit = self._score_reasoning_structure(traj.reasoning_trace)
+        components["reasoning_structure"] = reasoning_score
+        audit["reasoning_structure"] = reasoning_audit
+        if reasoning_audit.get("repetitive_loop_detected"):
+            failure_reason = FailureReason.REASONING_LOOP
+
+        # =========================================================
         # 5. Domain-Specific Structural Rules
         # =========================================================
         domain = problem.domain
@@ -292,6 +301,83 @@ class PrimaryScorer:
             return 0.10, {"structured_list_found": True}
         else:
             return -0.20, {"structured_list_found": False, "penalty": -0.20}
+
+    # ------------------------------------------------------------------
+    # Reasoning Structure: 3-5 Sentences Block Cap & Loop Detection
+    # ------------------------------------------------------------------
+    def _score_reasoning_structure(self, trace: str) -> Tuple[float, Dict[str, Any]]:
+        if not trace or len(trace.strip()) < 20:
+            return 0.0, {"checked": False, "reason": "empty_or_short_trace"}
+
+        audit: Dict[str, Any] = {}
+
+        # 1. Anti-Reward Hacking / Spam / Looping Detection
+        # Check if model actively repeats or loops sentences in reasoning
+        raw_sentences = [s.strip() for s in re.split(r"[.!?\n]+", trace) if len(s.strip().split()) >= 4]
+        sentence_counts: Dict[str, int] = defaultdict(int)
+        repeated_sentence = None
+        for s in raw_sentences:
+            norm = re.sub(r"\s+", " ", s.lower())
+            sentence_counts[norm] += 1
+            if sentence_counts[norm] >= 2:
+                repeated_sentence = s
+                break
+
+        if repeated_sentence:
+            audit["repetitive_loop_detected"] = True
+            audit["repeated_quote"] = repeated_sentence[:100]
+            audit["penalty"] = -0.5
+            return -0.5, audit
+
+        # 2. Block/Paragraph Analysis (\n separated wall-of-text check)
+        blocks = [b.strip() for b in re.split(r"\n+", trace) if b.strip()]
+        if not blocks:
+            return 0.0, {"checked": False}
+
+        substantive_blocks = 0
+        has_wall_of_text = False
+        max_sentences_in_block = 0
+        block_sentence_counts = []
+
+        for block in blocks:
+            # Anti-hack: Check for split numbers or trivial fragments (no point gain)
+            # E.g. "1.", "Step 1", "42", or lines with < 3 alphabetical words
+            words = re.findall(r"\b[a-zA-Z]{2,}\b", block)
+            if len(words) < 3 or re.fullmatch(r"^(?:step\s*)?\d+[.:\)]?\s*$", block, re.IGNORECASE):
+                # Trivial number line or split fragment -> no point gain, ignore from substantive blocks
+                continue
+
+            # Count full sentences in substantive block
+            sentences = [s.strip() for s in re.split(r"[.!?]+(?:\s+|$)", block) if len(s.strip().split()) >= 3]
+            s_count = max(1, len(sentences))
+            block_sentence_counts.append(s_count)
+            substantive_blocks += 1
+            if s_count > max_sentences_in_block:
+                max_sentences_in_block = s_count
+
+            # Cap is 3 to 5 sentences per block. Larger will be penalized -0.2
+            if s_count > 5:
+                has_wall_of_text = True
+
+        audit["substantive_blocks"] = substantive_blocks
+        audit["block_sentence_counts"] = block_sentence_counts
+        audit["max_sentences_in_block"] = max_sentences_in_block
+
+        # If any block exceeded 5 sentences -> -0.2 wall-of-text penalty
+        if has_wall_of_text:
+            audit["wall_of_text_violation"] = True
+            audit["penalty"] = -0.2
+            return -0.2, audit
+
+        # If substantive blocks exist and all are correctly paced within 3 to 5 sentences -> +0.1 reward
+        # (Note: split numbers alone without 3-5 sentence substantive blocks yield 0.0 - no point gain)
+        if substantive_blocks > 0 and all(3 <= sc <= 5 for sc in block_sentence_counts):
+            audit["well_structured_reasoning"] = True
+            audit["reward"] = 0.1
+            return 0.1, audit
+
+        # Substantive blocks exist but under 3 sentences (e.g. 1-2 sentence fragments) -> no point gain (0.0)
+        return 0.0, audit
 
     # ------------------------------------------------------------------
     # Section 7 & 7a: Code Editing & Destructive Edit Guard

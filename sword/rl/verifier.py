@@ -40,7 +40,7 @@ class ExternalVerifier:
         self,
         verifier_model: Optional[Any] = None,
         sampling_rate: float = 0.25,
-        max_total_delta: float = 0.35,
+        max_total_delta: float = 0.50,
         seed: int = 42,
     ):
         self.verifier_model = verifier_model
@@ -52,7 +52,7 @@ class ExternalVerifier:
         # Note: This is NEVER transmitted to the 9B model
         self.score_mapping = {
             "looping": {
-                ("yes", True): -0.35,
+                ("yes", True): -0.50,
                 ("no", False): 0.05,
             },
             "recheck_genuine": {
@@ -312,13 +312,14 @@ class ExternalVerifier:
                     results[q.id] = {"answer": "no", "citation": None}
 
             elif q.id == "looping":
-                # Check for repetitive identical sentences
-                sentences = [s.strip() for s in trace.split(".") if len(s.strip()) > 30]
-                counts = {}
+                # Check for repetitive identical sentences or looping patterns
+                sentences = [s.strip() for s in re.split(r"[.!?\n]+", trace) if len(s.strip().split()) >= 4]
+                counts: Dict[str, int] = {}
                 duplicated = None
                 for s in sentences:
-                    counts[s] = counts.get(s, 0) + 1
-                    if counts[s] > 2:
+                    norm = re.sub(r"\s+", " ", s.lower())
+                    counts[norm] = counts.get(norm, 0) + 1
+                    if counts[norm] >= 2:
                         duplicated = s
                         break
 
@@ -326,7 +327,7 @@ class ExternalVerifier:
                     results[q.id] = {
                         "answer": "yes",
                         "citation": duplicated[:100],
-                        "count": counts[duplicated]
+                        "count": counts[re.sub(r"\s+", " ", duplicated.lower())]
                     }
                 else:
                     results[q.id] = {"answer": "no", "citation": None}
