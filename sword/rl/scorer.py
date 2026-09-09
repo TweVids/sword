@@ -139,6 +139,13 @@ class PrimaryScorer:
             failure_reason = FailureReason.REASONING_LOOP
 
         # =========================================================
+        # 4b. Thinking Formatting: Prohibit Markdown Bold (**text**, **Step 1**)
+        # =========================================================
+        thinking_fmt_score, thinking_fmt_audit = self._score_thinking_formatting(traj.reasoning_trace)
+        components["thinking_formatting"] = thinking_fmt_score
+        audit["thinking_formatting"] = thinking_fmt_audit
+
+        # =========================================================
         # 5. Domain-Specific Structural Rules
         # =========================================================
         domain = problem.domain
@@ -378,6 +385,26 @@ class PrimaryScorer:
 
         # Substantive blocks exist but under 3 sentences (e.g. 1-2 sentence fragments) -> no point gain (0.0)
         return 0.0, audit
+
+    # ------------------------------------------------------------------
+    # Thinking Formatting: No Markdown Bold / Presentation Headers (**text**, **Step 1**)
+    # ------------------------------------------------------------------
+    def _score_thinking_formatting(self, trace: str) -> Tuple[float, Dict[str, Any]]:
+        if not trace:
+            return 0.0, {"checked": False}
+
+        # Check for bold formatting like **text** or **Step 1** in thinking trace
+        # Uses standard Markdown delimiter rule (cannot start or end with whitespace)
+        # to avoid false positives on math exponents (e.g. 2 ** 3)
+        bold_patterns = re.findall(r"\*\*(?!\s)[^*\n]+?(?<!\s)\*\*|__(?!\s)[^_\n]+?(?<!\s)__", trace)
+        if bold_patterns:
+            return -0.2, {
+                "prohibited_bold_found": True,
+                "matches": bold_patterns[:5],
+                "penalty": -0.2,
+            }
+
+        return 0.0, {"prohibited_bold_found": False}
 
     # ------------------------------------------------------------------
     # Section 7 & 7a: Code Editing & Destructive Edit Guard

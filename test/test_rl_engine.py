@@ -316,6 +316,50 @@ class TestRLEngine(unittest.TestCase):
         self.assertTrue(v_answers["looping"].answer)
         self.assertEqual(v_delta, -0.5)
 
+    def test_thinking_prohibited_bold_formatting(self):
+        problem = DatasetRow(problem_id="bold_test", user_problem="Explain physics", domain=DomainType.SCIENCE)
+
+        # 1. Prohibited bold like **Step 1** in thinking -> -0.2 penalty
+        traj_bold_step = Trajectory(
+            prompt="p",
+            full_text="**Step 1**: Let us compute momentum.",
+            reasoning_trace="In my analysis, **Step 1** is to compute momentum.",
+            final_answer="p = 10"
+        )
+        scored_step = self.scorer.score_trajectory(problem, traj_bold_step)
+        self.assertEqual(scored_step.component_scores["thinking_formatting"], -0.2)
+        self.assertTrue(scored_step.audit_log["thinking_formatting"]["prohibited_bold_found"])
+
+        # 2. Prohibited bold like **text** in thinking -> -0.2 penalty
+        traj_bold_text = Trajectory(
+            prompt="p",
+            full_text="Analyzing **text** here.",
+            reasoning_trace="We examine the **text** provided carefully.",
+            final_answer="done"
+        )
+        scored_text = self.scorer.score_trajectory(problem, traj_bold_text)
+        self.assertEqual(scored_text.component_scores["thinking_formatting"], -0.2)
+
+        # 3. Clean natural stream-of-consciousness thinking -> 0.0 penalty
+        traj_clean = Trajectory(
+            prompt="p",
+            full_text="Let us compute the momentum first. Then we check energy conservation.",
+            reasoning_trace="Let us compute the momentum first. Then we check energy conservation.",
+            final_answer="done"
+        )
+        scored_clean = self.scorer.score_trajectory(problem, traj_clean)
+        self.assertEqual(scored_clean.component_scores["thinking_formatting"], 0.0)
+
+        # 4. Math exponentiation (e.g. 2 ** 3 = 8) does not trigger false positive
+        traj_math = Trajectory(
+            prompt="p",
+            full_text="Computing 2 ** 3 = 8.",
+            reasoning_trace="Here we compute 2 ** 3 which equals 8.",
+            final_answer="8"
+        )
+        scored_math = self.scorer.score_trajectory(problem, traj_math)
+        self.assertEqual(scored_math.component_scores["thinking_formatting"], 0.0)
+
     # =========================================================
     # 4. System 2 Advisory Verifier (Section 19)
     # =========================================================
