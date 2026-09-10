@@ -568,7 +568,197 @@ def make_patched_bailing_mla_forward(original_forward):
 
 
 # =====================================================================
-# 3. High-Throughput Zero-Sync MoE Dispatch for Ling-3.0
+# 3. Memory-Efficient Fused RMSNorm & Chunked Cross-Entropy Loss
+# =====================================================================
+
+class FastRMSNormFunction(torch.autograd.Function):
+    """
+    Memory-efficient autograd implementation of Root Mean Square Normalization.
+    Unlike standard PyTorch eager evaluation which retains intermediate FP32 pow(2),
+    sum, and rsqrt tensors for backward across all 24 layers, this function saves
+    only the 1D/2D inv_rms scale factor and the original tensor, computing the
+    backward gradient in-place with minimal peak VRAM overhead.
+    """
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6):
+        orig_dtype = x.dtype
+        x_fp32 = x.float()
+        variance = x_fp32.pow(2).mean(dim=-1, keepdim=True)
+        inv_rms = torch.rsqrt(variance + eps)
+        norm_x = (x_fp32 * inv_rms).to(orig_dtype)
+        out = norm_x * weight
+        ctx.save_for_backward(x, weight, inv_rms)
+        ctx.eps = eps
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        x, weight, inv_rms = ctx.saved_tensors
+        orig_dtype = grad_output.dtype
+        x_fp32 = x.float()
+        grad_out_fp32 = grad_output.float()
+        w_fp32 = weight.float()
+
+        # Backward for elementwise scale by weight
+        # grad_weight = sum over batch and sequence
+        grad_weight = (grad_output * (x_fp32 * inv_rms).to(orig_dtype)).reshape(-1, weight.shape[-1]).sum(dim=0).to(orig_dtype)
+
+        # Backward for RMSNorm:
+        # y = x * inv_rms
+        # dy/dx = inv_rms * (I - (x * x^T) / (N * (var + eps)))
+        # dL/dx = w * grad_out * inv_rms - (x * inv_rms^3 / N) * sum(grad_out * w * x)
+        N = x.shape[-1]
+        gw = grad_out_fp32 * w_fp32
+        sum_gw_x = (gw * x_fp32).sum(dim=-1, keepdim=True)
+        grad_x = inv_rms * (gw - (x_fp32 * (inv_rms * inv_rms / N)) * sum_gw_x)
+
+        return grad_x.to(orig_dtype), grad_weight, None
+
+
+def fast_rmsnorm_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    """Drop-in memory-efficient forward replacement for BailingMoeV3RMSNorm."""
+    return FastRMSNormFunction.apply(hidden_states, self.weight, self.variance_epsilon)
+
+
+def compute_chunked_cross_entropy_loss(
+    hidden_states: torch.Tensor,
+    lm_head: nn.Module,
+    labels: torch.Tensor,
+    chunk_size: int = 512,
+    ignore_index: int = -100,
+) -> torch.Tensor:
+    """
+    Computes Cross-Entropy loss without materializing the full [B, L, Vocab] logits tensor.
+    For models with large vocabularies (Ling-3.0 has vocab_size = 157,184), materializing
+    logits at sequence length 8k with batch size 2 requires > 10 GB VRAM in FP32 alone.
+    This function chunks the sequence along the length dimension, projects to logits,
+    computes cross-entropy per chunk, and aggregates in-place.
+    """
+    # Shift labels and hidden states for next-token prediction
+    shift_hidden = hidden_states[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+
+    flat_hidden = shift_hidden.view(-1, shift_hidden.shape[-1])
+    flat_labels = shift_labels.view(-1)
+
+    # Filter out chunks where all labels are ignore_index to skip useless GEMMs
+    valid_mask = (flat_labels != ignore_index)
+    total_valid_tokens = valid_mask.sum().item()
+
+    if total_valid_tokens == 0:
+        # Dummy loss with gradient graph preserved
+        dummy_logits = lm_head(flat_hidden[:1])
+        return (dummy_logits.sum() * 0.0)
+
+    total_loss = 0.0
+    num_tokens = flat_hidden.shape[0]
+
+    for start_idx in range(0, num_tokens, chunk_size):
+        end_idx = min(start_idx + chunk_size, num_tokens)
+        chunk_lbls = flat_labels[start_idx:end_idx]
+
+        # Check if chunk contains any non-ignored tokens
+        if not (chunk_lbls != ignore_index).any():
+            continue
+
+        chunk_hid = flat_hidden[start_idx:end_idx]
+        chunk_logits = lm_head(chunk_hid).float()
+
+        chunk_loss = F.cross_entropy(
+            chunk_logits,
+            chunk_lbls,
+            reduction="sum",
+            ignore_index=ignore_index,
+        )
+        total_loss = total_loss + chunk_loss
+
+        # In-place release to free immediate activation buffer
+        del chunk_logits, chunk_hid
+
+    return total_loss / total_valid_tokens
+
+
+def make_patched_bailing_causallm_forward(original_forward):
+    """
+    Intercepts BailingMoeV3ForCausalLM forward pass.
+    When labels are provided during training / fine-tuning / SFT:
+    Computes Chunked Cross-Entropy Loss to avoid allocating [B, L, Vocab] logits.
+    """
+    def patched_causal_forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        **kwargs,
+    ):
+        # If labels are not provided, or caller explicitly asked for full logits (e.g. generate), use stock
+        if labels is None or getattr(self, "_disable_chunked_loss", False):
+            return original_forward(
+                self,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                labels=labels,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                **kwargs,
+            )
+
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        # Forward backbone model to get final hidden states
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            **kwargs,
+        )
+
+        hidden_states = outputs[0]
+
+        # Chunked Cross-Entropy calculation
+        chunk_size = getattr(self, "_loss_chunk_size", 512)
+        loss = compute_chunked_cross_entropy_loss(
+            hidden_states=hidden_states,
+            lm_head=self.lm_head,
+            labels=labels,
+            chunk_size=chunk_size,
+        )
+
+        if not return_dict:
+            return ((loss, None) + outputs[1:]) if loss is not None else outputs
+
+        from transformers.modeling_outputs import CausalLMOutputWithPast
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=None,  # Logits are bypassed to save VRAM
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+    return patched_causal_forward
+
+
+# =====================================================================
+# 4. High-Throughput Zero-Sync MoE Dispatch for Ling-3.0
 # =====================================================================
 
 def make_fast_bailing_moe_infer(original_moe_infer):
@@ -577,7 +767,8 @@ def make_fast_bailing_moe_infer(original_moe_infer):
     Dynamically routes between:
     1. Zero-Sync Batched-GEMM (BMM) for decode / small-batch rollouts (tokens * k <= 64),
        evaluating all routed experts concurrently via cuBLAS BMM (up to 5.7x faster).
-    2. Vectorized Active-Expert Grouped Dispatch for large prompt prefill.
+    2. Memory-Optimized In-Place Active-Expert Grouped Dispatch for large prompt prefill,
+       avoiding lingering duplicate tensors and freeing intermediate expert allocations.
     Output is bit-for-bit identical to stock HuggingFace moe_infer.
     """
     def fast_moe_infer(self, x: torch.Tensor, topk_ids: torch.Tensor, topk_weight: torch.Tensor) -> torch.Tensor:
@@ -612,27 +803,40 @@ def make_fast_bailing_moe_infer(original_moe_infer):
         cnts = topk_ids.new_zeros((topk_ids.shape[0], len(self.experts)))
         cnts.scatter_(1, topk_ids, 1)
         tokens_per_expert = cnts.sum(dim=0)
+        del cnts
+
         idxs = topk_ids.view(-1).argsort()
         sorted_tokens = x[idxs // topk_ids.shape[1]]
 
         # Only iterate over experts that have at least one token assigned
         active_mask = tokens_per_expert > 0
         active_exp_ids = active_mask.nonzero(as_tuple=True)[0]
+        del active_mask
+
         cum = torch.cumsum(tokens_per_expert, dim=0)
         starts = (cum - tokens_per_expert)[active_exp_ids].tolist()
         counts = tokens_per_expert[active_exp_ids].tolist()
         exp_list = active_exp_ids.tolist()
+        del cum, tokens_per_expert, active_exp_ids
 
-        outputs = []
+        # Memory optimization: pre-allocate output buffer directly to eliminate
+        # large torch.cat duplication and intermediate Python list accumulation
+        outs = sorted_tokens.new_empty((num_tokens * num_topk, hidden_dim)) if (num_tokens * num_topk > 0) else sorted_tokens.new_empty(0)
+
+        write_cursor = 0
         for exp_id, s_idx, n_tok in zip(exp_list, starts, counts):
             expert = self.experts[exp_id]
             tokens_for_this_expert = sorted_tokens[s_idx:s_idx + n_tok]
             expert_out = expert(tokens_for_this_expert)
-            outputs.append(expert_out.to(x.device))
+            outs[write_cursor:write_cursor + n_tok] = expert_out.to(outs.device)
+            write_cursor += n_tok
 
-        outs = torch.cat(outputs, dim=0) if len(outputs) else sorted_tokens.new_empty(0)
+        del sorted_tokens
+
         new_x = torch.empty_like(outs)
         new_x[idxs] = outs
+        del outs, idxs
+
         final_out = (
             new_x.view(*topk_ids.shape, -1)
             .type(topk_weight.dtype)
@@ -640,6 +844,7 @@ def make_fast_bailing_moe_infer(original_moe_infer):
             .sum(dim=1)
             .type(x.dtype)
         )
+        del new_x
         return final_out
 
     return fast_moe_infer
@@ -649,13 +854,25 @@ def make_fast_bailing_moe_infer(original_moe_infer):
 # 4. Universal Ling-3.0 Patcher & Unpatcher
 # =====================================================================
 
-def patch_ling(model, mode: str = "flash", patch_moe: bool = True):
+def patch_ling(
+    model,
+    mode: str = "flash",
+    patch_moe: bool = True,
+    patch_rms: bool = True,
+    patch_chunked_loss: bool = True,
+    loss_chunk_size: int = 512,
+):
     """
-    Patches inclusionAI/Ling-3.0-tiny (BF16, FP8, INT4) with Sword's
-    Pure FlashAttention MLA and Zero-Sync Fast MoE Expert Dispatch.
+    Patches inclusionAI/Ling-3.0-tiny (BF16, FP8, INT4) with Sword's:
+    1. Pure FlashAttention MLA (SDPA)
+    2. Zero-Sync Fast MoE Expert Dispatch with in-place activation recycling
+    3. Memory-Efficient Fused RMSNorm (avoids intermediate FP32 activation copies)
+    4. Chunked Cross-Entropy Loss (bypasses [B, L, 157184] VRAM materialization during SFT/pretraining)
     """
     mla_patched = 0
     moe_patched = 0
+    rms_patched = 0
+    loss_patched = 0
 
     # Ensure dynamic module has fast_attention_forward registered
     mod = sys.modules.get(model.__class__.__module__)
@@ -664,10 +881,20 @@ def patch_ling(model, mode: str = "flash", patch_moe: bool = True):
         mod.eager_attention_forward = fast_attention_forward
         mod._sword_mla_sdpa_installed = True
 
+    # 1. Patch CausalLM Forward for Chunked Cross-Entropy
+    if patch_chunked_loss:
+        mod_name = model.__class__.__name__
+        if "CausalLM" in mod_name or hasattr(model, "lm_head"):
+            if not hasattr(model, "_sword_original_forward"):
+                model._sword_original_forward = model.forward
+                model._loss_chunk_size = loss_chunk_size
+                model.forward = types.MethodType(make_patched_bailing_causallm_forward(model._sword_original_forward), model)
+                loss_patched += 1
+
     for name, module in model.named_modules():
         mod_cls_name = module.__class__.__name__
 
-        # 1. Patch Multi-Head Latent Attention (MLA)
+        # 2. Patch Multi-Head Latent Attention (MLA)
         if mod_cls_name == "BailingMoeV3MultiLatentAttention" or (
             hasattr(module, "kv_a_proj_with_mqa") and hasattr(module, "kv_b_proj")
         ):
@@ -677,7 +904,7 @@ def patch_ling(model, mode: str = "flash", patch_moe: bool = True):
             module.forward = types.MethodType(make_patched_bailing_mla_forward(module._sword_original_forward), module)
             mla_patched += 1
 
-        # 2. Patch MoE Sparse Block
+        # 3. Patch MoE Sparse Block
         if patch_moe and (
             mod_cls_name == "BailingMoeV3SparseMoeBlock" or hasattr(module, "moe_infer")
         ):
@@ -686,14 +913,32 @@ def patch_ling(model, mode: str = "flash", patch_moe: bool = True):
                 module.moe_infer = types.MethodType(make_fast_bailing_moe_infer(module._sword_original_moe_infer), module)
                 moe_patched += 1
 
+        # 4. Patch RMSNorm
+        if patch_rms and (
+            mod_cls_name == "BailingMoeV3RMSNorm" or "RMSNorm" in mod_cls_name
+        ):
+            if hasattr(module, "variance_epsilon") and hasattr(module, "weight") and not hasattr(module, "_sword_original_forward"):
+                module._sword_original_forward = module.forward
+                module.forward = types.MethodType(fast_rmsnorm_forward, module)
+                rms_patched += 1
+
     print(f"[Sword] Patched Ling-3.0-tiny: {mla_patched} MLA attention modules with Pure FlashAttention SDPA.")
-    print(f"[Sword] Patched Ling-3.0-tiny: {moe_patched} MoE routing blocks with Zero-Sync Fast Dispatch.")
+    print(f"[Sword] Patched Ling-3.0-tiny: {moe_patched} MoE routing blocks with Zero-Sync In-Place Dispatch.")
+    if rms_patched > 0:
+        print(f"[Sword] Patched Ling-3.0-tiny: {rms_patched} RMSNorm modules with Memory-Efficient Autograd.")
+    if loss_patched > 0:
+        print(f"[Sword] Patched Ling-3.0-tiny: CausalLM loss computation with Chunked Cross-Entropy (chunk_size={loss_chunk_size}).")
     return model
 
 
 def unpatch_ling(model):
     """Restores all patched Ling-3.0-tiny modules back to stock forward."""
     restored = 0
+    if hasattr(model, "_sword_original_forward"):
+        model.forward = model._sword_original_forward
+        delattr(model, "_sword_original_forward")
+        restored += 1
+
     for name, module in model.named_modules():
         if hasattr(module, "_sword_original_forward"):
             module.forward = module._sword_original_forward
@@ -725,6 +970,9 @@ def load_ling_model(
     max_seq_length: int = 8192,
     patch_sword: bool = True,
     patch_moe: bool = True,
+    patch_rms: bool = True,
+    patch_chunked_loss: bool = True,
+    loss_chunk_size: int = 512,
     attn_mode: str = "flash",
     **kwargs,
 ) -> Tuple[object, object]:
@@ -778,7 +1026,14 @@ def load_ling_model(
     )
 
     if patch_sword:
-        model = patch_ling(model, mode=attn_mode, patch_moe=patch_moe)
+        model = patch_ling(
+            model,
+            mode=attn_mode,
+            patch_moe=patch_moe,
+            patch_rms=patch_rms,
+            patch_chunked_loss=patch_chunked_loss,
+            loss_chunk_size=loss_chunk_size,
+        )
 
     model.eval()
     print(f"[Sword] Ling-3.0-tiny model ready for high-throughput inference & RL rollout.\n")

@@ -61,8 +61,17 @@ except ImportError:
     setup_fla_compatibility = None
 
 from datasets import load_dataset, Dataset
-from trl import SFTTrainer, SFTConfig
-from huggingface_hub import HfApi, snapshot_download
+try:
+    from trl import SFTTrainer, SFTConfig
+except ImportError:
+    SFTTrainer = None
+    SFTConfig = None
+
+try:
+    from huggingface_hub import HfApi, snapshot_download
+except ImportError:
+    HfApi = None
+    snapshot_download = None
 
 # Optimize runtime allocations
 os.environ["HF_DEACTIVATE_ASYNC_LOAD"] = "1"
