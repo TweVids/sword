@@ -422,18 +422,25 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token or "<|pad|>"
     tokenizer.padding_side = "right"
 
-    # Respect Ling-3.0-tiny-base's native chat template (<role>HUMAN</role>, <role>ASSISTANT</role>, etc.)
-    # Only supply fallback ChatML if no template exists on the tokenizer
-    if not getattr(tokenizer, "chat_template", None):
-        print("[*] No chat template found on tokenizer — configuring ChatML template.")
-        tokenizer.chat_template = (
-            "{% for message in messages %}"
-            "{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}"
-            "{% endfor %}"
-            "{% if add_generation_prompt %}{{'<|im_start|>assistant\n'}}{% endif %}"
-        )
-    else:
-        print("[*] Detected official native chat template on Ling-3.0-tiny-base tokenizer.")
+    # Ling-3.0-tiny Native Chat Template with <think> preservation:
+    # Stock Ling chat_template.jinja strips literal <think>...</think> tags.
+    # For cold-start SFT and subsequent GRPO, we preserve <think>...</think> tags so
+    # the base model explicitly learns reasoning delimiters for RL rollout parsing.
+    tokenizer.chat_template = (
+        "{%- for message in messages %}"
+        "{%- if message.role == 'system' %}"
+        "{{- '<role>SYSTEM</role>' + message.content + '<|role_end|>' }}"
+        "{%- elif message.role == 'user' %}"
+        "{{- '<role>HUMAN</role>' + message.content + '<|role_end|>' }}"
+        "{%- elif message.role == 'assistant' %}"
+        "{{- '<role>ASSISTANT</role>' + message.content + '<|role_end|>' }}"
+        "{%- endif %}"
+        "{%- endfor %}"
+        "{%- if add_generation_prompt %}"
+        "{{- '<role>ASSISTANT</role>' }}"
+        "{%- endif %}"
+    )
+    print("[*] Configured Ling native <role> chat template (with <think> reasoning preservation).")
 
     # 3. Format dataset text prompts using chat template
     def formatting_prompts_func(examples):
