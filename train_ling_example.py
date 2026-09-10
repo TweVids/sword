@@ -493,6 +493,22 @@ def main():
         packing=False,
     )
 
+    # Ensure model config has model_type populated so external tools don't crash
+    if hasattr(model, "config") and (not getattr(model.config, "model_type", None) or model.config.model_type == ""):
+        model.config.model_type = "bailing_hybrid"
+
+    # Unsloth monkey-patches TRL's SFTTrainer.__init__ to inspect known model types (Llama, Qwen, etc.),
+    # which raises TypeError for custom architectures like Ling's BailingMoeV3Config.
+    # We unwrap SFTTrainer.__init__ back to the pure Hugging Face TRL implementation:
+    import inspect
+    import trl
+    if hasattr(trl, "SFTTrainer") and hasattr(trl.SFTTrainer, "__init__"):
+        try:
+            trl.SFTTrainer.__init__ = inspect.unwrap(trl.SFTTrainer.__init__)
+            print("[*] Unwrapped SFTTrainer to native TRL (bypassing Unsloth auto-packing check for Ling).")
+        except Exception as e:
+            print(f"⚠️ SFTTrainer unwrap notice: {e}")
+
     trainer = SFTTrainer(
         model=model,
         train_dataset=train_ds,
