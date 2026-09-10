@@ -87,9 +87,9 @@ DATASET_LOCAL_PATH = r"E:\lingtiny\merged_finetune_dataset_with_effort.jsonl"
 DATASET_DRIVE_URL = os.environ.get("DATASET_DRIVE_URL", "")  # e.g. "https://drive.google.com/file/d/..."
 
 CFG = dict(
-    model_id="inclusionAI/Ling-3.0-tiny",  # Ling-3.0-tiny text base
-    output_dir="sft-ling-3.0-tiny",
-    max_seq_len=4096,                      # Target sequence context
+    model_id="inclusionAI/Ling-3.0-tiny-base",  # Raw text completion base model (Cold SFT)
+    output_dir="sft-ling-3.0-tiny-base",
+    max_seq_len=4096,                          # Target sequence context
     num_epochs=1,
     per_device_bs=2,
     grad_accum=8,
@@ -422,14 +422,24 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token or "<|pad|>"
     tokenizer.padding_side = "right"
 
-    # ChatML template if not already present
-    if not getattr(tokenizer, "chat_template", None):
-        tokenizer.chat_template = (
-            "{% for message in messages %}"
-            "{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}"
-            "{% endfor %}"
-            "{% if add_generation_prompt %}{{'<|im_start|>assistant\n'}}{% endif %}"
-        )
+    # Base Model Cold-Start: Register ChatML and reasoning delimiters
+    # Since Ling-3.0-tiny-base is a raw completion base model, ensure conversation tokens exist
+    special_tokens = ["<|im_start|>", "<|im_end|>", "<think>", "</think>"]
+    existing_vocab = tokenizer.get_vocab() if hasattr(tokenizer, "get_vocab") else {}
+    missing_tokens = [t for t in special_tokens if t not in existing_vocab]
+    if missing_tokens:
+        print(f"[*] Base model cold-start: adding {len(missing_tokens)} special tokens: {missing_tokens}")
+        tokenizer.add_special_tokens({"additional_special_tokens": missing_tokens})
+        if hasattr(model, "resize_token_embeddings"):
+            model.resize_token_embeddings(len(tokenizer))
+
+    # Configure ChatML template for cold-start SFT
+    tokenizer.chat_template = (
+        "{% for message in messages %}"
+        "{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}"
+        "{% endfor %}"
+        "{% if add_generation_prompt %}{{'<|im_start|>assistant\n'}}{% endif %}"
+    )
 
     # 3. Format dataset text prompts using chat template
     def formatting_prompts_func(examples):
