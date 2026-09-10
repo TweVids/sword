@@ -44,29 +44,74 @@ def setup_fla_compatibility():
     Registers pure-PyTorch fallbacks for `fla` (Flash Linear Attention)
     so that `inclusionAI/Ling-3.0-tiny` models can be loaded with `trust_remote_code=True`
     even in environments without `fla-core` installed.
+    Guarantees compatibility across Python 3.10-3.13 by setting __path__ package attributes
+    and linking parent-child module hierarchies.
     """
-    if "fla" in sys.modules and getattr(sys.modules["fla"], "_sword_loaded", False):
-        return
-
+    # Check if all required ops are genuinely present and functional
     try:
-        import fla
-        # Library exists and is functional
+        from fla.ops.simple_gla.fused_recurrent import fused_recurrent_simple_gla
+        from fla.ops.simple_gla.chunk import chunk_simple_gla
+        from fla.modules import FusedRMSNormGated, ShortConvolution
+        from fla.ops.kda import chunk_kda, fused_recurrent_kda
+        from fla.ops.utils.index import prepare_cu_seqlens_from_mask, prepare_lens_from_mask
+        from fla.utils import tensor_cache
         return
     except Exception:
         pass
 
-    # Create dummy module hierarchy
-    fla_mod = types.ModuleType("fla")
+    # Retrieve or construct package hierarchy with __path__ for Python 3.13 dynamic imports
+    fla_mod = sys.modules.get("fla")
+    if fla_mod is None:
+        fla_mod = types.ModuleType("fla")
+        sys.modules["fla"] = fla_mod
+    if not hasattr(fla_mod, "__path__"):
+        fla_mod.__path__ = []
     fla_mod._sword_loaded = True
-    modules_mod = types.ModuleType("fla.modules")
-    ops_mod = types.ModuleType("fla.ops")
-    ops_kda_mod = types.ModuleType("fla.ops.kda")
-    ops_utils_mod = types.ModuleType("fla.ops.utils")
-    ops_utils_index_mod = types.ModuleType("fla.ops.utils.index")
-    utils_mod = types.ModuleType("fla.utils")
-    simple_gla_mod = types.ModuleType("fla.ops.simple_gla")
-    simple_gla_rec_mod = types.ModuleType("fla.ops.simple_gla.fused_recurrent")
-    simple_gla_chunk_mod = types.ModuleType("fla.ops.simple_gla.chunk")
+
+    modules_mod = sys.modules.get("fla.modules") or types.ModuleType("fla.modules")
+    modules_mod.__path__ = []
+    sys.modules["fla.modules"] = modules_mod
+    fla_mod.modules = modules_mod
+
+    ops_mod = sys.modules.get("fla.ops") or types.ModuleType("fla.ops")
+    ops_mod.__path__ = []
+    sys.modules["fla.ops"] = ops_mod
+    fla_mod.ops = ops_mod
+
+    ops_kda_mod = sys.modules.get("fla.ops.kda") or types.ModuleType("fla.ops.kda")
+    ops_kda_mod.__path__ = []
+    sys.modules["fla.ops.kda"] = ops_kda_mod
+    ops_mod.kda = ops_kda_mod
+
+    ops_utils_mod = sys.modules.get("fla.ops.utils") or types.ModuleType("fla.ops.utils")
+    ops_utils_mod.__path__ = []
+    sys.modules["fla.ops.utils"] = ops_utils_mod
+    ops_mod.utils = ops_utils_mod
+
+    ops_utils_index_mod = sys.modules.get("fla.ops.utils.index") or types.ModuleType("fla.ops.utils.index")
+    ops_utils_index_mod.__path__ = []
+    sys.modules["fla.ops.utils.index"] = ops_utils_index_mod
+    ops_utils_mod.index = ops_utils_index_mod
+
+    utils_mod = sys.modules.get("fla.utils") or types.ModuleType("fla.utils")
+    utils_mod.__path__ = []
+    sys.modules["fla.utils"] = utils_mod
+    fla_mod.utils = utils_mod
+
+    simple_gla_mod = sys.modules.get("fla.ops.simple_gla") or types.ModuleType("fla.ops.simple_gla")
+    simple_gla_mod.__path__ = []
+    sys.modules["fla.ops.simple_gla"] = simple_gla_mod
+    ops_mod.simple_gla = simple_gla_mod
+
+    simple_gla_rec_mod = sys.modules.get("fla.ops.simple_gla.fused_recurrent") or types.ModuleType("fla.ops.simple_gla.fused_recurrent")
+    simple_gla_rec_mod.__path__ = []
+    sys.modules["fla.ops.simple_gla.fused_recurrent"] = simple_gla_rec_mod
+    simple_gla_mod.fused_recurrent = simple_gla_rec_mod
+
+    simple_gla_chunk_mod = sys.modules.get("fla.ops.simple_gla.chunk") or types.ModuleType("fla.ops.simple_gla.chunk")
+    simple_gla_chunk_mod.__path__ = []
+    sys.modules["fla.ops.simple_gla.chunk"] = simple_gla_chunk_mod
+    simple_gla_mod.chunk = simple_gla_chunk_mod
 
     class ShortConvolution(nn.Conv1d):
         """
@@ -274,6 +319,8 @@ def setup_fla_compatibility():
     utils_mod.tensor_cache = tensor_cache
     simple_gla_rec_mod.fused_recurrent_simple_gla = fused_recurrent_kda
     simple_gla_chunk_mod.chunk_simple_gla = chunk_kda
+    simple_gla_mod.fused_recurrent_simple_gla = fused_recurrent_kda
+    simple_gla_mod.chunk_simple_gla = chunk_kda
 
     # Register into sys.modules
     sys.modules["fla"] = fla_mod

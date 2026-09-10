@@ -50,13 +50,15 @@ from transformers import (
 # ── 2. Sword Acceleration Import ──────────────────────────────────────
 try:
     import sword
-    from sword.ling import load_ling_model, patch_ling
+    from sword.ling import load_ling_model, patch_ling, setup_fla_compatibility
     from sword.trainer import setup_blackwell_environment, download_from_drive
+    setup_fla_compatibility()
 except ImportError:
     load_ling_model = None
     patch_ling = None
     setup_blackwell_environment = None
     download_from_drive = None
+    setup_fla_compatibility = None
 
 from datasets import load_dataset, Dataset
 from trl import SFTTrainer, SFTConfig
@@ -366,6 +368,7 @@ def main():
                 load_in_16bit=True,
                 use_gradient_checkpointing="unsloth",
                 token=HF_TOKEN or None,
+                trust_remote_code=True,
             )
             peft_kwargs = dict(
                 finetune_language_layers=True,
