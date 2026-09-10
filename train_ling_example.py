@@ -417,29 +417,23 @@ def main():
         model = get_peft_model(base_model, peft_config)
         model.print_trainable_parameters()
 
-    # Ensure tokenizer has padding token and chat template configured
+    # Ensure tokenizer has padding token configured
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token or "<|pad|>"
     tokenizer.padding_side = "right"
 
-    # Base Model Cold-Start: Register ChatML and reasoning delimiters
-    # Since Ling-3.0-tiny-base is a raw completion base model, ensure conversation tokens exist
-    special_tokens = ["<|im_start|>", "<|im_end|>", "<think>", "</think>"]
-    existing_vocab = tokenizer.get_vocab() if hasattr(tokenizer, "get_vocab") else {}
-    missing_tokens = [t for t in special_tokens if t not in existing_vocab]
-    if missing_tokens:
-        print(f"[*] Base model cold-start: adding {len(missing_tokens)} special tokens: {missing_tokens}")
-        tokenizer.add_special_tokens({"additional_special_tokens": missing_tokens})
-        if hasattr(model, "resize_token_embeddings"):
-            model.resize_token_embeddings(len(tokenizer))
-
-    # Configure ChatML template for cold-start SFT
-    tokenizer.chat_template = (
-        "{% for message in messages %}"
-        "{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}"
-        "{% endfor %}"
-        "{% if add_generation_prompt %}{{'<|im_start|>assistant\n'}}{% endif %}"
-    )
+    # Respect Ling-3.0-tiny-base's native chat template (<role>HUMAN</role>, <role>ASSISTANT</role>, etc.)
+    # Only supply fallback ChatML if no template exists on the tokenizer
+    if not getattr(tokenizer, "chat_template", None):
+        print("[*] No chat template found on tokenizer — configuring ChatML template.")
+        tokenizer.chat_template = (
+            "{% for message in messages %}"
+            "{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}"
+            "{% endfor %}"
+            "{% if add_generation_prompt %}{{'<|im_start|>assistant\n'}}{% endif %}"
+        )
+    else:
+        print("[*] Detected official native chat template on Ling-3.0-tiny-base tokenizer.")
 
     # 3. Format dataset text prompts using chat template
     def formatting_prompts_func(examples):
@@ -500,13 +494,21 @@ def main():
 
     # 5. Mask prompt turns — compute loss on assistant responses only
     if train_on_responses_only is not None:
+        chat_tmpl = getattr(tokenizer, "chat_template", "") or ""
+        if "<role>HUMAN</role>" in chat_tmpl or "<role>" in chat_tmpl:
+            inst_part = "<role>HUMAN</role>"
+            resp_part = "<role>ASSISTANT</role>"
+        else:
+            inst_part = "<|im_start|>user\n"
+            resp_part = "<|im_start|>assistant\n"
+
         try:
             trainer = train_on_responses_only(
                 trainer,
-                instruction_part="<|im_start|>user\n",
-                response_part="<|im_start|>assistant\n",
+                instruction_part=inst_part,
+                response_part=resp_part,
             )
-            print("[*] Enabled response-only loss masking (<|im_start|>assistant).")
+            print(f"[*] Enabled response-only loss masking (response delimiter: {resp_part!r}).")
         except Exception as e:
             print(f"⚠️ train_on_responses_only skipped ({e}). Training on full sequence.")
 
