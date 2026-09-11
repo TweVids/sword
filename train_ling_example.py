@@ -45,6 +45,7 @@ from transformers import (
     AutoTokenizer,
     AutoConfig,
     AutoModelForCausalLM,
+    DataCollatorForSeq2Seq,
 )
 
 # ── 2. Sword Acceleration Import ──────────────────────────────────────
@@ -666,11 +667,20 @@ def main():
         except Exception as e:
             print(f"⚠️ SFTTrainer unwrap notice: {e}")
 
+    # Dynamic Batch Padding: Each batch is padded only to the longest sequence in that batch
+    # (rounded to multiple of 8 for Tensor Core GEMM alignment) instead of static 34k tokens!
+    dynamic_collator = DataCollatorForSeq2Seq(
+        tokenizer=tokenizer,
+        pad_to_multiple_of=8,
+        return_tensors="pt",
+    )
+
     trainer = SFTTrainer(
         model=model,
         train_dataset=train_ds,
         eval_dataset=eval_ds,
         processing_class=tokenizer,
+        data_collator=dynamic_collator,
         args=training_args,
         callbacks=[checkpoint_cb],
     )
