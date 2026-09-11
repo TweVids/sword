@@ -55,8 +55,10 @@ def setup_fla_compatibility():
         from fla.ops.kda import chunk_kda, fused_recurrent_kda
         from fla.ops.utils.index import prepare_cu_seqlens_from_mask, prepare_lens_from_mask
         from fla.utils import tensor_cache
+        print("[Sword] [OK] Native Flash-Linear-Attention (FLA Triton/CUDA) detected & active!")
         return
-    except Exception:
+    except Exception as e:
+        print(f"[Sword] [*] Native FLA not found ({e}). Loading Pure-PyTorch compatibility shims.")
         pass
 
     # Retrieve or construct package hierarchy with __path__ for Python 3.13 dynamic imports
