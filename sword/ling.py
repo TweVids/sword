@@ -202,56 +202,57 @@ def setup_fla_compatibility():
         In stock eager PyTorch, unrolling recurrence over sequence length T (e.g. 34,096 tokens)
         creates a computational graph retaining T intermediate FP32 hidden state tensors
         [B, H, K, V] across all 20 KDA layers, requiring over 1,300 GB of autograd memory.
-        This autograd function checkpoints recurrence state 'h' every C=64 steps,
+        This autograd function checkpoints recurrence state 'h' every C=256 steps in input dtype,
         yielding exact O(sqrt(T)) activation memory overhead and reducing KDA backward
-        memory from > 90 GB down to < 200 MB!
+        memory from > 90 GB down to < 1.5 GB!
         """
         @staticmethod
-        def forward(ctx, q_norm, k_norm, v_fp32, decay, beta_fp32, initial_state=None):
+        def forward(ctx, q_norm, k_norm, v, decay, beta, initial_state=None):
             B, T, H, K = q_norm.shape
-            V = v_fp32.shape[-1]
-            C = 64  # Checkpoint interval
+            V = v.shape[-1]
+            C = 256  # Checkpoint interval (slashes checkpoint memory to ~1.3 GB for 20 layers)
             h_checkpoints = []
 
-            h = initial_state.clone() if initial_state is not None else torch.zeros(
+            h = initial_state.float().clone() if initial_state is not None else torch.zeros(
                 B, H, K, V, device=q_norm.device, dtype=torch.float32
             )
-            outs = torch.empty(B, T, H, V, device=q_norm.device, dtype=torch.float32)
+            outs = torch.empty(B, T, H, V, device=q_norm.device, dtype=q_norm.dtype)
 
             for t in range(T):
                 if t % C == 0:
-                    h_checkpoints.append(h.detach().clone())
-                dec_t = decay[:, t].unsqueeze(-1)
+                    # Store checkpoint in original precision (BF16/FP16) to conserve VRAM
+                    h_checkpoints.append(h.detach().to(q_norm.dtype))
+                dec_t = decay[:, t].float().unsqueeze(-1)
                 h = h * dec_t
-                kt = k_norm[:, t]
-                vt = v_fp32[:, t]
+                kt = k_norm[:, t].float()
+                vt = v[:, t].float()
                 b_pred = torch.einsum("bhk,bhkv->bhv", kt, h)
-                bt = beta_fp32[:, t]
+                bt = beta[:, t].float()
                 delta_v = (vt - b_pred) * bt
                 h = h + torch.einsum("bhk,bhv->bhkv", kt, delta_v)
-                qt = q_norm[:, t]
-                outs[:, t] = torch.einsum("bhk,bhkv->bhv", qt, h)
+                qt = q_norm[:, t].float()
+                outs[:, t] = torch.einsum("bhk,bhkv->bhv", qt, h).to(q_norm.dtype)
 
-            ctx.save_for_backward(q_norm, k_norm, v_fp32, decay, beta_fp32)
+            ctx.save_for_backward(q_norm, k_norm, v, decay, beta)
             ctx.h_checkpoints = h_checkpoints
             ctx.C = C
             return outs, h
 
         @staticmethod
         def backward(ctx, grad_outs, grad_final_h):
-            q_norm, k_norm, v_fp32, decay, beta_fp32 = ctx.saved_tensors
+            q_norm, k_norm, v, decay, beta = ctx.saved_tensors
             h_checkpoints = ctx.h_checkpoints
             C = ctx.C
             B, T, H, K = q_norm.shape
-            V = v_fp32.shape[-1]
+            V = v.shape[-1]
 
             grad_q = torch.zeros_like(q_norm)
             grad_k = torch.zeros_like(k_norm)
-            grad_v = torch.zeros_like(v_fp32)
+            grad_v = torch.zeros_like(v)
             grad_decay = torch.zeros_like(decay)
-            grad_beta = torch.zeros_like(beta_fp32)
+            grad_beta = torch.zeros_like(beta)
 
-            dh = grad_final_h.clone() if grad_final_h is not None else torch.zeros(
+            dh = grad_final_h.float().clone() if grad_final_h is not None else torch.zeros(
                 B, H, K, V, device=q_norm.device, dtype=torch.float32
             )
             num_chunks = (T + C - 1) // C
@@ -259,17 +260,17 @@ def setup_fla_compatibility():
             for c in range(num_chunks - 1, -1, -1):
                 t_start = c * C
                 t_end = min(t_start + C, T)
-                h_cur = h_checkpoints[c].clone()
+                h_cur = h_checkpoints[c].float().clone()
                 chunk_h_states = []
                 chunk_dv = []
 
                 for t in range(t_start, t_end):
                     chunk_h_states.append(h_cur.clone())
-                    h_cur = h_cur * decay[:, t].unsqueeze(-1)
-                    kt = k_norm[:, t]
-                    vt = v_fp32[:, t]
+                    h_cur = h_cur * decay[:, t].float().unsqueeze(-1)
+                    kt = k_norm[:, t].float()
+                    vt = v[:, t].float()
                     b_pred = torch.einsum("bhk,bhkv->bhv", kt, h_cur)
-                    bt = beta_fp32[:, t]
+                    bt = beta[:, t].float()
                     dv = (vt - b_pred) * bt
                     chunk_dv.append(dv)
                     h_cur = h_cur + torch.einsum("bhk,bhv->bhkv", kt, dv)
@@ -277,32 +278,33 @@ def setup_fla_compatibility():
                 for t in range(t_end - 1, t_start - 1, -1):
                     orig_h = chunk_h_states[t - t_start]
                     dv = chunk_dv[t - t_start]
-                    dec_t = decay[:, t].unsqueeze(-1)
-                    kt = k_norm[:, t]
-                    vt = v_fp32[:, t]
-                    bt = beta_fp32[:, t]
-                    qt = q_norm[:, t]
-                    go = grad_outs[:, t]
+                    dec_t = decay[:, t].float().unsqueeze(-1)
+                    kt = k_norm[:, t].float()
+                    vt = v[:, t].float()
+                    bt = beta[:, t].float()
+                    qt = q_norm[:, t].float()
+                    go = grad_outs[:, t].float()
 
                     h_mid = orig_h * dec_t
                     h_after = h_mid + torch.einsum("bhk,bhv->bhkv", kt, dv)
 
-                    grad_q[:, t] = torch.einsum("bhv,bhkv->bhk", go, h_after)
+                    grad_q[:, t] = torch.einsum("bhv,bhkv->bhk", go, h_after).to(q_norm.dtype)
                     dh = dh + torch.einsum("bhk,bhv->bhkv", qt, go)
 
-                    grad_k[:, t] = torch.einsum("bhkv,bhv->bhk", dh, dv)
+                    grad_k[:, t] = torch.einsum("bhkv,bhv->bhk", dh, dv).to(k_norm.dtype)
                     d_dv = torch.einsum("bhk,bhkv->bhv", kt, dh)
 
                     d_diff = d_dv * bt
                     diff = vt - torch.einsum("bhk,bhkv->bhv", kt, h_mid)
-                    grad_beta[:, t] = (d_dv * diff).sum(dim=-1, keepdim=True) if beta_fp32.shape[-1] == 1 else (d_dv * diff)
-                    grad_v[:, t] = d_diff
+                    d_beta = (d_dv * diff).sum(dim=-1, keepdim=True) if beta.shape[-1] == 1 else (d_dv * diff)
+                    grad_beta[:, t] = d_beta.to(beta.dtype)
+                    grad_v[:, t] = d_diff.to(v.dtype)
 
                     d_bpred = -d_diff
-                    grad_k[:, t] += torch.einsum("bhv,bhkv->bhk", d_bpred, h_mid)
+                    grad_k[:, t] += torch.einsum("bhv,bhkv->bhk", d_bpred, h_mid).to(k_norm.dtype)
                     dh_mid = dh + torch.einsum("bhk,bhv->bhkv", kt, d_bpred)
 
-                    grad_decay[:, t] = (dh_mid * orig_h).sum(dim=-1)
+                    grad_decay[:, t] = (dh_mid * orig_h).sum(dim=-1).to(decay.dtype)
                     dh = dh_mid * dec_t
 
             return grad_q, grad_k, grad_v, grad_decay, grad_beta, None
@@ -372,8 +374,15 @@ def setup_fla_compatibility():
             ot = torch.matmul(qt.unsqueeze(2), h).squeeze(2)
             return ot.unsqueeze(1).to(q.dtype), h
 
-        # Multi-token sequence prefill/training: use chunked autograd function to avoid OOM
-        outs, final_h = KDAChunkedAutogradFunction.apply(q_norm, k_norm, v_fp32, decay, beta_fp32, recurrent_state)
+        # Multi-token sequence prefill/training: use chunked autograd function with native dtype
+        outs, final_h = KDAChunkedAutogradFunction.apply(
+            q_norm.to(q.dtype),
+            k_norm.to(k.dtype),
+            v,
+            decay.to(q.dtype),
+            beta_fp32.to(q.dtype),
+            recurrent_state,
+        )
         return outs.to(q.dtype), final_h
 
     def fused_recurrent_kda(

@@ -102,8 +102,8 @@ CFG = dict(
     output_dir="sft-ling-3.0-tiny-base",
     max_seq_len=4096,                          # Target sequence context
     num_epochs=1,
-    per_device_bs=2,
-    grad_accum=8,
+    per_device_bs=1,                           # bs=1 is optimal for long sequences (32k+ tokens)
+    grad_accum=16,                             # Equivalent effective batch size (1 * 16 = 16)
     lr=2e-4,
     warmup_steps=50,
     seed=3407,
