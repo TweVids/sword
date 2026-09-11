@@ -198,6 +198,143 @@ def download_dataset_from_drive(drive_url: str, dest_path: str, force: bool = Fa
 
 
 # =========================================================
+# 📊 VRAM REQUIREMENT CALCULATOR & PRE-FLIGHT CHECK
+# =========================================================
+def estimate_vram_requirement(
+    model_params_b: float = 7.9,
+    active_params_b: float = 1.3,
+    precision_bytes: float = 2.0,  # 2 for BF16/FP16, 1 for FP8, 0.5 for INT4
+    max_seq_len: int = 32768,
+    per_device_bs: int = 1,
+    lora_r: int = 16,
+    num_layers: int = 24,
+    hidden_dim: int = 2048,
+    vocab_size: int = 157184,
+    use_gradient_checkpointing: bool = True,
+    use_chunked_loss: bool = True,
+    optim: str = "adamw_8bit",
+) -> Dict[str, Any]:
+    """
+    Computes precise breakdown of VRAM needed to fine-tune Ling-3.0-tiny MoE model:
+    1. Base Model Weights
+    2. LoRA Adapter Weights & Gradients
+    3. Optimizer States (AdamW 8-bit vs 32-bit)
+    4. Forward/Backward Activations (with Flash MLA SDPA & Gradient Checkpointing)
+    5. Chunked Loss Logits vs Full Logit Materialization
+    6. PyTorch CUDA Workspace & Context Buffers
+    """
+    # 1. Base Model Weights (frozen during LoRA)
+    base_weights_gb = (model_params_b * 1e9 * precision_bytes) / (1024 ** 3)
+
+    # 2. LoRA Parameters (Attention + MoE projections)
+    # Target modules: q, k, v, o, kv_a, kv_b, gate, up, down across 24 layers
+    # Approximate trainable params at rank 16: ~40M to 70M params
+    lora_params_m = lora_r * 2 * 12 * num_layers * hidden_dim / 1e6
+    lora_weights_gb = (lora_params_m * 1e6 * precision_bytes) / (1024 ** 3)
+    lora_grads_gb = (lora_params_m * 1e6 * precision_bytes) / (1024 ** 3)
+
+    # 3. Optimizer States
+    # adamw_8bit: 2 bytes per param (1 byte momentum + 1 byte variance)
+    # adamw_torch / adamw_fused: 8 bytes per param (4 bytes FP32 momentum + 4 bytes FP32 variance)
+    optim_bytes_per_param = 2.0 if "8bit" in optim else 8.0
+    optim_states_gb = (lora_params_m * 1e6 * optim_bytes_per_param) / (1024 ** 3)
+
+    # 4. Activation Memory
+    # With gradient checkpointing enabled, PyTorch only stores boundary activations per transformer block
+    # Hidden state tensor per layer: [B, L, H] * precision_bytes
+    boundary_act_per_layer = per_device_bs * max_seq_len * hidden_dim * precision_bytes
+    if use_gradient_checkpointing:
+        # Checkpointed: Stored boundary inputs across layers + recomputed peak block
+        checkpointed_act_gb = (boundary_act_per_layer * num_layers) / (1024 ** 3)
+        peak_block_act_gb = (boundary_act_per_layer * 3.5) / (1024 ** 3)  # Peak inner MLA/SwiGLU within 1 block
+        total_act_gb = checkpointed_act_gb + peak_block_act_gb
+    else:
+        # Non-checkpointed: Quadratic/Linear activations retained across ALL layers
+        total_act_gb = (boundary_act_per_layer * num_layers * 4.0) / (1024 ** 3)
+
+    # 5. Logits & Loss Memory
+    if use_chunked_loss:
+        # Chunk size 512 avoids [B, L, Vocab] FP32 logits
+        logits_gb = (per_device_bs * 512 * vocab_size * 4) / (1024 ** 3)
+    else:
+        # Full materialization [B, L, 157184] FP32
+        logits_gb = (per_device_bs * max_seq_len * vocab_size * 4) / (1024 ** 3)
+
+    # 6. CUDA Context & PyTorch Fragment Overhead (~1.0 - 1.5 GB)
+    cuda_overhead_gb = 1.2
+
+    total_vram_needed_gb = (
+        base_weights_gb
+        + lora_weights_gb
+        + lora_grads_gb
+        + optim_states_gb
+        + total_act_gb
+        + logits_gb
+        + cuda_overhead_gb
+    )
+
+    return {
+        "total_gb": round(total_vram_needed_gb, 2),
+        "base_weights_gb": round(base_weights_gb, 2),
+        "lora_weights_gb": round(lora_weights_gb, 3),
+        "lora_grads_gb": round(lora_grads_gb, 3),
+        "optim_states_gb": round(optim_states_gb, 3),
+        "activations_gb": round(total_act_gb, 2),
+        "logits_gb": round(logits_gb, 2),
+        "cuda_overhead_gb": round(cuda_overhead_gb, 2),
+        "max_seq_len": max_seq_len,
+        "batch_size": per_device_bs,
+    }
+
+
+def print_vram_preflight(cfg: Dict[str, Any], precision_bytes: float = 2.0):
+    """Prints a human-readable pre-flight VRAM report and warns if hardware is insufficient."""
+    est = estimate_vram_requirement(
+        model_params_b=7.9,
+        precision_bytes=precision_bytes,
+        max_seq_len=cfg.get("max_seq_len", 4096),
+        per_device_bs=cfg.get("per_device_bs", 1),
+        lora_r=cfg.get("lora_r", 16),
+        optim=cfg.get("optim", "adamw_8bit"),
+        use_gradient_checkpointing=True,
+        use_chunked_loss=True,
+    )
+
+    avail_vram_gb = 0.0
+    gpu_name = "None (CPU)"
+    if torch.cuda.is_available():
+        p = torch.cuda.get_device_properties(0)
+        avail_vram_gb = round(p.total_memory / (1024 ** 3), 2)
+        gpu_name = p.name
+
+    print("=" * 68)
+    print(f"🖥️  VRAM ESTIMATION PRE-FLIGHT CHECK ({cfg.get('model_id', 'Ling-3.0-tiny')})")
+    print("=" * 68)
+    print(f"Target Max Sequence Length : {est['max_seq_len']:,} tokens")
+    print(f"Per-Device Batch Size      : {est['batch_size']}")
+    print(f"Base Model Weights         : {est['base_weights_gb']} GB")
+    print(f"LoRA Adapter Weights+Grads : {est['lora_weights_gb'] + est['lora_grads_gb']:.2f} GB")
+    print(f"Optimizer States (8-bit)   : {est['optim_states_gb']} GB")
+    print(f"Activations (with SDPA+GC) : {est['activations_gb']} GB")
+    print(f"Chunked Loss Head (512 tk) : {est['logits_gb']} GB (saved {((est['batch_size'] * est['max_seq_len'] * 157184 * 4)/(1024**3) - est['logits_gb']):.1f} GB vs unchunked!)")
+    print(f"PyTorch CUDA Overhead      : {est['cuda_overhead_gb']} GB")
+    print("-" * 68)
+    print(f"⚡ TOTAL ESTIMATED VRAM     : {est['total_gb']} GB")
+    print(f"🎮 DETECTED GPU VRAM       : {avail_vram_gb} GB ({gpu_name})")
+    print("=" * 68)
+
+    if avail_vram_gb > 0 and avail_vram_gb < est["total_gb"]:
+        deficit = est["total_gb"] - avail_vram_gb
+        print(f"\n⚠️  CRITICAL VRAM WARNING: Current GPU has {avail_vram_gb} GB, but fine-tuning requires ~{est['total_gb']} GB (Deficit: {deficit:.1f} GB).")
+        print(f"   Recommended Options:")
+        print(f"   1. Use a cloud GPU with at least 24 GB (RTX 3090/4090, A10, L4, A100).")
+        print(f"   2. If testing locally, load in 4-bit/FP8 or reduce sequence length.")
+    else:
+        print(f"✅ VRAM check passed: GPU memory is sufficient for training.")
+    print("")
+
+
+# =========================================================
 # 🔀 DATASET LOADER & SHUFFLER
 # =========================================================
 def load_and_prepare_dataset(local_path: str, drive_url: str = "", seed: int = 3407) -> Dataset:
@@ -339,8 +476,9 @@ class FullCheckpointCallback(TrainerCallback):
 def main():
     if torch.cuda.is_available():
         torch.cuda.set_device(0)
-        print(f"GPU : {torch.cuda.get_device_name(0)}")
-        print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+
+    # Pre-flight VRAM estimation check
+    print_vram_preflight(CFG)
 
     # 1. Resolve & Prepare Dataset (with immediate shuffle)
     full_ds = load_and_prepare_dataset(
@@ -404,9 +542,11 @@ def main():
             print("Loading via Sword load_ling_model (Flash MLA SDPA + Fast MoE)...")
             base_model, tokenizer = load_ling_model(
                 model_name_or_path=CFG["model_id"],
+                device_map=None,  # Do NOT use device_map="auto" during training!
                 patch_sword=True,
                 patch_moe=True,
             )
+            base_model.train()
         else:
             print("Loading via Hugging Face AutoModelForCausalLM...")
             tokenizer = AutoTokenizer.from_pretrained(CFG["model_id"], trust_remote_code=True)
@@ -479,6 +619,12 @@ def main():
         save_limit=CFG["save_limit"],
     )
 
+    # Enable gradient checkpointing to keep activation memory minimal for long sequences
+    if hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
+
     training_args = SFTConfig(
         output_dir=CFG["output_dir"],
         num_train_epochs=CFG["num_epochs"],
@@ -491,6 +637,8 @@ def main():
         fp16=False,
         bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
         optim="adamw_8bit" if torch.cuda.is_available() else "adamw_torch",
+        gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
         logging_steps=10,
         save_strategy="no",  # Handled by FullCheckpointCallback
         eval_strategy="steps",
