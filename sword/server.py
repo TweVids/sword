@@ -367,7 +367,7 @@ class FastServer:
                 self._graph_captured = False
                 self.cuda_graph_runner = None
                 if not getattr(self, "_logged_graph_note", False):
-                    print(f"[Sword] Decode mode: Optimized Zero-Sync SDPA + Fast MoE active (graph fallback note: {type(e).__name__}).")
+                    print(f"[Sword] Decode mode: Optimized Zero-Sync SDPA + Fast MoE active (graph fallback note: {type(e).__name__}: {e}).")
                     self._logged_graph_note = True
 
         # High-Speed Decode Loop
