@@ -259,7 +259,8 @@ def make_fast_moe_forward(original_forward):
     Replaces HuggingFace's eager routing loop (which executes one_hot + .nonzero() +
     torch.where() on GPU, inducing 1,500+ host-device synchronization roundtrips
     and ~800ms per token latency) with a 0.099ms zero-sync CPU routing dispatch.
-    Numerically bit-identical to HuggingFace FP8Experts.
+    Numerically bit-identical to HuggingFace FP8Experts & Qwen3MoeExperts.
+    Safely unwraps PEFT / Unsloth ParamWrapper layers and preserves active LoRA hooks.
     """
     def fast_moe_forward(
         self,
@@ -269,101 +270,127 @@ def make_fast_moe_forward(original_forward):
         *args,
         **kwargs,
     ) -> torch.Tensor:
-        num_tokens, hidden_dim = hidden_states.shape
-        num_experts = getattr(self, "num_experts", 128)
-        has_gate = getattr(self, "has_gate", True)
-        is_static = getattr(self, "activation_scheme", "dynamic") == "static"
+        # Resolve target module if wrapped by PEFT / Unsloth ParamWrapper
+        target = self
+        lora_ctx = None
+        if hasattr(self, "_activate_lora") and hasattr(self, "active_adapters"):
+            try:
+                lora_ctx = self._activate_lora(self.active_adapters)
+            except Exception:
+                lora_ctx = None
 
-        # Fast CPU routing: single D2H copy avoids GPU-side .nonzero() and torch.where() sync stalls completely
-        top_k_cpu = top_k_index.tolist()
-        expert_to_tokens = {}
-        for tok_i, exp_ids in enumerate(top_k_cpu):
-            for k_pos, exp_id in enumerate(exp_ids):
-                if exp_id < num_experts:
-                    expert_to_tokens.setdefault(exp_id, []).append((tok_i, k_pos))
+        while hasattr(target, "base_layer"):
+            target = target.base_layer
+        if hasattr(target, "module") and not hasattr(target, "gate_up_proj") and hasattr(target.module, "gate_up_proj"):
+            target = target.module
 
-        final_hidden_states = torch.zeros_like(hidden_states, dtype=torch.float32)
+        # Check if target has expected projections; if not, safely fallback to original_forward
+        has_gate_up = hasattr(target, "gate_up_proj")
+        has_split = hasattr(target, "gate_proj") and hasattr(target, "up_proj")
+        has_exp_list = hasattr(target, "experts") and isinstance(target.experts, (list, torch.nn.ModuleList))
+        is_fp8 = hasattr(target, "linear")
 
-        act_fn = getattr(self, "act_fn", F.silu)
+        if not (has_gate_up or has_split or has_exp_list or is_fp8):
+            return original_forward(hidden_states, top_k_index, top_k_weights, *args, **kwargs)
 
-        for exp_id, pairs in expert_to_tokens.items():
-            gate_up_act_scale = (
-                self.gate_up_proj_activation_scale[exp_id] if (is_static and hasattr(self, "gate_up_proj_activation_scale")) else None
-            )
-            down_act_scale = (
-                self.down_proj_activation_scale[exp_id] if (is_static and hasattr(self, "down_proj_activation_scale")) else None
-            )
+        def _do_dispatch():
+            num_tokens, hidden_dim = hidden_states.shape
+            num_experts = getattr(target, "num_experts", 128)
+            has_gate = getattr(target, "has_gate", True)
+            is_static = getattr(target, "activation_scheme", "dynamic") == "static"
 
-            is_fp8 = hasattr(self, "linear")
-            if is_fp8:
-                weight_up = self.gate_up_proj[exp_id] if has_gate else self.up_proj[exp_id]
-                scale_up = self.gate_up_proj_scale_inv[exp_id] if has_gate else self.up_proj_scale_inv[exp_id]
-                weight_down = self.down_proj[exp_id]
-                scale_down = self.down_proj_scale_inv[exp_id]
+            # Fast CPU routing: single D2H copy avoids GPU-side .nonzero() and torch.where() sync stalls completely
+            top_k_cpu = top_k_index.tolist()
+            expert_to_tokens = {}
+            for tok_i, exp_ids in enumerate(top_k_cpu):
+                for k_pos, exp_id in enumerate(exp_ids):
+                    if exp_id < num_experts:
+                        expert_to_tokens.setdefault(exp_id, []).append((tok_i, k_pos))
 
-            if len(pairs) == 1:
-                tok_i, k_pos = pairs[0]
-                current_state = hidden_states[tok_i:tok_i+1]
+            final_hidden_states = torch.zeros_like(hidden_states, dtype=torch.float32)
+            act_fn = getattr(target, "act_fn", F.silu)
+
+            for exp_id, pairs in expert_to_tokens.items():
+                gate_up_act_scale = (
+                    target.gate_up_proj_activation_scale[exp_id] if (is_static and hasattr(target, "gate_up_proj_activation_scale")) else None
+                )
+                down_act_scale = (
+                    target.down_proj_activation_scale[exp_id] if (is_static and hasattr(target, "down_proj_activation_scale")) else None
+                )
+
                 if is_fp8:
-                    proj_out = self.linear(current_state, weight_up, scale_up, activation_scale=gate_up_act_scale)
-                    proj_out = self._apply_gate(proj_out) if has_gate else act_fn(proj_out)
-                    proj_out = self.linear(proj_out, weight_down, scale_down, activation_scale=down_act_scale)
-                else:
-                    # Robust projection: handles 3D Parameter, Linear4bit, ModuleList, or separate gate/up projections
-                    if hasattr(self, "experts") and isinstance(self.experts, (list, torch.nn.ModuleList)):
-                        proj_out = self.experts[exp_id](current_state)
-                    elif hasattr(self, "gate_proj") and hasattr(self, "up_proj"):
-                        proj_g = self.gate_proj[exp_id]
-                        proj_u = self.up_proj[exp_id]
-                        gate = proj_g(current_state) if callable(proj_g) else F.linear(current_state, proj_g)
-                        up = proj_u(current_state) if callable(proj_u) else F.linear(current_state, proj_u)
-                        proj_out = act_fn(gate) * up
-                        proj_d = self.down_proj[exp_id]
-                        proj_out = proj_d(proj_out) if callable(proj_d) else F.linear(proj_out, proj_d)
+                    weight_up = target.gate_up_proj[exp_id] if has_gate else target.up_proj[exp_id]
+                    scale_up = target.gate_up_proj_scale_inv[exp_id] if has_gate else target.up_proj_scale_inv[exp_id]
+                    weight_down = target.down_proj[exp_id]
+                    scale_down = target.down_proj_scale_inv[exp_id]
+
+                if len(pairs) == 1:
+                    tok_i, k_pos = pairs[0]
+                    current_state = hidden_states[tok_i : tok_i + 1]
+                    if is_fp8:
+                        proj_out = target.linear(current_state, weight_up, scale_up, activation_scale=gate_up_act_scale)
+                        proj_out = target._apply_gate(proj_out) if has_gate else act_fn(proj_out)
+                        proj_out = target.linear(proj_out, weight_down, scale_down, activation_scale=down_act_scale)
                     else:
-                        proj_module_up = self.gate_up_proj[exp_id]
-                        proj_out = proj_module_up(current_state) if callable(proj_module_up) else F.linear(current_state, proj_module_up)
-                        gate, up = proj_out.chunk(2, dim=-1)
-                        proj_out = act_fn(gate) * up
-                        proj_module_down = self.down_proj[exp_id]
-                        proj_out = proj_module_down(proj_out) if callable(proj_module_down) else F.linear(proj_out, proj_module_down)
+                        if has_exp_list:
+                            proj_out = target.experts[exp_id](current_state)
+                        elif has_split:
+                            proj_g = target.gate_proj[exp_id]
+                            proj_u = target.up_proj[exp_id]
+                            gate = proj_g(current_state) if callable(proj_g) else F.linear(current_state, proj_g)
+                            up = proj_u(current_state) if callable(proj_u) else F.linear(current_state, proj_u)
+                            proj_out = act_fn(gate) * up
+                            proj_d = target.down_proj[exp_id]
+                            proj_out = proj_d(proj_out) if callable(proj_d) else F.linear(proj_out, proj_d)
+                        else:
+                            proj_module_up = target.gate_up_proj[exp_id]
+                            proj_out = proj_module_up(current_state) if callable(proj_module_up) else F.linear(current_state, proj_module_up)
+                            gate, up = proj_out.chunk(2, dim=-1)
+                            proj_out = act_fn(gate) * up
+                            proj_module_down = target.down_proj[exp_id]
+                            proj_out = proj_module_down(proj_out) if callable(proj_module_down) else F.linear(proj_out, proj_module_down)
 
-                routing_weight = top_k_weights[tok_i, k_pos]
-                final_hidden_states[tok_i] += (proj_out[0] * routing_weight).float()
-            else:
-                tok_indices = [p[0] for p in pairs]
-                k_positions = [p[1] for p in pairs]
-                idx_tensor = torch.tensor(tok_indices, dtype=torch.long, device=hidden_states.device)
-                k_tensor = torch.tensor(k_positions, dtype=torch.long, device=hidden_states.device)
-                current_state = hidden_states[idx_tensor]
-                if is_fp8:
-                    proj_out = self.linear(current_state, weight_up, scale_up, activation_scale=gate_up_act_scale)
-                    proj_out = self._apply_gate(proj_out) if has_gate else act_fn(proj_out)
-                    proj_out = self.linear(proj_out, weight_down, scale_down, activation_scale=down_act_scale)
+                    routing_weight = top_k_weights[tok_i, k_pos]
+                    final_hidden_states[tok_i] += (proj_out[0] * routing_weight).float()
                 else:
-                    if hasattr(self, "experts") and isinstance(self.experts, (list, torch.nn.ModuleList)):
-                        proj_out = self.experts[exp_id](current_state)
-                    elif hasattr(self, "gate_proj") and hasattr(self, "up_proj"):
-                        proj_g = self.gate_proj[exp_id]
-                        proj_u = self.up_proj[exp_id]
-                        gate = proj_g(current_state) if callable(proj_g) else F.linear(current_state, proj_g)
-                        up = proj_u(current_state) if callable(proj_u) else F.linear(current_state, proj_u)
-                        proj_out = act_fn(gate) * up
-                        proj_d = self.down_proj[exp_id]
-                        proj_out = proj_d(proj_out) if callable(proj_d) else F.linear(proj_out, proj_d)
+                    tok_indices = [p[0] for p in pairs]
+                    k_positions = [p[1] for p in pairs]
+                    idx_tensor = torch.tensor(tok_indices, dtype=torch.long, device=hidden_states.device)
+                    k_tensor = torch.tensor(k_positions, dtype=torch.long, device=hidden_states.device)
+                    current_state = hidden_states[idx_tensor]
+                    if is_fp8:
+                        proj_out = target.linear(current_state, weight_up, scale_up, activation_scale=gate_up_act_scale)
+                        proj_out = target._apply_gate(proj_out) if has_gate else act_fn(proj_out)
+                        proj_out = target.linear(proj_out, weight_down, scale_down, activation_scale=down_act_scale)
                     else:
-                        proj_module_up = self.gate_up_proj[exp_id]
-                        proj_out = proj_module_up(current_state) if callable(proj_module_up) else F.linear(current_state, proj_module_up)
-                        gate, up = proj_out.chunk(2, dim=-1)
-                        proj_out = act_fn(gate) * up
-                        proj_module_down = self.down_proj[exp_id]
-                        proj_out = proj_module_down(proj_out) if callable(proj_module_down) else F.linear(proj_out, proj_module_down)
+                        if has_exp_list:
+                            proj_out = target.experts[exp_id](current_state)
+                        elif has_split:
+                            proj_g = target.gate_proj[exp_id]
+                            proj_u = target.up_proj[exp_id]
+                            gate = proj_g(current_state) if callable(proj_g) else F.linear(current_state, proj_g)
+                            up = proj_u(current_state) if callable(proj_u) else F.linear(current_state, proj_u)
+                            proj_out = act_fn(gate) * up
+                            proj_d = target.down_proj[exp_id]
+                            proj_out = proj_d(proj_out) if callable(proj_d) else F.linear(proj_out, proj_d)
+                        else:
+                            proj_module_up = target.gate_up_proj[exp_id]
+                            proj_out = proj_module_up(current_state) if callable(proj_module_up) else F.linear(current_state, proj_module_up)
+                            gate, up = proj_out.chunk(2, dim=-1)
+                            proj_out = act_fn(gate) * up
+                            proj_module_down = target.down_proj[exp_id]
+                            proj_out = proj_module_down(proj_out) if callable(proj_module_down) else F.linear(proj_out, proj_module_down)
 
-                weights = top_k_weights[idx_tensor, k_tensor, None]
-                weighted_out = proj_out * weights.to(proj_out.dtype)
-                final_hidden_states.index_add_(0, idx_tensor, weighted_out.float())
+                    weights = top_k_weights[idx_tensor, k_tensor, None]
+                    weighted_out = proj_out * weights.to(proj_out.dtype)
+                    final_hidden_states.index_add_(0, idx_tensor, weighted_out.float())
 
-        return final_hidden_states.to(hidden_states.dtype)
+            return final_hidden_states.to(hidden_states.dtype)
+
+        if lora_ctx is not None:
+            with lora_ctx:
+                return _do_dispatch()
+        return _do_dispatch()
 
     return fast_moe_forward
 
@@ -390,9 +417,12 @@ def patch_moe_experts(model, force_fast_moe: bool = True):
     Replaces slow GPU-side .nonzero() / torch.where() loops that induce hundreds of host-device
     synchronization stalls per token with high-speed zero-sync routing.
     Also instruments MoE sparse blocks to expose router logits for RL monitoring & aux loss.
+    Safely unwraps PEFT/Unsloth ParamWrapper to preserve LoRA adapter hooks.
     """
     patched_count = 0
     fused_count = 0
+    seen_modules = set()
+
     for name, module in model.named_modules():
         mod_type = module.__class__.__name__
 
@@ -401,28 +431,37 @@ def patch_moe_experts(model, force_fast_moe: bool = True):
             module._sword_original_forward = module.forward
             module.forward = types.MethodType(make_patched_qwen3_moe_block_forward(module._sword_original_forward), module)
 
-        if mod_type in ("FP8Experts", "HYV3Experts", "Qwen3MoeExperts", "Qwen2MoeExperts") or name.endswith(".experts"):
-            cfg = getattr(module, "config", getattr(model, "config", None))
+        # If module is a ParamWrapper (from PEFT/Unsloth), target the underlying expert layer
+        target_mod = module
+        if mod_type == "ParamWrapper" and hasattr(module, "base_layer"):
+            target_mod = module.base_layer
+
+        target_type = target_mod.__class__.__name__
+        if (target_type in ("FP8Experts", "HYV3Experts", "Qwen3MoeExperts", "Qwen2MoeExperts") or name.endswith(".experts")) and id(target_mod) not in seen_modules:
+            seen_modules.add(id(target_mod))
+
+            cfg = getattr(target_mod, "config", getattr(module, "config", getattr(model, "config", None)))
             impl = getattr(cfg, "_experts_implementation", None)
 
             # Check if model is quantized (BitsAndBytes 4-bit/8-bit or Linear4bit)
             is_quantized = any(
                 hasattr(p, "quant_state") or "Linear4bit" in m.__class__.__name__ or "8bit" in m.__class__.__name__
-                for m in module.modules() for p in m.parameters()
+                for m in target_mod.modules() for p in m.parameters()
             ) or getattr(cfg, "load_in_4bit", False) or getattr(cfg, "quantization_config", None) is not None
 
             # When force_fast_moe is enabled or model is quantized, grouped_mm cannot execute
             # or induces eager fallback. Apply Sword Zero-Sync Fast Dispatch.
             if not force_fast_moe and not is_quantized and impl in ("grouped_mm", "batched_mm", "deepgemm", "deepgemm_megamoe"):
-                if not hasattr(module, "_sword_fast_forward"):
-                    module._sword_fast_forward = types.MethodType(make_fast_moe_forward(module.forward), module)
+                if not hasattr(target_mod, "_sword_fast_forward"):
+                    target_mod._sword_fast_forward = types.MethodType(make_fast_moe_forward(target_mod.forward), target_mod)
                 fused_count += 1
                 continue
 
-            if not hasattr(module, "_sword_original_forward"):
-                module._sword_original_forward = module.forward
-            module.forward = types.MethodType(make_fast_moe_forward(module._sword_original_forward), module)
+            if not hasattr(target_mod, "_sword_original_forward"):
+                target_mod._sword_original_forward = target_mod.forward
+            target_mod.forward = types.MethodType(make_fast_moe_forward(target_mod._sword_original_forward), target_mod)
             patched_count += 1
+
     if patched_count > 0:
         print(f"[Sword] Patched {patched_count} MoE expert routing modules with Zero-Sync Fast Dispatch.")
     if fused_count > 0:
@@ -515,14 +554,18 @@ def unpatch_model(model):
     Restores all attention and MoE expert modules back to original unpatched forward methods.
     """
     unpatched_count = 0
+    seen = set()
     for name, module in model.named_modules():
-        if hasattr(module, "_sword_original_forward"):
-            module.forward = module._sword_original_forward
-            delattr(module, "_sword_original_forward")
-            for attr in ("_sword_attn_mode", "_sword_static_cache", "_sword_num_heads", "_sword_num_kv_heads", "_sword_head_dim", "_sword_num_groups", "_has_q_norm", "_has_k_norm"):
-                if hasattr(module, attr):
-                    delattr(module, attr)
-            unpatched_count += 1
+        target = getattr(module, "base_layer", module)
+        for m in (module, target):
+            if id(m) not in seen and hasattr(m, "_sword_original_forward"):
+                seen.add(id(m))
+                m.forward = m._sword_original_forward
+                delattr(m, "_sword_original_forward")
+                for attr in ("_sword_attn_mode", "_sword_static_cache", "_sword_num_heads", "_sword_num_kv_heads", "_sword_head_dim", "_sword_num_groups", "_has_q_norm", "_has_k_norm"):
+                    if hasattr(m, attr):
+                        delattr(m, attr)
+                unpatched_count += 1
     try:
         from .ling import unpatch_ling as _unpatch_ling
         _unpatch_ling(model)
