@@ -97,6 +97,10 @@ class FastServer:
                 print(f"[Sword] torch.compile note: {e}. Defaulting to optimized eager mode.")
                 self.decode_fn = self.model
 
+        # SGLang-Style CUDA Graph Decoding Runner for 4-bit MoE
+        self.cuda_graph_runner = None
+        self._graph_captured = False
+
     @classmethod
     def from_pretrained(
         cls,
@@ -273,22 +277,72 @@ class FastServer:
         eos_id = getattr(self.tokenizer, "eos_token_id", None)
         active_mask = torch.ones((bsz, 1), dtype=torch.bool, device=self.device)
 
-        # Pre-allocate decode_pos_ids buffer (zero allocation per step)
+        # Pre-allocate static input buffers for decode step
+        decode_input_ids = torch.empty((bsz, 1), dtype=torch.long, device=self.device)
         decode_pos_ids = torch.empty((bsz, 1), dtype=torch.long, device=self.device)
 
-        # High-Speed Async Decode Loop (zero CPU-GPU sync stalls per token)
+        # -------------------------------------------------------------
+        # SGLang-Style CUDA Graph Capture for Decode Step (Single-launch replay)
+        # -------------------------------------------------------------
+        cuda_graph = None
+        graph_logits = None
+        if self.device.type == "cuda" and not self._graph_captured:
+            try:
+                # Warmup memory & kernels on side stream before graph capture
+                s = torch.cuda.Stream()
+                s.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(s):
+                    for _ in range(3):
+                        decode_input_ids.copy_(next_token)
+                        decode_pos_ids.fill_(curr_pos)
+                        out_warm = self.decode_fn(
+                            input_ids=decode_input_ids,
+                            position_ids=decode_pos_ids,
+                            past_key_values=self.static_cache,
+                            use_cache=True,
+                        )
+                torch.cuda.current_stream().wait_stream(s)
+
+                # Capture graph: records all 1,152 kernels into 1 executable hardware graph
+                cuda_graph = torch.cuda.CUDAGraph()
+                decode_input_ids.copy_(next_token)
+                decode_pos_ids.fill_(curr_pos)
+                with torch.cuda.graph(cuda_graph):
+                    graph_out = self.decode_fn(
+                        input_ids=decode_input_ids,
+                        position_ids=decode_pos_ids,
+                        past_key_values=self.static_cache,
+                        use_cache=True,
+                    )
+                    graph_logits = graph_out.logits[:, -1, :] if hasattr(graph_out, "logits") else graph_out[0][:, -1, :]
+
+                self.cuda_graph_runner = (cuda_graph, decode_input_ids, decode_pos_ids, graph_logits)
+                self._graph_captured = True
+            except Exception:
+                self._graph_captured = False
+                self.cuda_graph_runner = None
+
+        # High-Speed Decode Loop
         for step in range(1, max_new_tokens):
             self.static_cache.set_pos(curr_pos)
             decode_pos_ids.fill_(curr_pos)
-            out = self.decode_fn(
-                input_ids=next_token,
-                position_ids=decode_pos_ids,
-                past_key_values=self.static_cache,
-                sword_static_cache=self.static_cache,
-                start_pos=curr_pos,
-                use_cache=True,
-            )
-            step_logits = out.logits[:, -1, :] if hasattr(out, "logits") else out[0][:, -1, :]
+            decode_input_ids.copy_(next_token)
+
+            if self.cuda_graph_runner is not None:
+                g, g_in, g_pos, g_logits = self.cuda_graph_runner
+                # Replay pre-recorded graph: 1 single CPU instruction instead of 1,152 kernel launches!
+                g.replay()
+                step_logits = g_logits
+            else:
+                out = self.decode_fn(
+                    input_ids=decode_input_ids,
+                    position_ids=decode_pos_ids,
+                    past_key_values=self.static_cache,
+                    sword_static_cache=self.static_cache,
+                    start_pos=curr_pos,
+                    use_cache=True,
+                )
+                step_logits = out.logits[:, -1, :] if hasattr(out, "logits") else out[0][:, -1, :]
 
             if temperature > 0.0:
                 probs = F.softmax(step_logits / temperature, dim=-1)
@@ -296,7 +350,7 @@ class FastServer:
             else:
                 next_token = torch.argmax(step_logits, dim=-1, keepdim=True)
 
-            generated.append(next_token)
+            generated.append(next_token.clone())
             curr_pos += 1
 
             if eos_id is not None:
