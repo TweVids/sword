@@ -97,9 +97,34 @@ class ContinuousStreamingQueue:
         return source
 
     def _load_source(self, source: str) -> int:
-        """Loads items from a resolved path or url into the queue."""
+        """Loads items from a resolved path, url, or Hugging Face dataset into the queue."""
         local_path = self._resolve_source_path(source)
+        
+        # Check if local file exists
         if not os.path.exists(local_path):
+            # Check if source is a HuggingFace dataset (e.g. "openai/gsm8k" or "HuggingFaceH4/MATH-500")
+            if "/" in source and not os.path.isabs(source):
+                try:
+                    from datasets import load_dataset
+                    print(f"[Sword-RL] 📥 Ingesting dataset from Hugging Face: {source}...")
+                    ds = load_dataset(source)
+                    # Use train split if available, otherwise first split
+                    split_name = "train" if "train" in ds else list(ds.keys())[0]
+                    hf_split = ds[split_name]
+                    loaded = 0
+                    for line_idx, item in enumerate(hf_split):
+                        data = dict(item)
+                        row = self._dict_to_dataset_row(data, fallback_id=f"hf_{len(self.processed_sources)}_{line_idx}")
+                        if row.problem_id not in self.known_problems:
+                            self.queue.append(row)
+                            self.known_problems[row.problem_id] = row
+                            loaded += 1
+                    self.processed_sources.add(source)
+                    print(f"[Sword-RL] [OK] Ingested {loaded:,} problems from Hugging Face dataset {source}. Total active queue: {len(self.queue):,}")
+                    return loaded
+                except Exception as e:
+                    print(f"[Sword-RL] Hugging Face load_dataset failed for {source}: {e}")
+
             print(f"[Sword-RL] Warning: Dataset file not found: {local_path}")
             return 0
 
@@ -128,15 +153,30 @@ class ContinuousStreamingQueue:
 
     def _dict_to_dataset_row(self, data: Dict[str, Any], fallback_id: str) -> DatasetRow:
         """Converts raw dict to standardized DatasetRow."""
-        problem_id = str(data.get("problem_id") or data.get("id") or fallback_id)
-        user_problem = data.get("user_problem") or data.get("prompt") or data.get("problem") or data.get("question") or ""
-        domain = data.get("domain", "general")
+        # Auto-detect OpenSWE or Scale-SWE SWE tasks
+        if "instance_id" in data and ("problem_statement" in data or "repo" in data):
+            try:
+                from sword.gym.adapters import OpenSWEAdapter, ScaleSWEAdapter
+                if "FAIL_TO_PASS" in data or "f2p_script" in data or "f2p_patch" in data:
+                    return ScaleSWEAdapter.parse_item(data).to_dataset_row()
+                else:
+                    return OpenSWEAdapter.parse_item(data).to_dataset_row()
+            except Exception:
+                pass
+
+        problem_id = str(data.get("problem_id") or data.get("id") or data.get("instance_id") or fallback_id)
+        user_problem = data.get("user_problem") or data.get("prompt") or data.get("problem") or data.get("question") or data.get("problem_statement") or ""
+        # Support HF dataset formats with "problem" / "question" and "answer" / "solution"
+        domain = data.get("domain")
+        reference_answer = data.get("reference_answer") or data.get("answer") or data.get("solution") or None
+        if not domain:
+            domain = "math" if reference_answer is not None else "general"
+
         effort_tier = data.get("effort_tier", "medium")
         difficulty = data.get("difficulty", "medium")
         explain_flag = bool(data.get("explain_flag", False))
         recheck_required = data.get("recheck_required", None)
         task_scope = data.get("task_scope", [])
-        reference_answer = data.get("reference_answer", None)
         reference_corpus_id = data.get("reference_corpus_id", None)
         prior_failure_reason = data.get("prior_failure_reason", None)
         music_constraints = data.get("music_constraints", None)

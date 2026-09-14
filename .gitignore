@@ -26,3 +26,12 @@ checkpoints/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Secrets & Environment
+.env
+*.token
+*.key
+data_cache/
+checkpoints-grpo/
+gym_state*.json
+

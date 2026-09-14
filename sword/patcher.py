@@ -270,6 +270,8 @@ def make_fast_moe_forward(original_forward):
 
         final_hidden_states = torch.zeros_like(hidden_states, dtype=torch.float32)
 
+        act_fn = getattr(self, "act_fn", F.silu)
+
         for exp_id, pairs in expert_to_tokens.items():
             gate_up_act_scale = (
                 self.gate_up_proj_activation_scale[exp_id] if (is_static and hasattr(self, "gate_up_proj_activation_scale")) else None
@@ -290,12 +292,12 @@ def make_fast_moe_forward(original_forward):
                 current_state = hidden_states[tok_i:tok_i+1]
                 if is_fp8:
                     proj_out = self.linear(current_state, weight_up, scale_up, activation_scale=gate_up_act_scale)
-                    proj_out = self._apply_gate(proj_out) if has_gate else self.act_fn(proj_out)
+                    proj_out = self._apply_gate(proj_out) if has_gate else act_fn(proj_out)
                     proj_out = self.linear(proj_out, weight_down, scale_down, activation_scale=down_act_scale)
                 else:
                     proj_out = F.linear(current_state, self.gate_up_proj[exp_id])
                     gate, up = proj_out.chunk(2, dim=-1)
-                    proj_out = self.act_fn(gate) * up
+                    proj_out = act_fn(gate) * up
                     proj_out = F.linear(proj_out, self.down_proj[exp_id])
 
                 routing_weight = top_k_weights[tok_i, k_pos]
@@ -308,12 +310,12 @@ def make_fast_moe_forward(original_forward):
                 current_state = hidden_states[idx_tensor]
                 if is_fp8:
                     proj_out = self.linear(current_state, weight_up, scale_up, activation_scale=gate_up_act_scale)
-                    proj_out = self._apply_gate(proj_out) if has_gate else self.act_fn(proj_out)
+                    proj_out = self._apply_gate(proj_out) if has_gate else act_fn(proj_out)
                     proj_out = self.linear(proj_out, weight_down, scale_down, activation_scale=down_act_scale)
                 else:
                     proj_out = F.linear(current_state, self.gate_up_proj[exp_id])
                     gate, up = proj_out.chunk(2, dim=-1)
-                    proj_out = self.act_fn(gate) * up
+                    proj_out = act_fn(gate) * up
                     proj_out = F.linear(proj_out, self.down_proj[exp_id])
 
                 weights = top_k_weights[idx_tensor, k_tensor, None]
@@ -325,18 +327,40 @@ def make_fast_moe_forward(original_forward):
     return fast_moe_forward
 
 
+def make_patched_qwen3_moe_block_forward(original_forward):
+    """
+    Patches Qwen3MoeSparseMoeBlock to capture router_logits as `self.last_router_logits`
+    for MoE router collapse monitoring & auxiliary load-balancing loss in RL / GRPO.
+    """
+    def patched_block_forward(self, hidden_states: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
+        router_logits, routing_weights, selected_experts = self.gate(hidden_states_reshaped)
+        self.last_router_logits = router_logits
+        final_hidden_states = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
+        return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+    return patched_block_forward
+
+
 def patch_moe_experts(model):
     """
-    Patches MoE expert routing layers (FP8Experts, HYV3Experts)
+    Patches MoE expert routing layers (FP8Experts, HYV3Experts, Qwen3MoeExperts)
     with Sword's Zero-Sync Fast MoE Forward ONLY when running in eager mode.
     When grouped_mm, batched_mm, or deepgemm is active, preserves the fused
     kernel which executes all experts in a single GPU launch per layer.
+    Also instruments MoE sparse blocks to expose router logits for RL monitoring.
     """
     patched_count = 0
     fused_count = 0
     for name, module in model.named_modules():
         mod_type = module.__class__.__name__
-        if mod_type in ("FP8Experts", "HYV3Experts") or name.endswith(".experts"):
+
+        # Instrument MoE sparse block to record router logits for RL aux loss
+        if mod_type in ("Qwen3MoeSparseMoeBlock", "Qwen2MoeSparseMoeBlock") or (hasattr(module, "experts") and hasattr(module, "gate") and not hasattr(module, "_sword_original_forward")):
+            module._sword_original_forward = module.forward
+            module.forward = types.MethodType(make_patched_qwen3_moe_block_forward(module._sword_original_forward), module)
+
+        if mod_type in ("FP8Experts", "HYV3Experts", "Qwen3MoeExperts") or name.endswith(".experts"):
             cfg = getattr(module, "config", getattr(model, "config", None))
             impl = getattr(cfg, "_experts_implementation", None)
             # Fused kernels (grouped_mm, batched_mm, deepgemm) run at hardware speed!
@@ -410,18 +434,22 @@ def patch_model(model, mode: str = "flash", patch_moe: bool = True):
     if patch_moe:
         patch_moe_experts(model)
 
-    # Check for Ling-3.0-tiny (BailingMoeV3) hybrid architecture
-    try:
-        from .ling import patch_ling as _patch_ling
-        _patch_ling(model, mode=mode, patch_moe=patch_moe)
-    except Exception as e:
-        pass
+    # Check for Ling-3.0-tiny (BailingMoeV3) hybrid architecture ONLY if actually a Ling model
+    is_ling = any("bailing" in m.__class__.__name__.lower() or "ling" in m.__class__.__name__.lower() for m in model.modules())
+    if is_ling:
+        try:
+            from .ling import patch_ling as _patch_ling
+            _patch_ling(model, mode=mode, patch_moe=patch_moe)
+        except Exception as e:
+            pass
 
     return model
 
 
 patch_qwen = patch_model
 patch_moe = patch_model
+patch_qwen3_moe = patch_model
+make_patched_qwen3_attention_forward = make_patched_attention_forward
 
 
 def patch_ling(model, mode: str = "flash", patch_moe: bool = True):
@@ -458,4 +486,5 @@ def unpatch_model(model):
 
 unpatch_qwen = unpatch_model
 unpatch_moe = unpatch_model
+unpatch_qwen3_moe = unpatch_model
 

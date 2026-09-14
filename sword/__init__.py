@@ -184,7 +184,7 @@ _fix_transformers_bailing_compatibility()
 
 from .attention import PureFlashAttention, apply_rotary_pos_emb
 
-from .kv_cache import StaticKVCache
+from .kv_cache import StaticKVCache, SmartKVCache
 from .model import FastTransformerModel, FastTransformerConfig
 from .engine import SpeedEngine
 from .patcher import (
@@ -192,16 +192,18 @@ from .patcher import (
     patch_moe,
     patch_moe_experts,
     patch_qwen,
+    patch_qwen3_moe,
     patch_ling,
     unpatch_model,
     unpatch_moe,
     unpatch_qwen,
+    unpatch_qwen3_moe,
     unpatch_ling,
     set_attention_mode,
 )
-from .loader import load_qwen_model, load_moe_model, load_ling_model
+from .loader import load_qwen_model, load_moe_model, load_qwen3_moe_model, load_ling_model
 from .ling import FastLingServer, setup_fla_compatibility
-from .server import FastServer, FastMoEServer, FastQwenServer
+from .server import FastServer, FastMoEServer, FastQwenServer, FastQwen3MoeServer
 from .finetune import benchmark_finetune_8k, apply_lora_to_model
 from .trainer import (
     setup_blackwell_environment,
@@ -220,14 +222,24 @@ from .rl import (
     MoERouterMonitor,
     ChunkedGRPOLoss,
 )
+from .gym import (
+    DockerCodingGym,
+    GymInstance,
+    GymExecutionResult,
+    OpenSWEAdapter,
+    ScaleSWEAdapter,
+    load_swe_dataset,
+    extract_unified_diff,
+)
 
-__version__ = "0.5.0"
+__version__ = "0.7.0"
 print(f"[Sword] Version {__version__} loaded successfully.")
 
 __all__ = [
     "PureFlashAttention",
     "apply_rotary_pos_emb",
     "StaticKVCache",
+    "SmartKVCache",
     "FastTransformerModel",
     "FastTransformerConfig",
     "SpeedEngine",
@@ -235,18 +247,22 @@ __all__ = [
     "patch_moe",
     "patch_moe_experts",
     "patch_qwen",
+    "patch_qwen3_moe",
     "patch_ling",
     "unpatch_model",
     "unpatch_moe",
     "unpatch_qwen",
+    "unpatch_qwen3_moe",
     "unpatch_ling",
     "set_attention_mode",
     "load_qwen_model",
     "load_moe_model",
+    "load_qwen3_moe_model",
     "load_ling_model",
     "FastServer",
     "FastMoEServer",
     "FastQwenServer",
+    "FastQwen3MoeServer",
     "FastLingServer",
     "setup_fla_compatibility",
     "benchmark_finetune_8k",
@@ -264,6 +280,13 @@ __all__ = [
     "ExternalVerifier",
     "MoERouterMonitor",
     "ChunkedGRPOLoss",
+    "DockerCodingGym",
+    "GymInstance",
+    "GymExecutionResult",
+    "OpenSWEAdapter",
+    "ScaleSWEAdapter",
+    "load_swe_dataset",
+    "extract_unified_diff",
     "__version__",
 ]
 

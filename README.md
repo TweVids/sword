@@ -37,17 +37,14 @@ pip install -r requirements.txt
 
 ### 2. Run 4-Concurrency Serving & Benchmark
 ```bash
-# Qwen 3.5 Dense Serving
-python test/serve.py --model-id Qwen/Qwen3.5-9B-Instruct --load-in-4bit --max-new-tokens 64
+# Qwen3 MoE (Qwen3 30B A3B) High-Throughput Serving & RL Rollout:
+python serve_moe.py --model Qwen/Qwen3-30B-A3B --concurrency 4 --max-new-tokens 128
 
-# Ling-3.0-tiny (BF16, FP8, or INT4) High-Throughput Serving & RL Rollout:
-python serve_moe.py --model inclusionAI/Ling-3.0-tiny --concurrency 4 --max-new-tokens 128
+# Qwen3 MoE Multi-Trajectory RL Rollout Generation (PPO / GRPO):
+python serve_moe.py --model Qwen/Qwen3-30B-A3B --rl-rollouts 8 --max-new-tokens 256
 
-# Ling-3.0-tiny FP8 Tensor-Core Serving:
-python serve_moe.py --model inclusionAI/Ling-3.0-tiny-fp8 --concurrency 8
-
-# Multi-Trajectory RL Rollout Generation (PPO / GRPO):
-python serve_moe.py --model inclusionAI/Ling-3.0-tiny --rl-rollouts 4 --max-new-tokens 256
+# Run Comprehensive BEFORE vs AFTER Speedup Benchmark:
+python serve_moe.py --model Qwen/Qwen3-30B-A3B --benchmark
 ```
 
 ---
@@ -55,16 +52,17 @@ python serve_moe.py --model inclusionAI/Ling-3.0-tiny --rl-rollouts 4 --max-new-
 ## Supported Architectures
 
 * **Dense & MoE Transformer Family:**
+  * **Qwen3 MoE (specially Qwen3 30B A3B):** 128 experts, top-8 active routing, 8:1 GQA ratio (32 query heads, 4 KV heads), QK RMSNorm, Zero-Sync MoE dispatch, router logits instrumentation for GRPO aux loss.
   * **Qwen Family:** Qwen2, Qwen2.5, Qwen3, Qwen3.5 (QK-norm, dual-projection gating).
   * **Hunyuan / HYV3:** MoE with fused FP8 tensor cores.
-* **Hybrid Linear-MoE Family (Ling-3.0 Series):**
-  * `inclusionAI/Ling-3.0-tiny` (BF16, 7.9B total params, 1.3B active).
-  * `inclusionAI/Ling-3.0-tiny-fp8` (Pre-quantized FP8 for Blackwell / Hopper).
-  * `inclusionAI/Ling-3.0-tiny-int4` (Compressed-tensors INT4).
-  * **3:1 Alternating KDA-MLA Attention Stack:** 3 Kimi Delta Attention linear recurrent layers followed by 1 Multi-Head Latent Attention layer.
-  * **Zero-Sync MoE Dispatch:** Eliminates host-device synchronization stalls (`.cpu().numpy()`), evaluating only activated experts out of 128.
-  * **Native Thinking Mode:** Configurable per-request reasoning mode (`<think>`).
-  * **RL Rollout Engine:** Built-in multi-trajectory parallel rollout generation for RLHF, PPO, and GRPO.
+* **Faster & Smarter KV Cache:**
+  * **O(1) Metadata Reset:** Bypasses multi-gigabyte HBM zeroing between generation batches.
+  * **Auto-Clear on New Rollouts:** Automatically resets pointers and masks when new rollout requests arrive.
+  * **Prefix KV Broadcast:** Replicates prefilled prompt KV states across $G$ sibling trajectories in GRPO in O(1) time.
+* **Unsloth RL Engine (GRPO / PPO):**
+  * Built-in `FastLanguageModel` memory-efficient LoRA adapters and gradient checkpointing.
+  * Fused negative cross-entropy chunked token logprob calculation (eliminates full $[B, L, V]$ tensor allocation).
+  * Zero-copy reference model evaluation via LoRA adapter bypass (saves 50% VRAM).
 
 ---
 
@@ -80,7 +78,52 @@ python serve_moe.py --model inclusionAI/Ling-3.0-tiny --rl-rollouts 4 --max-new-
   * `server.py`: High-concurrency serving engine.
   * `engine.py`: Batched rollout and decode engine.
 * `serve_moe.py`: Serving and RL rollout entry point for Ling-3.0 and MoE models.
+* `serve_gym.py`: CLI server hosting the local Docker Coding Gym with public zrok tunneling.
 * `benchmark.py`: Throughput benchmarking suite.
-* `test/test_ling.py`: Unit test suite verifying Ling-3.0 optimizations.
+* `test/`: Unit test suite verifying attention, KV cache, RL engine, MoE, and Docker gym.
 * `requirements.txt`: Environment package specifications.
+
+---
+
+## Docker Coding Gym for SWE / Coding RL (OpenSWE & Scale-SWE)
+
+When training coding models with GRPO in cloud environments like Molab / Colab where Docker is not permitted, Sword provides a distributed **Client/Server Docker Gym** architecture:
+
+```
+[ Local Machine (Docker Host) ]                       [ Molab / Remote GPU (Trainer) ]
+┌──────────────────────────────┐                      ┌──────────────────────────────┐
+│  sword-coding-gym:latest     │                      │  Qwen3-30B-A3B (Unsloth GRPO)│
+│  - Python 3.10, git, pytest  │                      │  - Multi-stream rollouts (G) │
+│  - Warm container pool       │  ◄── zrok Tunnel ──► │  - RemoteCodingGym Client    │
+│  - OpenSWE (eval.sh)         │      (HTTPS)         │  - Chunked GRPOLoss backward │
+│  - Scale-SWE (F2P + P2P)     │                      │  - Zero Docker needed!       │
+└──────────────────────────────┘                      └──────────────────────────────┘
+```
+
+### 1. On Local Machine: Host the Docker Gym
+```bash
+# Start Docker gym server and automatically expose via secure zrok tunnel:
+python serve_gym.py --port 8765 --share-zrok
+
+# Output:
+# 🌐 PUBLIC ZROK ENDPOINT READY FOR MOLAB / COLAB:
+# 👉 https://<token>.shares.zrok.io
+```
+
+### 2. In Molab / Colab: Train with Remote Execution Rewards
+```python
+import sword
+
+# Connect to your local machine's Docker gym over the public zrok endpoint
+trainer = sword.start_grpo(
+    model_name_or_path="Qwen/Qwen3-30B-A3B",
+    data=["path/to/openswe_oss.jsonl"],
+    remote_gym_endpoint="https://<token>.shares.zrok.io",
+    num_rollouts_per_prompt=8,
+)
+
+# Step continuous RL loop
+trainer.step()
+```
+
 

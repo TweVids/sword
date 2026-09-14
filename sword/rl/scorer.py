@@ -40,9 +40,11 @@ class PrimaryScorer:
         self,
         component_cap: float = 0.35,
         safety_penalty_clamp: float = -1.5,
+        gym: Optional[Any] = None,
     ):
         self.component_cap = component_cap
         self.safety_penalty_clamp = safety_penalty_clamp
+        self.gym = gym
 
         # Known AI cliché hex colors (Section 9 palette fingerprinting)
         self.cliche_colors = {
@@ -153,6 +155,9 @@ class PrimaryScorer:
             code_score, code_audit = self._score_code_editing(problem, traj)
             components["code_diff"] = code_score
             audit["code"] = code_audit
+            if "gym_execution" in code_audit:
+                gym_exec = code_audit["gym_execution"]
+                components["execution"] = gym_exec.get("reward", 1.0 if gym_exec.get("success") else -0.2)
             if code_audit.get("destructive_violation"):
                 failure_reason = FailureReason.DESTRUCTIVE_EDIT
 
@@ -199,7 +204,9 @@ class PrimaryScorer:
         # Prevent any single positive metric from cross-subsidizing hard failures
         capped_components: Dict[str, float] = {}
         for k, v in components.items():
-            if v > 0:
+            if k == "execution":
+                capped_components[k] = max(-1.0, min(1.0, v))
+            elif v > 0:
                 capped_components[k] = min(v, self.component_cap)
             else:
                 capped_components[k] = v
@@ -387,24 +394,47 @@ class PrimaryScorer:
         return 0.0, audit
 
     # ------------------------------------------------------------------
-    # Thinking Formatting: No Markdown Bold / Presentation Headers (**text**, **Step 1**)
+    # Thinking Formatting: No Markdown Bold, No Early "step-by-step", No Rapid Short Lists (<15 words)
     # ------------------------------------------------------------------
     def _score_thinking_formatting(self, trace: str) -> Tuple[float, Dict[str, Any]]:
         if not trace:
             return 0.0, {"checked": False}
 
-        # Check for bold formatting like **text** or **Step 1** in thinking trace
-        # Uses standard Markdown delimiter rule (cannot start or end with whitespace)
-        # to avoid false positives on math exponents (e.g. 2 ** 3)
+        score = 0.0
+        audit: Dict[str, Any] = {}
+
+        # 1. Prohibited bold formatting like **text** or **Step 1**
         bold_patterns = re.findall(r"\*\*(?!\s)[^*\n]+?(?<!\s)\*\*|__(?!\s)[^_\n]+?(?<!\s)__", trace)
         if bold_patterns:
-            return -0.2, {
-                "prohibited_bold_found": True,
-                "matches": bold_patterns[:5],
-                "penalty": -0.2,
-            }
+            score -= 0.2
+            audit["prohibited_bold_found"] = True
+            audit["bold_matches"] = bold_patterns[:5]
 
-        return 0.0, {"prohibited_bold_found": False}
+        # Extract words from trace
+        words = trace.split()
+        first_200_words = " ".join(words[:200])
+
+        # 2. "Step-by-step" / "step to step" prohibition in the first 200 words
+        step_pattern = r"\b(?:step[\s\-_]*(?:by|to)[\s\-_]*step)\b"
+        if re.search(step_pattern, first_200_words, re.IGNORECASE):
+            score -= 0.2
+            audit["early_step_by_step_penalty"] = -0.2
+            audit["early_step_by_step_detected"] = True
+
+        # 3. Rapid short numbered list check in early thinking (e.g. 1. ... \n 2. ...)
+        # If consecutive list items appear and any has < 15 words -> -0.2 penalty
+        # Substantive items with >= 15 words avoid false positives and receive no penalty
+        list_items = re.findall(r"(?:^|\n)\s*\d+[.:\)]\s*(.*?)(?=(?:\n\s*\d+[.:\)]|\Z))", first_200_words, re.DOTALL)
+        if len(list_items) >= 2:
+            short_items = [item.strip() for item in list_items if len(item.split()) < 15]
+            if short_items:
+                score -= 0.2
+                audit["rapid_short_list_penalty"] = -0.2
+                audit["short_list_items"] = [s[:60] for s in short_items[:3]]
+            else:
+                audit["substantive_list_allowed"] = True
+
+        return max(-0.4, score), audit
 
     # ------------------------------------------------------------------
     # Section 7 & 7a: Code Editing & Destructive Edit Guard
@@ -463,7 +493,23 @@ class PrimaryScorer:
             else:
                 audit["surgical_intent_gaming_blocked"] = True  # Said the phrase but wrote huge diff!
 
-        return max(-1.0, min(0.35, score)), audit
+        # 5. Docker Coding Gym ground-truth test execution (if gym attached)
+        if self.gym and "gym_instance" in problem.extra_metadata:
+            try:
+                from sword.gym.schema import GymInstance
+                gym_inst = GymInstance.from_dict(problem.extra_metadata["gym_instance"])
+                gym_res = self.gym.evaluate_patch(gym_inst, traj.full_text)
+                audit["gym_execution"] = gym_res.to_dict()
+                if gym_res.success:
+                    score += 0.50
+                elif not gym_res.patch_applied:
+                    score -= 0.30
+                else:
+                    score += gym_res.reward * 0.30
+            except Exception as e:
+                audit["gym_execution_error"] = str(e)
+
+        return max(-1.0, min(1.0 if self.gym else 0.35, score)), audit
 
     # ------------------------------------------------------------------
     # Section 9: UI / Front-end Design Slop Tell-Detection

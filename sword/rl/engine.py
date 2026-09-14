@@ -25,7 +25,7 @@ from .scorer import PrimaryScorer
 from .verifier import ExternalVerifier
 from .moe_monitor import MoERouterMonitor
 from .loss import ChunkedGRPOLoss
-from ..ling import FastLingServer, load_ling_model, patch_ling
+from ..server import FastQwen3MoeServer, FastMoEServer, FastServer
 from ..finetune import apply_lora_to_model
 from ..trainer import (
     setup_blackwell_environment,
@@ -37,13 +37,18 @@ from ..trainer import (
 
 class GRPOTrainer:
     """
-    Unified In-Process GRPO Training Engine.
-    Combines Sword 8-stream rollout generation with memory-efficient policy gradient updates.
+    Unified In-Process GRPO Training Engine for Qwen3 MoE & Modern LLM Architectures.
+    Combines Sword 8-stream rollout generation (188+ tokens/s) with Unsloth memory-efficient updates:
+    - Native Qwen3 MoE (specifically Qwen3 30B A3B) support with grouped_mm / zero-sync routing
+    - Auto-clearing Static/Smart KV Cache between rollout batches
+    - Unsloth FastLanguageModel LoRA + gradient checkpointing acceleration
+    - Dual-System Scorer: System 1 (Deterministic Primary) + System 2 (Advisory Judge)
+    - MoE router collapse prevention with active load-balancing aux loss & entropy alarms
     """
 
     def __init__(
         self,
-        model_name_or_path: str = "inclusionAI/Ling-3.0-tiny",
+        model_name_or_path: str = "Qwen/Qwen3-30B-A3B",
         verifier_model_name: Optional[str] = None,
         data_sources: Optional[List[str]] = None,
         output_dir: str = "checkpoints-grpo",
@@ -57,9 +62,13 @@ class GRPOTrainer:
         hf_repo_id: Optional[str] = None,
         hf_token: Optional[str] = None,
         torch_dtype: torch.dtype = torch.bfloat16,
-        device: str = "cuda" if torch.cuda.is_available() else "cpu",
         lora_r: int = 16,
         lora_alpha: int = 32,
+        use_unsloth: bool = True,
+        gym: Optional[Any] = None,
+        use_docker_gym: bool = False,
+        remote_gym_endpoint: Optional[str] = None,
+        docker_gym_image: str = "sword-coding-gym:latest",
     ):
         setup_blackwell_environment()
 
@@ -92,23 +101,59 @@ class GRPOTrainer:
         )
 
         # 2. Load Policy Model & Tokenizer with Sword Flash Acceleration
-        print("\n[*] Loading Policy Model with Sword Engine...")
-        self.server = FastLingServer.from_pretrained(
-            model_name_or_path=model_name_or_path,
-            torch_dtype=torch_dtype,
-            device_map="auto" if device == "cuda" else None,
-            patch_sword=True,
-            patch_moe=True,
-        )
+        print(f"\n[*] Loading Policy Model with Sword Engine ({model_name_or_path})...")
+        is_ling = any(x in model_name_or_path.lower() for x in ["ling", "bailing"])
+        if is_ling:
+            from ..ling import FastLingServer
+            self.server = FastLingServer.from_pretrained(
+                model_name_or_path=model_name_or_path,
+                torch_dtype=torch_dtype,
+                device_map="auto" if device == "cuda" else None,
+                patch_sword=True,
+                patch_moe=True,
+            )
+        else:
+            self.server = FastQwen3MoeServer.from_pretrained(
+                model_name_or_path=model_name_or_path,
+                torch_dtype=torch_dtype,
+                device_map="auto" if device == "cuda" else None,
+                max_concurrency=max(batch_size * num_rollouts_per_prompt, 8),
+                max_seq_len=2048,
+            )
         self.model = self.server.model
         self.tokenizer = self.server.tokenizer
 
-        # 3. Apply LoRA Adapters for Parameter-Efficient Training
-        print(f"[*] Applying LoRA adapters (r={lora_r}, alpha={lora_alpha})...")
-        self.model = apply_lora_to_model(self.model, r=lora_r, lora_alpha=lora_alpha)
+        # 3. Apply Unsloth / PEFT Memory-Efficient LoRA Adapters
+        self.use_unsloth = use_unsloth
+        print(f"[*] Applying Memory-Efficient LoRA (r={lora_r}, alpha={lora_alpha}, use_unsloth={use_unsloth})...")
+        self.model = self._setup_lora_and_checkpointing(
+            self.model,
+            r=lora_r,
+            lora_alpha=lora_alpha,
+            use_unsloth=use_unsloth,
+        )
 
-        # 4. Initialize System 1 Primary Scorer (Deterministic)
-        self.scorer = PrimaryScorer()
+        # 4. Optional Docker / Remote Coding Gym for SWE tasks (OpenSWE / Scale-SWE)
+        self.gym = gym
+        if self.gym is None:
+            endpoint = remote_gym_endpoint or os.environ.get("SWORD_GYM_ENDPOINT")
+            if endpoint:
+                try:
+                    from sword.gym import RemoteCodingGym
+                    self.gym = RemoteCodingGym(endpoint=endpoint)
+                    print(f"[Sword-RL] 🌐 Connected to Remote Coding Gym at {self.gym.endpoint}")
+                except Exception as e:
+                    print(f"[Sword-RL] Remote Coding Gym warning: {e}")
+            elif use_docker_gym:
+                try:
+                    from sword.gym import DockerCodingGym
+                    self.gym = DockerCodingGym(default_image=docker_gym_image)
+                    print(f"[Sword-RL] 🐳 Docker Coding Gym active (image={docker_gym_image})")
+                except Exception as e:
+                    print(f"[Sword-RL] Docker Coding Gym warning: {e}")
+
+        # 5. Initialize System 1 Primary Scorer (Deterministic)
+        self.scorer = PrimaryScorer(gym=self.gym)
 
         # 5. Initialize System 2 External Verifier (Advisory Judge)
         verifier_model = None
@@ -138,6 +183,49 @@ class GRPOTrainer:
         # 8. Setup Optimizer (Trainable LoRA & Router parameters)
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
         self.optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=0.01)
+
+    @staticmethod
+    def _setup_lora_and_checkpointing(
+        model: nn.Module,
+        r: int = 16,
+        lora_alpha: int = 32,
+        lora_dropout: float = 0.0,
+        use_unsloth: bool = True,
+    ) -> nn.Module:
+        """
+        Applies Unsloth memory-efficient LoRA adapters and gradient checkpointing.
+        Saves 50%+ VRAM during GRPO policy updates.
+        Falls back to HuggingFace PEFT LoRA if Unsloth is not installed or on non-CUDA.
+        """
+        if use_unsloth and torch.cuda.is_available():
+            try:
+                try:
+                    from unsloth import FastModel as FastLanguageModel
+                except ImportError:
+                    from unsloth import FastLanguageModel
+
+                print(f"[Sword-RL] Injected Unsloth FastLanguageModel LoRA (r={r}, alpha={lora_alpha}, checkpointing='unsloth').")
+                peft_model = FastLanguageModel.get_peft_model(
+                    model,
+                    r=r,
+                    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj", "gate_up_proj"],
+                    lora_alpha=lora_alpha,
+                    lora_dropout=lora_dropout,
+                    bias="none",
+                    use_gradient_checkpointing="unsloth",
+                    random_state=3407,
+                )
+                return peft_model
+            except Exception as e:
+                print(f"[Sword-RL] Unsloth LoRA note: ({e}). Falling back to native PEFT LoRA...")
+
+        peft_model = apply_lora_to_model(model, r=r, lora_alpha=lora_alpha)
+        if hasattr(peft_model, "gradient_checkpointing_enable"):
+            try:
+                peft_model.gradient_checkpointing_enable()
+            except Exception:
+                pass
+        return peft_model
 
     def add_data_source(self, source_url_or_path: str):
         """Dynamic dataset registration without stopping the engine ("infinity time")."""
@@ -180,7 +268,7 @@ class GRPOTrainer:
                     num_rollouts_per_prompt=self.num_rollouts_per_prompt,
                     max_new_tokens=min(self.max_new_tokens, prob.effort_tier.max_tokens),
                     temperature=0.8,
-                    use_fast_engine=True,
+                    auto_clear=True,
                 )[0]
 
                 # 3. Dual-System Evaluation Phase
@@ -399,7 +487,7 @@ class GRPOTrainer:
 def start_grpo(
     data: Optional[List[str]] = None,
     continues: Optional[str] = None,
-    model_name_or_path: str = "inclusionAI/Ling-3.0-tiny",
+    model_name_or_path: str = "Qwen/Qwen3-30B-A3B",
     verifier_model_name: Optional[str] = None,
     output_dir: str = "checkpoints-grpo",
     num_rollouts_per_prompt: int = 8,
@@ -407,6 +495,7 @@ def start_grpo(
     max_new_tokens: int = 512,
     lr: float = 5e-6,
     save_steps: int = 50,
+    use_unsloth: bool = True,
     **kwargs,
 ) -> GRPOTrainer:
     """
@@ -429,6 +518,7 @@ def start_grpo(
         max_new_tokens=max_new_tokens,
         lr=lr,
         save_steps=save_steps,
+        use_unsloth=use_unsloth,
         **kwargs,
     )
 

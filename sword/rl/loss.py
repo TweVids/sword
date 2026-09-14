@@ -121,15 +121,21 @@ class ChunkedGRPOLoss(nn.Module):
             chunk_h = h_states[:, start_idx:end_idx, :]  # [B, chunk_len, H]
             chunk_targets = targets[:, start_idx:end_idx]  # [B, chunk_len]
 
-            # Compute logits only for this chunk
+            # Unsloth-style memory-efficient fused token logprob computation:
+            # Mathematically: log_softmax(logits)[target] == -cross_entropy(logits, target)
+            # Fused PyTorch C++/CUDA kernel eliminates materializing full [B, chunk_len, V] float32 tensor in VRAM!
+            chunk_b, chunk_l, chunk_h_dim = chunk_h.shape
+            chunk_h_flat = chunk_h.reshape(-1, chunk_h_dim)
             if lm_head is not None:
-                chunk_logits = lm_head(chunk_h)  # [B, chunk_len, V]
+                chunk_logits = lm_head(chunk_h_flat)
             else:
-                chunk_logits = F.linear(chunk_h, model.get_output_embeddings().weight)
+                chunk_logits = F.linear(chunk_h_flat, model.get_output_embeddings().weight)
 
-            # Compute log softmax for targets directly
-            log_probs = F.log_softmax(chunk_logits.float(), dim=-1)
-            token_logprobs = torch.gather(log_probs, dim=-1, index=chunk_targets.unsqueeze(-1)).squeeze(-1)
+            token_logprobs = -F.cross_entropy(
+                chunk_logits.float(),
+                chunk_targets.reshape(-1),
+                reduction="none",
+            ).reshape(chunk_b, chunk_l)
             policy_logprobs_list.append(token_logprobs)
 
         # Concatenate across chunks -> [B, L-1]
@@ -152,9 +158,13 @@ class ChunkedGRPOLoss(nn.Module):
         targets = input_ids[:, 1:]
         target_mask = response_mask[:, 1:]
         shift_logits = logits[:, :-1, :]
+        bsz, s_len, vocab_size = shift_logits.shape
 
-        log_probs = F.log_softmax(shift_logits.float(), dim=-1)
-        policy_logprobs = torch.gather(log_probs, dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
+        policy_logprobs = -F.cross_entropy(
+            shift_logits.reshape(-1, vocab_size).float(),
+            targets.reshape(-1),
+            reduction="none",
+        ).reshape(bsz, s_len)
 
         return self._compute_surrogate_loss(
             policy_logprobs, target_mask, advantages, old_logprobs, ref_logprobs

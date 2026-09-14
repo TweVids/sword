@@ -39,8 +39,8 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        default="inclusionAI/Ling-3.0-tiny",
-        help="HuggingFace model ID or local path (default: inclusionAI/Ling-3.0-tiny, supports -fp8, -int4, Hy-MT2)",
+        default="Qwen/Qwen3-30B-A3B",
+        help="HuggingFace model ID or local path (default: Qwen/Qwen3-30B-A3B, supports Qwen3 MoE 30B A3B, Hy-MT2, Ling-3.0)",
     )
     parser.add_argument(
         "--concurrency",
@@ -63,32 +63,38 @@ def main():
     parser.add_argument(
         "--temperature",
         type=float,
-        default=1.0,
-        help="Sampling temperature (Ling-3.0 recommended: 1.0, 0.0 for greedy)",
+        default=0.8,
+        help="Sampling temperature (default: 0.8, 0.0 for greedy)",
     )
     parser.add_argument(
         "--top-p",
         type=float,
         default=0.95,
-        help="Top-p nucleus sampling (Ling-3.0 recommended: 0.95)",
+        help="Top-p nucleus sampling (default: 0.95)",
     )
     parser.add_argument(
         "--top-k",
         type=int,
-        default=20,
-        help="Top-k sampling (Ling-3.0 recommended: 20)",
+        default=50,
+        help="Top-k sampling (default: 50)",
+    )
+    parser.add_argument(
+        "--auto-clear-kv",
+        action="store_true",
+        default=True,
+        help="Automatically clear Static/Smart KV Cache between rollouts without HBM zeroing (default: True)",
     )
     parser.add_argument(
         "--enable-thinking",
         action="store_true",
-        default=True,
-        help="Enable Ling-3.0 native thinking mode (default: True)",
+        default=False,
+        help="Enable native thinking mode if supported (default: False)",
     )
     parser.add_argument(
         "--disable-thinking",
         action="store_false",
         dest="enable_thinking",
-        help="Disable Ling-3.0 thinking mode for fast routine answers",
+        help="Disable thinking mode for fast routine answers",
     )
     parser.add_argument(
         "--rl-rollouts",
@@ -108,22 +114,30 @@ def main():
     )
     args = parser.parse_args()
 
+    is_qwen3_moe = "qwen3" in args.model.lower() and ("moe" in args.model.lower() or "a3b" in args.model.lower())
     is_ling = any(x in args.model.lower() for x in ["ling", "bailing"])
+
+    if is_qwen3_moe:
+        arch_desc = "Qwen3 MoE (30B A3B Sparse MoE with Top-8 Active Experts)"
+    elif is_ling:
+        arch_desc = "Bailing Hybrid (KDA + MLA + Sparse MoE)"
+    else:
+        arch_desc = "MoE Standard Transformer"
 
     print("=" * 72)
     print(" ⚡ SWORD HIGH-THROUGHPUT MoE & RL ROLLOUT ENGINE ⚡")
     print("=" * 72)
     print(f"Model ID:          {args.model}")
-    print(f"Architecture:      {'Bailing Hybrid (KDA + MLA + Sparse MoE)' if is_ling else 'MoE Standard'}")
+    print(f"Architecture:      {arch_desc}")
     print(f"Target GPU:        {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
     print(f"Concurrency:       {args.concurrency} concurrent streams")
     print(f"Max New Tokens:    {args.max_new_tokens} tokens/stream")
     print(f"Max Sequence Len:  {args.max_seq_len} tokens")
-    print(f"Thinking Mode:     {'Enabled (<think> active)' if args.enable_thinking else 'Disabled'}")
+    print(f"Smart KV Cache:    {'Auto-Clear Active (Zero HBM Write Overhead)' if args.auto_clear_kv else 'Manual'}")
     print("=" * 72)
 
 
-    # 1. Initialize Server (loads FP8 model, patches attention with Flash SDPA, sets up Static KV Cache)
+    # 1. Initialize Server (loads FP8/BF16 model, patches attention with Flash SDPA, sets up Static KV Cache)
     print("\n[*] Initializing FastMoEServer with Sword Speed Engine...")
     t0 = time.perf_counter()
     server = FastMoEServer.from_pretrained(

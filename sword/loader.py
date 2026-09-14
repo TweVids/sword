@@ -180,6 +180,18 @@ def load_moe_model(
             attn_mode=attn_mode,
         )
 
+    # If Qwen3 MoE model requested, delegate to specialized load_qwen3_moe_model
+    if "qwen3" in model_name_or_path.lower() and ("moe" in model_name_or_path.lower() or "a3b" in model_name_or_path.lower()):
+        return load_qwen3_moe_model(
+            model_name_or_path=model_name_or_path,
+            device_map=device_map,
+            torch_dtype=torch_dtype,
+            max_seq_length=max_seq_length,
+            patch_sword=patch_sword,
+            attn_mode=attn_mode,
+            experts_implementation=experts_implementation,
+        )
+
     print(f"\n[Sword] Loading MoE model: {model_name_or_path}...")
     tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=True)
     tokenizer.padding_side = "left"
@@ -221,6 +233,95 @@ def load_moe_model(
 
     model.eval()
     print(f"[Sword] MoE model ready for high-speed serving.")
+    return model, tokenizer
+
+
+def load_qwen3_moe_model(
+    model_name_or_path: str = "Qwen/Qwen3-30B-A3B",
+    load_in_4bit: bool = False,
+    load_in_8bit: bool = False,
+    device_map: str = "auto",
+    torch_dtype: Optional[torch.dtype] = None,
+    max_seq_length: int = 8192,
+    use_unsloth: bool = True,
+    patch_sword: bool = True,
+    attn_mode: str = "flash",
+    experts_implementation: str = "grouped_mm",
+) -> Tuple[object, object]:
+    """
+    Loads Qwen3 MoE (specifically Qwen3 30B A3B, Qwen3-30B-A3B-Instruct, etc.)
+    with hardware acceleration, Unsloth / BitsAndBytes / native FP8 support,
+    and Sword Pure FlashAttention + Fast MoE speed engine.
+    """
+    if torch_dtype is None:
+        torch_dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float32
+
+    print(f"\n[Sword] Loading Qwen3 MoE model: {model_name_or_path}...")
+    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=True)
+    tokenizer.padding_side = "left"
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = None
+
+    # Try Unsloth FastLanguageModel or FastModel first on GPU
+    if use_unsloth and torch.cuda.is_available():
+        try:
+            try:
+                from unsloth import FastModel as FastLanguageModel
+            except ImportError:
+                from unsloth import FastLanguageModel
+
+            print(f"[Sword] Attempting Unsloth acceleration for Qwen3 MoE (4-bit={load_in_4bit}, max_seq={max_seq_length})...")
+            model, _ = FastLanguageModel.from_pretrained(
+                model_name=model_name_or_path,
+                max_seq_length=max_seq_length,
+                dtype=torch_dtype,
+                load_in_4bit=load_in_4bit,
+            )
+            print("[Sword] Loaded Qwen3 MoE with Unsloth FastModel.")
+        except Exception as e:
+            print(f"[Sword] Unsloth load skipped ({e}). Falling back to Transformers + BitsAndBytes / Native FP8/BF16...")
+
+    if model is None:
+        from transformers import AutoConfig
+        try:
+            config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
+            if hasattr(config, "_experts_implementation"):
+                config._experts_implementation = experts_implementation
+        except Exception:
+            config = None
+
+        quant_config = None
+        if load_in_4bit:
+            quant_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch_dtype,
+                bnb_4bit_use_double_quant=True,
+            )
+        elif load_in_8bit:
+            quant_config = BitsAndBytesConfig(load_in_8bit=True)
+
+        load_kwargs = {
+            "device_map": device_map if torch.cuda.is_available() else None,
+            "trust_remote_code": True,
+        }
+        if config is not None:
+            load_kwargs["config"] = config
+        if quant_config is not None:
+            load_kwargs["quantization_config"] = quant_config
+        else:
+            load_kwargs["torch_dtype"] = torch_dtype
+
+        model = AutoModelForCausalLM.from_pretrained(model_name_or_path, **load_kwargs)
+
+    if patch_sword:
+        from .patcher import patch_qwen3_moe
+        model = patch_qwen3_moe(model, mode=attn_mode, patch_moe=True)
+
+    model.eval()
+    print("[Sword] Qwen3 MoE model ready for high-throughput serving & RL rollout.")
     return model, tokenizer
 
 

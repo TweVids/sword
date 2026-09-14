@@ -114,6 +114,25 @@ class FastServer:
         - For FP8 MoE (e.g. tencent/Hy-MT2-30B-A3B-FP8): uses load_moe_model
         - For 4-bit/8-bit models: uses load_qwen_model
         """
+        is_qwen3_moe = "qwen3" in model_name_or_path.lower() and ("moe" in model_name_or_path.lower() or "a3b" in model_name_or_path.lower())
+        if is_qwen3_moe:
+            from .loader import load_qwen3_moe_model
+            model, tokenizer = load_qwen3_moe_model(
+                model_name_or_path=model_name_or_path,
+                load_in_4bit=load_in_4bit,
+                load_in_8bit=load_in_8bit,
+                device_map=device_map,
+                torch_dtype=torch_dtype,
+                max_seq_length=max_seq_len,
+            )
+            return cls(
+                model=model,
+                tokenizer=tokenizer,
+                max_concurrency=max_concurrency,
+                max_seq_len=max_seq_len,
+                compile_decode=compile_decode,
+            )
+
         is_ling = any(x in model_name_or_path.lower() for x in ["ling", "bailing"])
         if is_ling:
             from .ling import FastLingServer
@@ -149,6 +168,45 @@ class FastServer:
             compile_decode=compile_decode,
         )
 
+    @torch.inference_mode()
+    def generate_rollouts(
+        self,
+        prompts: List[str],
+        num_rollouts_per_prompt: int = 4,
+        max_new_tokens: int = 256,
+        temperature: float = 0.8,
+        top_p: float = 0.95,
+        top_k: int = 50,
+        auto_clear: bool = True,
+        **kwargs,
+    ) -> List[List[str]]:
+        """
+        High-throughput multi-trajectory parallel rollout generation for RL (GRPO / PPO).
+        Generates G rollouts per prompt with automatic KV cache clearing and prefix sharing.
+        """
+        # Auto-clear KV cache when new rollout batch arrives
+        if auto_clear and hasattr(self, "static_cache"):
+            self.static_cache.new_rollout()
+
+        expanded_prompts = []
+        for p in prompts:
+            expanded_prompts.extend([p] * num_rollouts_per_prompt)
+
+        results = self.serve(
+            prompts=expanded_prompts,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+        )
+
+        all_res = results["responses"]
+        grouped = []
+        for i in range(len(prompts)):
+            start_i = i * num_rollouts_per_prompt
+            grouped.append(all_res[start_i : start_i + num_rollouts_per_prompt])
+
+        return grouped
+
 
     @torch.inference_mode()
     def serve(
@@ -183,8 +241,8 @@ class FastServer:
             torch.cuda.synchronize()
         start_time = time.perf_counter()
 
-        # Prefill phase
-        self.static_cache.reset(list(range(bsz)))
+        # Prefill phase with zero-overhead auto-clear
+        self.static_cache.new_rollout(batch_size=bsz)
         self.static_cache.set_pos(0)
         if attention_mask is not None:
             prefill_pos_ids = (attention_mask.long().cumsum(-1) - 1).clamp_min(0)
@@ -369,6 +427,7 @@ class FastServer:
 
 
 # Aliases for architecture-specific imports and backward compatibility
+FastQwen3MoeServer = FastServer
 FastMoEServer = FastServer
 FastQwenServer = FastServer
 
