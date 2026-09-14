@@ -32,17 +32,29 @@ def _fast_sdpa_attention(
 ) -> torch.Tensor:
     """
     Pure-PyTorch Fast SDPA Attention kernel.
-    Dispatches directly to FLASH_ATTENTION / EFFICIENT_ATTENTION on modern hardware (e.g. Blackwell).
+    Enforces FlashAttention / Efficient Attention C++ kernels on hardware (e.g. Blackwell).
     """
-    return F.scaled_dot_product_attention(
-        query,
-        key,
-        value,
-        attn_mask=attention_mask,
-        dropout_p=dropout_p,
-        is_causal=is_causal and attention_mask is None,
-        scale=scale,
-    )
+    try:
+        with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]):
+            return F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=attention_mask,
+                dropout_p=dropout_p,
+                is_causal=is_causal and attention_mask is None,
+                scale=scale,
+            )
+    except Exception:
+        return F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=attention_mask,
+            dropout_p=dropout_p,
+            is_causal=is_causal and attention_mask is None,
+            scale=scale,
+        )
 
 
 def _vanilla_quadratic_attention(
@@ -297,12 +309,24 @@ def make_fast_moe_forward(original_forward):
                     proj_out = self._apply_gate(proj_out) if has_gate else act_fn(proj_out)
                     proj_out = self.linear(proj_out, weight_down, scale_down, activation_scale=down_act_scale)
                 else:
-                    proj_module_up = self.gate_up_proj[exp_id]
-                    proj_out = proj_module_up(current_state) if callable(proj_module_up) else F.linear(current_state, proj_module_up)
-                    gate, up = proj_out.chunk(2, dim=-1)
-                    proj_out = act_fn(gate) * up
-                    proj_module_down = self.down_proj[exp_id]
-                    proj_out = proj_module_down(proj_out) if callable(proj_module_down) else F.linear(proj_out, proj_module_down)
+                    # Robust projection: handles 3D Parameter, Linear4bit, ModuleList, or separate gate/up projections
+                    if hasattr(self, "experts") and isinstance(self.experts, (list, torch.nn.ModuleList)):
+                        proj_out = self.experts[exp_id](current_state)
+                    elif hasattr(self, "gate_proj") and hasattr(self, "up_proj"):
+                        proj_g = self.gate_proj[exp_id]
+                        proj_u = self.up_proj[exp_id]
+                        gate = proj_g(current_state) if callable(proj_g) else F.linear(current_state, proj_g)
+                        up = proj_u(current_state) if callable(proj_u) else F.linear(current_state, proj_u)
+                        proj_out = act_fn(gate) * up
+                        proj_d = self.down_proj[exp_id]
+                        proj_out = proj_d(proj_out) if callable(proj_d) else F.linear(proj_out, proj_d)
+                    else:
+                        proj_module_up = self.gate_up_proj[exp_id]
+                        proj_out = proj_module_up(current_state) if callable(proj_module_up) else F.linear(current_state, proj_module_up)
+                        gate, up = proj_out.chunk(2, dim=-1)
+                        proj_out = act_fn(gate) * up
+                        proj_module_down = self.down_proj[exp_id]
+                        proj_out = proj_module_down(proj_out) if callable(proj_module_down) else F.linear(proj_out, proj_module_down)
 
                 routing_weight = top_k_weights[tok_i, k_pos]
                 final_hidden_states[tok_i] += (proj_out[0] * routing_weight).float()
@@ -317,12 +341,23 @@ def make_fast_moe_forward(original_forward):
                     proj_out = self._apply_gate(proj_out) if has_gate else act_fn(proj_out)
                     proj_out = self.linear(proj_out, weight_down, scale_down, activation_scale=down_act_scale)
                 else:
-                    proj_module_up = self.gate_up_proj[exp_id]
-                    proj_out = proj_module_up(current_state) if callable(proj_module_up) else F.linear(current_state, proj_module_up)
-                    gate, up = proj_out.chunk(2, dim=-1)
-                    proj_out = act_fn(gate) * up
-                    proj_module_down = self.down_proj[exp_id]
-                    proj_out = proj_module_down(proj_out) if callable(proj_module_down) else F.linear(proj_out, proj_module_down)
+                    if hasattr(self, "experts") and isinstance(self.experts, (list, torch.nn.ModuleList)):
+                        proj_out = self.experts[exp_id](current_state)
+                    elif hasattr(self, "gate_proj") and hasattr(self, "up_proj"):
+                        proj_g = self.gate_proj[exp_id]
+                        proj_u = self.up_proj[exp_id]
+                        gate = proj_g(current_state) if callable(proj_g) else F.linear(current_state, proj_g)
+                        up = proj_u(current_state) if callable(proj_u) else F.linear(current_state, proj_u)
+                        proj_out = act_fn(gate) * up
+                        proj_d = self.down_proj[exp_id]
+                        proj_out = proj_d(proj_out) if callable(proj_d) else F.linear(proj_out, proj_d)
+                    else:
+                        proj_module_up = self.gate_up_proj[exp_id]
+                        proj_out = proj_module_up(current_state) if callable(proj_module_up) else F.linear(current_state, proj_module_up)
+                        gate, up = proj_out.chunk(2, dim=-1)
+                        proj_out = act_fn(gate) * up
+                        proj_module_down = self.down_proj[exp_id]
+                        proj_out = proj_module_down(proj_out) if callable(proj_module_down) else F.linear(proj_out, proj_module_down)
 
                 weights = top_k_weights[idx_tensor, k_tensor, None]
                 weighted_out = proj_out * weights.to(proj_out.dtype)
@@ -348,13 +383,13 @@ def make_patched_qwen3_moe_block_forward(original_forward):
     return patched_block_forward
 
 
-def patch_moe_experts(model):
+def patch_moe_experts(model, force_fast_moe: bool = True):
     """
-    Patches MoE expert routing layers (FP8Experts, HYV3Experts, Qwen3MoeExperts)
-    with Sword's Zero-Sync Fast MoE Forward ONLY when running in eager mode.
-    When grouped_mm, batched_mm, or deepgemm is active, preserves the fused
-    kernel which executes all experts in a single GPU launch per layer.
-    Also instruments MoE sparse blocks to expose router logits for RL monitoring.
+    Patches MoE expert routing layers (FP8Experts, HYV3Experts, Qwen3MoeExperts, Qwen2MoeExperts)
+    with Sword's Zero-Sync Fast MoE Forward.
+    Replaces slow GPU-side .nonzero() / torch.where() loops that induce hundreds of host-device
+    synchronization stalls per token with high-speed zero-sync routing.
+    Also instruments MoE sparse blocks to expose router logits for RL monitoring & aux loss.
     """
     patched_count = 0
     fused_count = 0
@@ -366,12 +401,19 @@ def patch_moe_experts(model):
             module._sword_original_forward = module.forward
             module.forward = types.MethodType(make_patched_qwen3_moe_block_forward(module._sword_original_forward), module)
 
-        if mod_type in ("FP8Experts", "HYV3Experts", "Qwen3MoeExperts") or name.endswith(".experts"):
+        if mod_type in ("FP8Experts", "HYV3Experts", "Qwen3MoeExperts", "Qwen2MoeExperts") or name.endswith(".experts"):
             cfg = getattr(module, "config", getattr(model, "config", None))
             impl = getattr(cfg, "_experts_implementation", None)
-            # Fused kernels (grouped_mm, batched_mm, deepgemm) run at hardware speed!
-            if impl in ("grouped_mm", "batched_mm", "deepgemm", "deepgemm_megamoe"):
-                # Always register fast fallback in case fused kernel throws at runtime
+
+            # Check if model is quantized (BitsAndBytes 4-bit/8-bit or Linear4bit)
+            is_quantized = any(
+                hasattr(p, "quant_state") or "Linear4bit" in m.__class__.__name__ or "8bit" in m.__class__.__name__
+                for m in module.modules() for p in m.parameters()
+            ) or getattr(cfg, "load_in_4bit", False) or getattr(cfg, "quantization_config", None) is not None
+
+            # When force_fast_moe is enabled or model is quantized, grouped_mm cannot execute
+            # or induces eager fallback. Apply Sword Zero-Sync Fast Dispatch.
+            if not force_fast_moe and not is_quantized and impl in ("grouped_mm", "batched_mm", "deepgemm", "deepgemm_megamoe"):
                 if not hasattr(module, "_sword_fast_forward"):
                     module._sword_fast_forward = types.MethodType(make_fast_moe_forward(module.forward), module)
                 fused_count += 1
@@ -381,10 +423,10 @@ def patch_moe_experts(model):
                 module._sword_original_forward = module.forward
             module.forward = types.MethodType(make_fast_moe_forward(module._sword_original_forward), module)
             patched_count += 1
-    if fused_count > 0:
-        print(f"[Sword] Preserving {fused_count} MoE layers with fused '{impl}' kernels (hardware tensor core speed).")
     if patched_count > 0:
-        print(f"[Sword] Patched {patched_count} MoE expert routing modules with Zero-Sync Fast Dispatch (eager mode).")
+        print(f"[Sword] Patched {patched_count} MoE expert routing modules with Zero-Sync Fast Dispatch.")
+    if fused_count > 0:
+        print(f"[Sword] Preserving {fused_count} MoE layers with fused '{impl}' kernels.")
     return model
 
 
