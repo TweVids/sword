@@ -13,10 +13,17 @@ from typing import Optional, List, Tuple, Union
 import torch
 
 
-class StaticKVCache:
+try:
+    from transformers.cache_utils import Cache
+except ImportError:
+    class Cache:
+        pass
+
+
+class StaticKVCache(Cache):
     """
     High-Throughput Static Key-Value Cache Buffer.
-    
+    Inherits from transformers Cache for full compatibility with native HF models & PeftModel.
     Eliminates dynamic memory allocations, garbage collection stalls,
     and tensor concatenations during token decode.
     """
@@ -31,10 +38,20 @@ class StaticKVCache:
         device: Optional[torch.device] = None,
         auto_clear: bool = True,
     ):
+        if issubclass(self.__class__, Cache) and hasattr(Cache, "__init__"):
+            try:
+                super().__init__(layers=[])
+            except Exception:
+                self.layers = []
+                self.offloading = False
+        else:
+            self.layers = []
+            self.offloading = False
+
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.num_layers = num_layers
-        self.max_batch_size = max_batch_size
+        self._max_batch_size = max_batch_size
         self.num_kv_heads = num_kv_heads
         self.max_seq_len = max_seq_len
         self.head_dim = head_dim
@@ -124,26 +141,70 @@ class StaticKVCache:
             self.current_pos = 0
         else:
             for b in batch_indices:
-                if b < self.max_batch_size:
+                if b < self._max_batch_size:
                     for k, v in zip(self.k_cache, self.v_cache):
                         k[b].zero_()
                         v[b].zero_()
                     self.seq_lengths[b] = 0
             self.current_pos = 0
 
+    @property
+    def max_batch_size(self) -> int:
+        return self._max_batch_size
+
+    @max_batch_size.setter
+    def max_batch_size(self, value: int):
+        self._max_batch_size = value
+
+    @property
+    def batch_size(self) -> int:
+        return self._active_batch_size or self._max_batch_size
+
+    @batch_size.setter
+    def batch_size(self, value: int):
+        self._active_batch_size = value
+
+    def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
+        """Returns the current sequence length for the cache."""
+        return self.current_pos
+
+    def get_max_length(self) -> Optional[int]:
+        """Returns the maximum sequence length supported by the cache."""
+        return self.max_seq_len
+
+    def get_usable_length(self, new_seq_len: int, layer_idx: Optional[int] = 0) -> int:
+        """Given the sequence length of the new tokens, returns the usable length of the cache."""
+        return self.current_pos
+
     def update(
         self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
         layer_idx: int,
-        k: torch.Tensor,
-        v: torch.Tensor,
+        cache_kwargs: Optional[dict] = None,
         start_pos: Optional[int] = None,
+        **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Updates cache for a single layer without reallocation.
-        Fast 4D slice write eliminates 5D pointer-arithmetic overhead.
+        HF Cache update interface compatibility.
+        Supports both positional and keyword argument orders.
         """
-        if start_pos is None:
-            start_pos = self.current_pos
+        # Allow either (layer_idx, k, v) or (k, v, layer_idx)
+        if isinstance(key_states, int):
+            # Old signature: update(layer_idx, k, v, start_pos=...)
+            l_idx = key_states
+            k = value_states
+            v = layer_idx
+            if start_pos is None:
+                start_pos = cache_kwargs if isinstance(cache_kwargs, int) else self.current_pos
+        else:
+            l_idx = layer_idx
+            k = key_states
+            v = value_states
+            if start_pos is None and cache_kwargs and isinstance(cache_kwargs, dict):
+                start_pos = cache_kwargs.get("start_pos", None)
+            if start_pos is None:
+                start_pos = kwargs.get("start_pos", self.current_pos)
 
         bsz, _, seq_len, _ = k.shape
         end_pos = start_pos + seq_len
@@ -156,13 +217,13 @@ class StaticKVCache:
             )
 
         # In-place slice copy (zero memory allocation)
-        self.k_cache[layer_idx][:bsz, :, start_pos:end_pos, :] = k
-        self.v_cache[layer_idx][:bsz, :, start_pos:end_pos, :] = v
+        self.k_cache[l_idx][:bsz, :, start_pos:end_pos, :] = k
+        self.v_cache[l_idx][:bsz, :, start_pos:end_pos, :] = v
 
         # Return view up to current end position
         return (
-            self.k_cache[layer_idx][:bsz, :, :end_pos, :],
-            self.v_cache[layer_idx][:bsz, :, :end_pos, :],
+            self.k_cache[l_idx][:bsz, :, :end_pos, :],
+            self.v_cache[l_idx][:bsz, :, :end_pos, :],
         )
 
     def duplicate_prefix_for_rollouts(

@@ -253,9 +253,10 @@ class FastServer:
             input_ids=input_ids,
             position_ids=prefill_pos_ids,
             attention_mask=attention_mask,
+            past_key_values=self.static_cache,
             sword_static_cache=self.static_cache,
             start_pos=0,
-            use_cache=False,
+            use_cache=True,
         )
         logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
         next_token_logits = logits[:, -1, :]
@@ -282,9 +283,10 @@ class FastServer:
             out = self.decode_fn(
                 input_ids=next_token,
                 position_ids=decode_pos_ids,
+                past_key_values=self.static_cache,
                 sword_static_cache=self.static_cache,
                 start_pos=curr_pos,
-                use_cache=False,
+                use_cache=True,
             )
             step_logits = out.logits[:, -1, :] if hasattr(out, "logits") else out[0][:, -1, :]
 

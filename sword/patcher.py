@@ -100,6 +100,8 @@ def make_patched_attention_forward(original_forward):
         **kwargs,
     ):
         static_cache = getattr(self, "_sword_static_cache", None) or kwargs.get("sword_static_cache", None)
+        if static_cache is None and past_key_values is not None and hasattr(past_key_values, "k_cache"):
+            static_cache = past_key_values
         layer_idx = getattr(self, "layer_idx", 0)
 
         bsz, q_len, _ = hidden_states.shape
@@ -295,10 +297,12 @@ def make_fast_moe_forward(original_forward):
                     proj_out = self._apply_gate(proj_out) if has_gate else act_fn(proj_out)
                     proj_out = self.linear(proj_out, weight_down, scale_down, activation_scale=down_act_scale)
                 else:
-                    proj_out = F.linear(current_state, self.gate_up_proj[exp_id])
+                    proj_module_up = self.gate_up_proj[exp_id]
+                    proj_out = proj_module_up(current_state) if callable(proj_module_up) else F.linear(current_state, proj_module_up)
                     gate, up = proj_out.chunk(2, dim=-1)
                     proj_out = act_fn(gate) * up
-                    proj_out = F.linear(proj_out, self.down_proj[exp_id])
+                    proj_module_down = self.down_proj[exp_id]
+                    proj_out = proj_module_down(proj_out) if callable(proj_module_down) else F.linear(proj_out, proj_module_down)
 
                 routing_weight = top_k_weights[tok_i, k_pos]
                 final_hidden_states[tok_i] += (proj_out[0] * routing_weight).float()
@@ -313,10 +317,12 @@ def make_fast_moe_forward(original_forward):
                     proj_out = self._apply_gate(proj_out) if has_gate else act_fn(proj_out)
                     proj_out = self.linear(proj_out, weight_down, scale_down, activation_scale=down_act_scale)
                 else:
-                    proj_out = F.linear(current_state, self.gate_up_proj[exp_id])
+                    proj_module_up = self.gate_up_proj[exp_id]
+                    proj_out = proj_module_up(current_state) if callable(proj_module_up) else F.linear(current_state, proj_module_up)
                     gate, up = proj_out.chunk(2, dim=-1)
                     proj_out = act_fn(gate) * up
-                    proj_out = F.linear(proj_out, self.down_proj[exp_id])
+                    proj_module_down = self.down_proj[exp_id]
+                    proj_out = proj_module_down(proj_out) if callable(proj_module_down) else F.linear(proj_out, proj_module_down)
 
                 weights = top_k_weights[idx_tensor, k_tensor, None]
                 weighted_out = proj_out * weights.to(proj_out.dtype)
