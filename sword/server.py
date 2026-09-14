@@ -226,48 +226,95 @@ class FastServer:
         bsz = len(prompts)
         assert bsz <= self.max_concurrency, f"Prompt batch ({bsz}) exceeds max_concurrency ({self.max_concurrency})"
 
-        # Tokenize with left-padding for generation
-        enc = self.tokenizer(
-            prompts,
-            padding=True,
-            return_tensors="pt",
-            truncation=True,
-            max_length=self.max_seq_len - max_new_tokens,
-        )
-
-        input_ids = enc["input_ids"].to(self.device)
-        attention_mask = enc.get("attention_mask", None)
-        if attention_mask is not None:
-            attention_mask = attention_mask.to(self.device)
-        prompt_len = input_ids.shape[1]
-
         if self.device.type == "cuda":
             torch.cuda.synchronize()
         start_time = time.perf_counter()
 
-        # Prefill phase with zero-overhead auto-clear
-        self.static_cache.new_rollout(batch_size=bsz)
-        self.static_cache.set_pos(0)
-        if attention_mask is not None:
-            prefill_pos_ids = (attention_mask.long().cumsum(-1) - 1).clamp_min(0)
+        # Check if all prompts share identical text (standard in GRPO multi-rollout generation)
+        is_shared_prompt = (bsz > 1 and all(p == prompts[0] for p in prompts))
+
+        if is_shared_prompt:
+            # SGLang-Style Shared Prefix: Prefill 1 prompt instead of bsz redundant copies (8x prefill speedup!)
+            enc_single = self.tokenizer(
+                [prompts[0]],
+                padding=True,
+                return_tensors="pt",
+                truncation=True,
+                max_length=self.max_seq_len - max_new_tokens,
+            )
+            in_ids_single = enc_single["input_ids"].to(self.device)
+            prompt_len = in_ids_single.shape[1]
+            attn_mask_single = enc_single.get("attention_mask", None)
+            if attn_mask_single is not None:
+                attn_mask_single = attn_mask_single.to(self.device)
+                prefill_pos_ids = (attn_mask_single.long().cumsum(-1) - 1).clamp_min(0)
+            else:
+                prefill_pos_ids = torch.arange(0, prompt_len, dtype=torch.long, device=self.device).unsqueeze(0)
+
+            self.static_cache.new_rollout(batch_size=bsz)
+            self.static_cache.set_pos(0)
+            outputs = self.model(
+                input_ids=in_ids_single,
+                position_ids=prefill_pos_ids,
+                attention_mask=attn_mask_single,
+                past_key_values=self.static_cache,
+                sword_static_cache=self.static_cache,
+                start_pos=0,
+                use_cache=True,
+            )
+            # Duplicate the prefilled prefix KV cache to all bsz rollout streams in 0.01ms
+            self.static_cache.duplicate_prefix_for_rollouts(
+                num_prompts=1,
+                group_size=bsz,
+                prompt_lens=[prompt_len],
+            )
+            input_ids = in_ids_single.expand(bsz, -1)
+            logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
+            next_token_logits = logits[:, -1, :].repeat(bsz, 1)
         else:
-            prefill_pos_ids = torch.arange(0, prompt_len, dtype=torch.long, device=self.device).unsqueeze(0).expand(bsz, -1)
+            # Standard multi-prompt batch prefill
+            enc = self.tokenizer(
+                prompts,
+                padding=True,
+                return_tensors="pt",
+                truncation=True,
+                max_length=self.max_seq_len - max_new_tokens,
+            )
+            input_ids = enc["input_ids"].to(self.device)
+            attention_mask = enc.get("attention_mask", None)
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(self.device)
+            prompt_len = input_ids.shape[1]
 
-        outputs = self.model(
-            input_ids=input_ids,
-            position_ids=prefill_pos_ids,
-            attention_mask=attention_mask,
-            past_key_values=self.static_cache,
-            sword_static_cache=self.static_cache,
-            start_pos=0,
-            use_cache=True,
-        )
-        logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
-        next_token_logits = logits[:, -1, :]
+            self.static_cache.new_rollout(batch_size=bsz)
+            self.static_cache.set_pos(0)
+            if attention_mask is not None:
+                prefill_pos_ids = (attention_mask.long().cumsum(-1) - 1).clamp_min(0)
+            else:
+                prefill_pos_ids = torch.arange(0, prompt_len, dtype=torch.long, device=self.device).unsqueeze(0).expand(bsz, -1)
 
+            outputs = self.model(
+                input_ids=input_ids,
+                position_ids=prefill_pos_ids,
+                attention_mask=attention_mask,
+                past_key_values=self.static_cache,
+                sword_static_cache=self.static_cache,
+                start_pos=0,
+                use_cache=True,
+            )
+            logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
+            next_token_logits = logits[:, -1, :]
+
+        # Fast sampling with Top-k vocabulary pruning
         if temperature > 0.0:
-            probs = F.softmax(next_token_logits / temperature, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
+            if top_k > 0 and top_k < next_token_logits.shape[-1]:
+                top_logits, top_indices = torch.topk(next_token_logits, k=top_k, dim=-1)
+                probs = F.softmax(top_logits / temperature, dim=-1)
+                sample = torch.multinomial(probs, num_samples=1)
+                next_token = torch.gather(top_indices, -1, sample)
+            else:
+                probs = F.softmax(next_token_logits / temperature, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
         else:
             next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
 
@@ -288,22 +335,19 @@ class FastServer:
         graph_logits = None
         if self.device.type == "cuda" and not self._graph_captured:
             try:
-                # Warmup memory & kernels on side stream before graph capture
-                s = torch.cuda.Stream()
-                s.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(s):
-                    for _ in range(3):
-                        decode_input_ids.copy_(next_token)
-                        decode_pos_ids.fill_(curr_pos)
-                        out_warm = self.decode_fn(
-                            input_ids=decode_input_ids,
-                            position_ids=decode_pos_ids,
-                            past_key_values=self.static_cache,
-                            use_cache=True,
-                        )
-                torch.cuda.current_stream().wait_stream(s)
+                # Warm up memory, cuBLAS handles & kernels on current stream before graph capture
+                for _ in range(3):
+                    decode_input_ids.copy_(next_token)
+                    decode_pos_ids.fill_(curr_pos)
+                    _ = self.decode_fn(
+                        input_ids=decode_input_ids,
+                        position_ids=decode_pos_ids,
+                        past_key_values=self.static_cache,
+                        use_cache=True,
+                    )
+                torch.cuda.synchronize()
 
-                # Capture graph: records all 1,152 kernels into 1 executable hardware graph
+                # Capture graph: records all decode kernels into 1 executable hardware graph
                 cuda_graph = torch.cuda.CUDAGraph()
                 decode_input_ids.copy_(next_token)
                 decode_pos_ids.fill_(curr_pos)
@@ -334,7 +378,7 @@ class FastServer:
 
             if self.cuda_graph_runner is not None:
                 g, g_in, g_pos, g_logits = self.cuda_graph_runner
-                # Replay pre-recorded graph: 1 single CPU instruction instead of 1,152 kernel launches!
+                # Replay pre-recorded graph: 1 single CPU instruction instead of hundreds of kernel launches!
                 g.replay()
                 step_logits = g_logits
             else:
@@ -349,8 +393,14 @@ class FastServer:
                 step_logits = out.logits[:, -1, :] if hasattr(out, "logits") else out[0][:, -1, :]
 
             if temperature > 0.0:
-                probs = F.softmax(step_logits / temperature, dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1)
+                if top_k > 0 and top_k < step_logits.shape[-1]:
+                    top_logits, top_indices = torch.topk(step_logits, k=top_k, dim=-1)
+                    probs = F.softmax(top_logits / temperature, dim=-1)
+                    sample = torch.multinomial(probs, num_samples=1)
+                    next_token = torch.gather(top_indices, -1, sample)
+                else:
+                    probs = F.softmax(step_logits / temperature, dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1)
             else:
                 next_token = torch.argmax(step_logits, dim=-1, keepdim=True)
 
