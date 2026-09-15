@@ -2,7 +2,7 @@ import types
 import torch
 import torch.nn.functional as F
 from torch.nn.attention import sdpa_kernel, SDPBackend
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict
 from .attention import apply_rotary_pos_emb
 
 
@@ -313,6 +313,18 @@ def make_patched_attention_forward(original_forward):
     return patched_forward
 
 
+_TOK_IDX_CACHE: Dict[Tuple[int, int, str], torch.Tensor] = {}
+
+
+def _get_flat_tok_idx(num_tokens: int, num_exp_per_tok: int, device: torch.device) -> torch.Tensor:
+    key = (num_tokens, num_exp_per_tok, str(device))
+    val = _TOK_IDX_CACHE.get(key)
+    if val is None or val.device != device:
+        val = torch.arange(num_tokens, device=device).unsqueeze(1).expand(-1, num_exp_per_tok).reshape(-1)
+        _TOK_IDX_CACHE[key] = val
+    return val
+
+
 def make_fast_moe_forward(original_forward):
     """
     High-performance zero-sync MoE expert dispatch forward.
@@ -364,7 +376,7 @@ def make_fast_moe_forward(original_forward):
             num_tokens, hidden_dim = hidden_states.shape
             num_exp_per_tok = top_k_index.shape[1]
             flat_exp_idx = top_k_index.reshape(-1)
-            flat_tok_idx = torch.arange(num_tokens, device=hidden_states.device).unsqueeze(1).expand(-1, num_exp_per_tok).reshape(-1)
+            flat_tok_idx = _get_flat_tok_idx(num_tokens, num_exp_per_tok, hidden_states.device)
             x = hidden_states[flat_tok_idx].unsqueeze(1)
             w_up = target.gate_up_proj[flat_exp_idx]
             if w_up.dtype != x.dtype and str(w_up.dtype).startswith("torch.float8"):
@@ -686,27 +698,35 @@ def convert_to_fp8(model, skip_modules: Tuple[str, ...] = ("lm_head", "embed_tok
     """
     In-memory FP8 weight quantization for modern GPUs (e.g. Blackwell / Ada Lovelace).
     Casts frozen MoE expert weights (gate_up_proj, down_proj) to torch.float8_e4m3fn,
-    cutting ~90% of model weight VRAM by 50% (saving ~27 GB on Qwen3-30B-A3B)
+    cutting ~90% of model weight VRAM by 50% (saving ~27-29 GB on Qwen3-30B-A3B)
     while keeping attention projections in native BF16 for 100% stability.
     """
     if not hasattr(torch, "float8_e4m3fn"):
         print("[Sword] Warning: torch.float8_e4m3fn is not supported in this PyTorch version.")
         return model
 
+    import gc
     converted = 0
     total_bytes_saved = 0
     for name, param in model.named_parameters():
-        if not param.requires_grad and any(s in name.lower() for s in ("gate_up_proj", "down_proj")):
-            if any(skip in name.lower() for skip in skip_modules):
+        name_lower = name.lower()
+        if any(s in name_lower for s in ("gate_up_proj", "down_proj")):
+            if any(skip in name_lower for skip in skip_modules) or "lora" in name_lower:
                 continue
             if param.dim() >= 2 and torch.is_floating_point(param):
                 orig_bytes = param.nbytes
+                param.requires_grad = False
                 param.data = param.data.to(torch.float8_e4m3fn)
                 total_bytes_saved += (orig_bytes - param.nbytes)
                 converted += 1
 
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     mb_saved = total_bytes_saved / (1024 * 1024)
-    print(f"[Sword] Converted {converted} MoE weight tensors to FP8 ({torch.float8_e4m3fn}). Saved ~{mb_saved:.1f} MB VRAM.")
+    gb_saved = total_bytes_saved / (1024 * 1024 * 1024)
+    print(f"[Sword] Converted {converted} MoE weight tensors to FP8 ({torch.float8_e4m3fn}). Saved ~{gb_saved:.2f} GB ({mb_saved:.1f} MB) VRAM.")
     return model
 
 
