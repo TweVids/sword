@@ -337,13 +337,21 @@ def make_fast_moe_forward(original_forward):
         if hasattr(target, "module") and not hasattr(target, "gate_up_proj") and hasattr(target.module, "gate_up_proj"):
             target = target.module
 
-        # Check if target has expected projections; if not, safely fallback to original_forward
+        # Check if target has expected projections; if not or if 4-bit packed, safely fallback to original_forward
         has_gate_up = hasattr(target, "gate_up_proj")
         has_split = hasattr(target, "gate_proj") and hasattr(target, "up_proj")
         has_exp_list = hasattr(target, "experts") and isinstance(target.experts, (list, torch.nn.ModuleList))
         is_fp8 = hasattr(target, "linear")
 
-        if not (has_gate_up or has_split or has_exp_list or is_fp8):
+        is_4bit_packed = (
+            has_gate_up
+            and (
+                hasattr(target.gate_up_proj, "quant_state")
+                or not torch.is_floating_point(target.gate_up_proj)
+                or getattr(target.gate_up_proj, "dim", lambda: 0)() != 3
+            )
+        )
+        if is_4bit_packed or not (has_gate_up or has_split or has_exp_list or is_fp8):
             return original_forward(hidden_states, top_k_index, top_k_weights, *args, **kwargs)
 
         # Pure GPU/CPU Batched BMM MoE Dispatch (Zero-Sync, 100% CUDA Graph capture compatible)
@@ -533,6 +541,11 @@ def patch_moe_experts(model, force_fast_moe: bool = False):
             ) or getattr(cfg, "load_in_4bit", False) or getattr(cfg, "quantization_config", None) is not None
 
             is_fp8 = hasattr(target_mod, "linear") or hasattr(target_mod, "gate_up_proj_scale_inv")
+
+            # When model is quantized in 4-bit (BitsAndBytes/Unsloth), preserve native 4-bit kernels
+            if is_quantized and not is_fp8:
+                fused_count += 1
+                continue
 
             # When real hardware-fused grouped_mm or Unsloth Triton kernels are available, preserve them
             has_real_fused_kernel = (
