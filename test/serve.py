@@ -104,10 +104,10 @@ def run_colab_serving():
         )
         model = AutoModelForCausalLM.from_config(cfg)
         model = patch_qwen(model)
-        server = FastQwenServer(model=model, tokenizer=tokenizer, max_concurrency=4)
+        server = FastQwenServer(model=model, tokenizer=tokenizer, max_concurrency=args.concurrency)
 
-    # 1. Direct 4-stream concurrent serve
-    print("\n[*] Serving 4 concurrent requests...")
+    # 1. Direct concurrent serve
+    print(f"\n[*] Serving {args.concurrency} concurrent requests...")
     results = server.serve(prompts, max_new_tokens=args.max_new_tokens, temperature=0.7)
     
     print("\n--- Generated Sample Responses ---")
