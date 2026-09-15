@@ -367,6 +367,23 @@ class TestQwen3MoEAndSmartKVCache(unittest.TestCase):
         self.assertEqual(res["total_tokens"], 8)
         self.assertEqual(len(res["responses"]), 2)
 
+    # =========================================================
+    # 10. In-Memory MoE Weight FP8 Conversion (convert_to_fp8)
+    # =========================================================
+    def test_convert_to_fp8_moe_weights(self):
+        """Verifies in-memory FP8 conversion of Qwen3 MoE expert weights."""
+        if not hasattr(torch, "float8_e4m3fn"):
+            return
+
+        cfg = make_mini_qwen3_moe_config()
+        model = Qwen3MoeForCausalLM(cfg).bfloat16()
+        sword.convert_to_fp8(model)
+
+        for name, param in model.named_parameters():
+            if "gate_up_proj" in name or "down_proj" in name:
+                self.assertEqual(param.dtype, torch.float8_e4m3fn)
+                self.assertFalse(param.requires_grad)
+
 
 if __name__ == "__main__":
     unittest.main()
