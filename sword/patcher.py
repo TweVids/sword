@@ -205,14 +205,42 @@ def make_patched_attention_forward(original_forward):
                 start_pos = getattr(static_cache, "current_pos", 0)
 
             key_states, value_states = static_cache.update(layer_idx, key_states, value_states, start_pos)
-            # Single-token decode: Q attends to all cached K/V, causal mask is not needed
-            if q_len == 1:
-                is_causal = False
-                attention_mask = None
         elif past_key_values is not None and hasattr(past_key_values, "update"):
             key_states, value_states = past_key_values.update(key_states, value_states, layer_idx, kwargs)
-            if q_len == 1:
-                is_causal = False
+
+        kv_len = key_states.shape[-2]
+        if q_len == 1:
+            # Single-token decode: Q attends to all cached K/V, causal mask is not needed
+            is_causal = False
+            attention_mask = None
+        elif kv_len > q_len:
+            # Multi-token evaluation with past KV cache (e.g. speculative prompt lookup decoding).
+            # Query tokens attend to all past tokens [0 .. kv_len - q_len - 1]
+            # and causally among themselves [kv_len - q_len .. kv_len - 1].
+            slice_mask = torch.zeros(
+                (1, 1, q_len, kv_len),
+                dtype=query_states.dtype,
+                device=query_states.device,
+            )
+            causal_sub = torch.triu(
+                torch.full(
+                    (q_len, q_len),
+                    float("-inf"),
+                    device=query_states.device,
+                    dtype=query_states.dtype,
+                ),
+                diagonal=1,
+            )
+            slice_mask[:, :, :, kv_len - q_len :] = causal_sub
+
+            if attention_mask is not None and attention_mask.shape[-1] == kv_len:
+                if attention_mask.dtype == torch.bool:
+                    slice_mask = slice_mask.masked_fill(~attention_mask, float("-inf"))
+                else:
+                    slice_mask = slice_mask + attention_mask
+
+            attention_mask = slice_mask
+            is_causal = False
 
         # -------------------------------------------------------------
         # 4. Pure FlashAttention / Efficient Attention SDPA

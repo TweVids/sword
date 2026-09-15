@@ -304,6 +304,7 @@ class FastServer:
 
         outputs = self.model(
             input_ids=input_ids,
+            attention_mask=attn_mask,
             position_ids=pos_ids,
             past_key_values=self.static_cache,
             sword_static_cache=self.static_cache,
@@ -342,9 +343,11 @@ class FastServer:
             if not candidates:
                 decode_in = torch.tensor([[generated_tokens[-1]]], dtype=torch.long, device=self.device)
                 decode_pos = torch.tensor([[curr_pos]], dtype=torch.long, device=self.device)
+                decode_mask = torch.ones((1, curr_pos + 1), dtype=torch.long, device=self.device)
                 self.static_cache.set_pos(curr_pos)
                 out = self.model(
                     input_ids=decode_in,
+                    attention_mask=decode_mask,
                     position_ids=decode_pos,
                     past_key_values=self.static_cache,
                     sword_static_cache=self.static_cache,
@@ -365,10 +368,12 @@ class FastServer:
                 eval_tokens = [generated_tokens[-1]] + candidates[:-1]
                 eval_in = torch.tensor([eval_tokens], dtype=torch.long, device=self.device)
                 eval_pos = torch.arange(curr_pos, curr_pos + K, dtype=torch.long, device=self.device).unsqueeze(0)
+                eval_mask = torch.ones((1, curr_pos + K), dtype=torch.long, device=self.device)
 
                 self.static_cache.set_pos(curr_pos)
                 out = self.model(
                     input_ids=eval_in,
+                    attention_mask=eval_mask,
                     position_ids=eval_pos,
                     past_key_values=self.static_cache,
                     sword_static_cache=self.static_cache,
@@ -391,6 +396,8 @@ class FastServer:
                         generated_tokens.append(target_cand)
                         token_history.append(target_cand)
                         accepted += 1
+                        if len(generated_tokens) >= max_new_tokens:
+                            break
                         if eos_id is not None and target_cand == eos_id:
                             break
                     else:

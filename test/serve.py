@@ -31,6 +31,8 @@ def run_colab_serving():
     parser.add_argument("--max-new-tokens", type=int, default=64, help="Number of new tokens to generate per stream")
     parser.add_argument("--concurrency", type=int, default=4, help="Concurrent streams (e.g. 4 or 8)")
     parser.add_argument("--compile", action="store_true", help="Enable torch.compile with dynamic shapes (TorchInductor)")
+    parser.add_argument("--speculative", action="store_true", help="Enable Prompt Lookup Speculative Drafting")
+    parser.add_argument("--speculative-k", type=int, default=3, help="Number of speculative candidate tokens")
     parser.add_argument("--mock-test", action="store_true", help="Run with synthetic weights for quick verification")
     args = parser.parse_args()
 
@@ -108,7 +110,13 @@ def run_colab_serving():
 
     # 1. Direct concurrent serve
     print(f"\n[*] Serving {args.concurrency} concurrent requests...")
-    results = server.serve(prompts, max_new_tokens=args.max_new_tokens, temperature=0.7)
+    results = server.serve(
+        prompts,
+        max_new_tokens=args.max_new_tokens,
+        temperature=0.7,
+        use_speculative=True if args.speculative else None,
+        speculative_k=args.speculative_k,
+    )
     
     print("\n--- Generated Sample Responses ---")
     for idx, (p, r) in enumerate(zip(prompts, results["responses"])):
@@ -117,7 +125,12 @@ def run_colab_serving():
 
     # 2. Comparative Before vs After Speed Benchmark
     print("\n[*] Running comparative benchmark (BEFORE vs AFTER)...")
-    metrics = server.benchmark_before_after(prompts, max_new_tokens=args.max_new_tokens)
+    metrics = server.benchmark_before_after(
+        prompts,
+        max_new_tokens=args.max_new_tokens,
+        use_speculative=True if args.speculative else None,
+        speculative_k=args.speculative_k,
+    )
     
     import json
     print("\n[Raw Metrics Summary]:")

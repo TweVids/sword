@@ -284,5 +284,54 @@ class TestQwen3MoEAndSmartKVCache(unittest.TestCase):
         self.assertGreater(metrics["routing_entropy"], 1.0)
 
 
+    def test_qwen3_moe_speculative_decoding_with_static_cache(self):
+        """Verifies Speculative Prompt Lookup Decoding works without attention mask mismatch on Qwen3 MoE."""
+        cfg = make_mini_qwen3_moe_config()
+        model = Qwen3MoeForCausalLM(cfg)
+        model.eval()
+
+        class MockTokenizer:
+            pad_token_id = 0
+            eos_token_id = 2
+            padding_side = "left"
+            def __call__(self, texts, padding=True, return_tensors="pt", **kwargs):
+                # Repeating pattern to trigger speculative n-gram matches
+                pattern = [10, 20, 30, 40, 10, 20, 30, 40]
+                return {
+                    "input_ids": torch.tensor([pattern for _ in texts], dtype=torch.long),
+                    "attention_mask": torch.ones(len(texts), len(pattern), dtype=torch.long),
+                }
+            def batch_decode(self, token_ids, skip_special_tokens=True):
+                return ["mock_decoded_text" for _ in range(token_ids.shape[0])]
+
+        server = FastQwen3MoeServer(
+            model=model,
+            tokenizer=MockTokenizer(),
+            max_concurrency=2,
+            max_seq_len=256,
+        )
+
+        res = server.serve(
+            prompts=["test pattern prompt"],
+            max_new_tokens=8,
+            temperature=0.0,
+            use_speculative=True,
+            speculative_k=3,
+        )
+
+        self.assertTrue(res["speculative"])
+        self.assertEqual(res["total_tokens"], 8)
+        self.assertEqual(len(res["responses"]), 1)
+
+        bench = server.benchmark_before_after(
+            prompts=["test pattern prompt"],
+            max_new_tokens=6,
+            use_speculative=True,
+            speculative_k=3,
+        )
+        self.assertIn("speedup", bench)
+        self.assertGreater(bench["after_total_tps"], 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()
