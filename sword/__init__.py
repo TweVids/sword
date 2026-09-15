@@ -200,6 +200,8 @@ from .patcher import (
     unpatch_qwen3_moe,
     unpatch_ling,
     set_attention_mode,
+    convert_to_fp8,
+    convert_moe_to_fp8,
 )
 from .loader import load_qwen_model, load_moe_model, load_qwen3_moe_model, load_ling_model
 from .ling import FastLingServer, setup_fla_compatibility
@@ -255,6 +257,8 @@ __all__ = [
     "unpatch_qwen3_moe",
     "unpatch_ling",
     "set_attention_mode",
+    "convert_to_fp8",
+    "convert_moe_to_fp8",
     "load_qwen_model",
     "load_moe_model",
     "load_qwen3_moe_model",

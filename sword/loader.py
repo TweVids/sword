@@ -53,11 +53,15 @@ def load_qwen_model(
         try:
             from unsloth import FastLanguageModel
             print(f"[Sword] Loading {model_name_or_path} with Unsloth FastLanguageModel (4-bit={load_in_4bit}, fp8={load_in_fp8}, max_seq={max_seq_length})...")
+            extra_kwargs = {}
+            if load_in_fp8:
+                extra_kwargs["load_in_fp8"] = True
             model, _ = FastLanguageModel.from_pretrained(
                 model_name=model_name_or_path,
                 max_seq_length=max_seq_length,
                 dtype=dtype,
                 load_in_4bit=load_in_4bit,
+                **extra_kwargs,
             )
             try:
                 FastLanguageModel.for_inference(model)
@@ -299,11 +303,15 @@ def load_qwen3_moe_model(
                 from unsloth import FastLanguageModel
 
             print(f"[Sword] Attempting Unsloth acceleration for Qwen3 MoE (4-bit={load_in_4bit}, fp8={load_in_fp8}, max_seq={max_seq_length})...")
+            extra_kwargs = {}
+            if load_in_fp8:
+                extra_kwargs["load_in_fp8"] = True
             model, _ = FastLanguageModel.from_pretrained(
                 model_name=model_name_or_path,
                 max_seq_length=max_seq_length,
                 dtype=torch_dtype,
                 load_in_4bit=load_in_4bit,
+                **extra_kwargs,
             )
             try:
                 FastLanguageModel.for_inference(model)
