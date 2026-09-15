@@ -812,6 +812,11 @@ class FastServer:
         print(f"{'TOTAL':<10}{before_tps:<18.2f}{after_tps:<18.2f}{total_speedup:<10.2f}x")
         print("=" * 72)
         print(f"Target of 20+ TPS for {bsz} concurrency: {'ACHIEVED' if after_tps >= 20.0 else 'CHECK RUN'}\n")
+        if use_speculative and bsz > 1:
+            avg_sp = sum(after_stream_tps) / sum(before_stream_tps) if sum(before_stream_tps) > 0 else 1.0
+            print(f"[*] Speculative Note: Evaluated sequentially per stream ({avg_sp:.2f}x average stream speedup).")
+            print(f"[*] To benchmark parallel batch throughput across all {bsz} streams simultaneously,")
+            print(f"    run with 'use_speculative=False' (Batched SDPA mode).\n")
 
         return {
             "before_time": before_time,
