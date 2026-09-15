@@ -33,7 +33,15 @@ def _fast_sdpa_attention(
     """
     Pure-PyTorch Fast SDPA Attention kernel.
     Enforces FlashAttention / Efficient Attention C++ kernels on hardware (e.g. Blackwell).
+    Seamlessly harmonizes FP8 / BF16 / FP16 key/value states from StaticKVCache.
     """
+    if key.dtype != query.dtype or value.dtype != query.dtype:
+        if str(query.dtype).startswith("torch.float8"):
+            query = query.to(torch.bfloat16)
+        target_dtype = query.dtype
+        key = key.to(target_dtype)
+        value = value.to(target_dtype)
+
     try:
         with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]):
             return F.scaled_dot_product_attention(
@@ -71,6 +79,13 @@ def _vanilla_quadratic_attention(
     Materializes the full [batch, heads, seq_len, seq_len] attention matrix in VRAM.
     Used to demonstrate O(N^2) memory & latency explosion vs FlashAttention O(N).
     """
+    if key.dtype != query.dtype or value.dtype != query.dtype:
+        if str(query.dtype).startswith("torch.float8"):
+            query = query.to(torch.bfloat16)
+        target_dtype = query.dtype
+        key = key.to(target_dtype)
+        value = value.to(target_dtype)
+
     bsz, num_heads, q_len, head_dim = query.shape
     kv_len = key.shape[2]
     if scale is None:

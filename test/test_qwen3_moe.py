@@ -332,6 +332,41 @@ class TestQwen3MoEAndSmartKVCache(unittest.TestCase):
         self.assertIn("speedup", bench)
         self.assertGreater(bench["after_total_tps"], 0.0)
 
+    # =========================================================
+    # 9. Native FP8 KV Cache Serving Compatibility
+    # =========================================================
+    def test_qwen3_moe_fp8_kv_cache_serving(self):
+        """Verifies Qwen3 MoE serving with native torch.float8_e4m3fn KV Cache."""
+        if not hasattr(torch, "float8_e4m3fn"):
+            return
+
+        cfg = make_mini_qwen3_moe_config()
+        model = Qwen3MoeForCausalLM(cfg).bfloat16()
+        patch_qwen3_moe(model, mode="flash", patch_moe=True)
+
+        class MockTokenizer:
+            pad_token_id = 0
+            eos_token_id = 2
+            def __call__(self, texts, padding=True, return_tensors="pt", **kwargs):
+                return {
+                    "input_ids": torch.randint(10, 900, (len(texts), 8)),
+                    "attention_mask": torch.ones(len(texts), 8, dtype=torch.long),
+                }
+            def batch_decode(self, token_ids, skip_special_tokens=True):
+                return ["output" for _ in range(token_ids.shape[0])]
+
+        server = FastQwen3MoeServer(
+            model=model,
+            tokenizer=MockTokenizer(),
+            max_concurrency=4,
+            max_seq_len=256,
+            kv_cache_dtype=torch.float8_e4m3fn,
+        )
+
+        res = server.serve(["test prompt 1", "test prompt 2"], max_new_tokens=4, use_speculative=False)
+        self.assertEqual(res["total_tokens"], 8)
+        self.assertEqual(len(res["responses"]), 2)
+
 
 if __name__ == "__main__":
     unittest.main()
