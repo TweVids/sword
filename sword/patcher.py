@@ -331,6 +331,35 @@ def make_fast_moe_forward(original_forward):
         if not (has_gate_up or has_split or has_exp_list or is_fp8):
             return original_forward(hidden_states, top_k_index, top_k_weights, *args, **kwargs)
 
+        # Pure GPU/CPU Batched BMM MoE Dispatch (Zero-Sync, 100% CUDA Graph capture compatible)
+        if (
+            hasattr(target, "gate_up_proj")
+            and hasattr(target, "down_proj")
+            and getattr(target.gate_up_proj, "dim", lambda: 0)() == 3
+            and getattr(target.down_proj, "dim", lambda: 0)() == 3
+        ):
+            num_tokens, hidden_dim = hidden_states.shape
+            num_exp_per_tok = top_k_index.shape[1]
+            flat_exp_idx = top_k_index.reshape(-1)
+            flat_tok_idx = torch.arange(num_tokens, device=hidden_states.device).unsqueeze(1).expand(-1, num_exp_per_tok).reshape(-1)
+            x = hidden_states[flat_tok_idx].unsqueeze(1)
+            w_up = target.gate_up_proj[flat_exp_idx]
+            if w_up.dtype != x.dtype and str(w_up.dtype).startswith("torch.float8"):
+                w_up = w_up.to(x.dtype)
+            gate_up = torch.bmm(x, w_up.transpose(1, 2))
+            gate, up = gate_up.chunk(2, dim=-1)
+            act_fn = getattr(target, "act_fn", F.silu)
+            act = act_fn(gate) * up
+            w_down = target.down_proj[flat_exp_idx]
+            if w_down.dtype != act.dtype and str(w_down.dtype).startswith("torch.float8"):
+                w_down = w_down.to(act.dtype)
+            down = torch.bmm(act, w_down.transpose(1, 2))
+            flat_w = top_k_weights.reshape(-1, 1, 1).to(down.dtype)
+            weighted = (down * flat_w).squeeze(1)
+            out = torch.zeros_like(hidden_states)
+            out.index_add_(0, flat_tok_idx, weighted.to(out.dtype))
+            return out
+
         def _do_dispatch():
             num_tokens, hidden_dim = hidden_states.shape
             num_experts = getattr(target, "num_experts", 128)
@@ -488,8 +517,15 @@ def patch_moe_experts(model, force_fast_moe: bool = False):
                 for m in target_mod.modules() for p in m.parameters()
             ) or getattr(cfg, "load_in_4bit", False) or getattr(cfg, "quantization_config", None) is not None
 
-            # When hardware-fused grouped_mm or Unsloth Triton kernels are available, preserve them for hardware tensor core speed
-            if not force_fast_moe and impl in ("grouped_mm", "batched_mm", "deepgemm", "deepgemm_megamoe"):
+            is_fp8 = hasattr(target_mod, "linear") or hasattr(target_mod, "gate_up_proj_scale_inv")
+
+            # When real hardware-fused grouped_mm or Unsloth Triton kernels are available, preserve them
+            has_real_fused_kernel = (
+                impl in ("deepgemm", "deepgemm_megamoe")
+                or (is_fp8 and hasattr(target_mod, "linear") and impl == "grouped_mm")
+                or hasattr(target_mod, "_fused_kernel")
+            )
+            if not force_fast_moe and has_real_fused_kernel:
                 if not hasattr(target_mod, "_sword_fast_forward"):
                     target_mod._sword_fast_forward = types.MethodType(make_fast_moe_forward(target_mod.forward), target_mod)
                 fused_count += 1

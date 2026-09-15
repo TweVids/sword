@@ -50,6 +50,7 @@ class FastServer:
         max_seq_len: int = 2048,
         device: Optional[str] = None,
         compile_decode: bool = False,
+        kv_cache_dtype: Optional[torch.dtype] = None,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -82,12 +83,15 @@ class FastServer:
         num_heads = getattr(t_cfg, "num_attention_heads", 16)
         head_dim = getattr(t_cfg, "head_dim", hidden_size // num_heads)
         
-        # In FP8 models, use bfloat16/float16 for KV Cache to preserve precision and Flash SDPA compatibility
-        raw_dtype = getattr(model, "dtype", torch.bfloat16)
-        if raw_dtype is None or "float8" in str(raw_dtype):
-            dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
+        # In FP8 models, use bfloat16/float16 for KV Cache unless explicitly specified
+        if kv_cache_dtype is not None:
+            dtype = kv_cache_dtype
         else:
-            dtype = raw_dtype
+            raw_dtype = getattr(model, "dtype", torch.bfloat16)
+            if raw_dtype is None or "float8" in str(raw_dtype):
+                dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
+            else:
+                dtype = raw_dtype
 
         self.num_layers = num_layers
         self.num_kv_heads = num_kv_heads
@@ -160,11 +164,13 @@ class FastServer:
         model_name_or_path: str = "tencent/Hy-MT2-30B-A3B-FP8",
         load_in_4bit: bool = False,
         load_in_8bit: bool = False,
+        load_in_fp8: bool = False,
         max_concurrency: int = 4,
         max_seq_len: int = 2048,
         compile_decode: bool = False,
         device_map: str = "auto",
         torch_dtype: Optional[torch.dtype] = None,
+        kv_cache_dtype: Optional[torch.dtype] = None,
     ):
         """
         Clean one-line factory method for serving MoE or Dense models:
@@ -178,6 +184,7 @@ class FastServer:
                 model_name_or_path=model_name_or_path,
                 load_in_4bit=load_in_4bit,
                 load_in_8bit=load_in_8bit,
+                load_in_fp8=load_in_fp8,
                 device_map=device_map,
                 torch_dtype=torch_dtype,
                 max_seq_length=max_seq_len,
@@ -188,6 +195,7 @@ class FastServer:
                 max_concurrency=max_concurrency,
                 max_seq_len=max_seq_len,
                 compile_decode=compile_decode,
+                kv_cache_dtype=kv_cache_dtype,
             )
 
         is_ling = any(x in model_name_or_path.lower() for x in ["ling", "bailing"])
@@ -202,9 +210,10 @@ class FastServer:
             )
 
         is_moe_or_fp8 = any(x in model_name_or_path.lower() for x in ["fp8", "moe", "hy-", "hy_", "hunyuan", "deepseek"])
-        if is_moe_or_fp8 and not (load_in_4bit or load_in_8bit):
+        if (is_moe_or_fp8 or load_in_fp8) and not (load_in_4bit or load_in_8bit):
             model, tokenizer = load_moe_model(
                 model_name_or_path=model_name_or_path,
+                load_in_fp8=load_in_fp8,
                 device_map=device_map,
                 torch_dtype=torch_dtype,
                 max_seq_length=max_seq_len,
@@ -214,6 +223,7 @@ class FastServer:
                 model_name_or_path=model_name_or_path,
                 load_in_4bit=load_in_4bit,
                 load_in_8bit=load_in_8bit,
+                load_in_fp8=load_in_fp8,
                 device_map=device_map,
                 max_seq_length=max_seq_len,
             )
@@ -223,6 +233,7 @@ class FastServer:
             max_concurrency=max_concurrency,
             max_seq_len=max_seq_len,
             compile_decode=compile_decode,
+            kv_cache_dtype=kv_cache_dtype,
         )
 
     @torch.inference_mode()
@@ -811,7 +822,8 @@ class FastServer:
         total_speedup = after_tps / before_tps if before_tps > 0 else 1.0
         print(f"{'TOTAL':<10}{before_tps:<18.2f}{after_tps:<18.2f}{total_speedup:<10.2f}x")
         print("=" * 72)
-        print(f"Target of 20+ TPS for {bsz} concurrency: {'ACHIEVED' if after_tps >= 20.0 else 'CHECK RUN'}\n")
+        target_tps = 100.0 if bsz >= 4 else 20.0
+        print(f"Target of {target_tps:.0f}+ TPS for {bsz} concurrency: {'ACHIEVED' if after_tps >= target_tps else 'CHECK RUN'}\n")
         if use_speculative and bsz > 1:
             avg_sp = sum(after_stream_tps) / sum(before_stream_tps) if sum(before_stream_tps) > 0 else 1.0
             print(f"[*] Speculative Note: Evaluated sequentially per stream ({avg_sp:.2f}x average stream speedup).")

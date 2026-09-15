@@ -9,6 +9,7 @@ def load_qwen_model(
     model_name_or_path: str = "Qwen/Qwen2.5-7B-Instruct",
     load_in_4bit: bool = True,
     load_in_8bit: bool = False,
+    load_in_fp8: bool = False,
     device_map: str = "auto",
     dtype: Optional[torch.dtype] = None,
     max_seq_length: int = 8192,
@@ -16,20 +17,27 @@ def load_qwen_model(
 ) -> Tuple[object, object]:
     """
     Loads Qwen (Qwen2, Qwen2.5, Qwen3, Qwen3.5) model using Unsloth (if available on GPU)
-    or Transformers + BitsAndBytes quantization, and applies Sword's Pure FlashAttention patch.
+    or Transformers + BitsAndBytes / native FP8 quantization, and applies Sword's Pure FlashAttention patch.
     
     Args:
         model_name_or_path: HuggingFace model repo id or local checkpoint path
         load_in_4bit: Use 4-bit NF4 bitsandbytes quantization
         load_in_8bit: Use 8-bit bitsandbytes quantization
+        load_in_fp8: Use native FP8 (torch.float8_e4m3fn) precision
         device_map: Hardware placement ('auto', 'cuda', etc.)
-        dtype: Compute precision (defaults to bfloat16 if GPU supported)
+        dtype: Compute precision (defaults to bfloat16 or float8_e4m3fn if GPU supported)
         max_seq_length: Maximum sequence context length (default 8192)
         use_unsloth: Whether to try Unsloth FastLanguageModel first on GPU
         
     Returns:
         Tuple of (patched_model, tokenizer)
     """
+    if load_in_fp8:
+        load_in_4bit = False
+        load_in_8bit = False
+        if dtype is None and hasattr(torch, "float8_e4m3fn") and torch.cuda.is_available():
+            dtype = torch.float8_e4m3fn
+
     if dtype is None:
         dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float32
 
@@ -44,13 +52,17 @@ def load_qwen_model(
     if use_unsloth and torch.cuda.is_available():
         try:
             from unsloth import FastLanguageModel
-            print(f"[Sword] Loading {model_name_or_path} with Unsloth FastLanguageModel (4-bit={load_in_4bit}, max_seq={max_seq_length})...")
+            print(f"[Sword] Loading {model_name_or_path} with Unsloth FastLanguageModel (4-bit={load_in_4bit}, fp8={load_in_fp8}, max_seq={max_seq_length})...")
             model, _ = FastLanguageModel.from_pretrained(
                 model_name=model_name_or_path,
                 max_seq_length=max_seq_length,
                 dtype=dtype,
                 load_in_4bit=load_in_4bit,
             )
+            try:
+                FastLanguageModel.for_inference(model)
+            except Exception:
+                pass
         except Exception as e:
             err_msg = str(e)
             print(f"[Sword] Unsloth load skipped ({err_msg}). Falling back to Transformers + BitsAndBytes...")
@@ -140,6 +152,7 @@ def _fix_transformers_fp8_quantizer_bug():
 
 def load_moe_model(
     model_name_or_path: str = "tencent/Hy-MT2-30B-A3B-FP8",
+    load_in_fp8: bool = False,
     device_map: str = "auto",
     torch_dtype: Optional[torch.dtype] = None,
     max_seq_length: int = 8192,
@@ -157,6 +170,7 @@ def load_moe_model(
     
     Args:
         model_name_or_path: HuggingFace model repo id or local checkpoint path
+        load_in_fp8: Whether to use native FP8 (torch.float8_e4m3fn) precision
         device_map: Hardware placement ('auto', 'cuda', etc.)
         torch_dtype: Compute precision (defaults to 'auto' for FP8 safetensors)
         max_seq_length: Maximum sequence context length
@@ -184,6 +198,7 @@ def load_moe_model(
     if "qwen3" in model_name_or_path.lower() and ("moe" in model_name_or_path.lower() or "a3b" in model_name_or_path.lower()):
         return load_qwen3_moe_model(
             model_name_or_path=model_name_or_path,
+            load_in_fp8=load_in_fp8,
             device_map=device_map,
             torch_dtype=torch_dtype,
             max_seq_length=max_seq_length,
@@ -191,6 +206,10 @@ def load_moe_model(
             attn_mode=attn_mode,
             experts_implementation=experts_implementation,
         )
+
+    if (load_in_fp8 or "fp8" in model_name_or_path.lower()) and torch_dtype is None:
+        if hasattr(torch, "float8_e4m3fn") and torch.cuda.is_available():
+            torch_dtype = torch.float8_e4m3fn
 
     print(f"\n[Sword] Loading MoE model: {model_name_or_path}...")
     tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=True)
@@ -240,6 +259,7 @@ def load_qwen3_moe_model(
     model_name_or_path: str = "Qwen/Qwen3-30B-A3B",
     load_in_4bit: bool = False,
     load_in_8bit: bool = False,
+    load_in_fp8: bool = False,
     device_map: str = "auto",
     torch_dtype: Optional[torch.dtype] = None,
     max_seq_length: int = 8192,
@@ -253,6 +273,12 @@ def load_qwen3_moe_model(
     with hardware acceleration, Unsloth / BitsAndBytes / native FP8 support,
     and Sword Pure FlashAttention + Fast MoE speed engine.
     """
+    if load_in_fp8:
+        load_in_4bit = False
+        load_in_8bit = False
+        if torch_dtype is None and hasattr(torch, "float8_e4m3fn") and torch.cuda.is_available():
+            torch_dtype = torch.float8_e4m3fn
+
     if torch_dtype is None:
         torch_dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float32
 
@@ -272,13 +298,17 @@ def load_qwen3_moe_model(
             except ImportError:
                 from unsloth import FastLanguageModel
 
-            print(f"[Sword] Attempting Unsloth acceleration for Qwen3 MoE (4-bit={load_in_4bit}, max_seq={max_seq_length})...")
+            print(f"[Sword] Attempting Unsloth acceleration for Qwen3 MoE (4-bit={load_in_4bit}, fp8={load_in_fp8}, max_seq={max_seq_length})...")
             model, _ = FastLanguageModel.from_pretrained(
                 model_name=model_name_or_path,
                 max_seq_length=max_seq_length,
                 dtype=torch_dtype,
                 load_in_4bit=load_in_4bit,
             )
+            try:
+                FastLanguageModel.for_inference(model)
+            except Exception:
+                pass
             print("[Sword] Loaded Qwen3 MoE with Unsloth FastModel.")
         except Exception as e:
             print(f"[Sword] Unsloth load skipped ({e}). Falling back to Transformers + BitsAndBytes / Native FP8/BF16...")
