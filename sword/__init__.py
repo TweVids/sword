@@ -237,7 +237,15 @@ from .gym import (
 __version__ = "0.8.5"
 print(f"[Sword] Version {__version__} loaded successfully.")
 
+
+def run_standalone_math_grpo(*args, **kwargs):
+    """Convenience entry point for running Math GRPO training directly from sword."""
+    from sword.train_math_grpo import run_standalone_math_grpo as _run
+    return _run(*args, **kwargs)
+
+
 __all__ = [
+    "run_standalone_math_grpo",
     "PureFlashAttention",
     "apply_rotary_pos_emb",
     "StaticKVCache",
