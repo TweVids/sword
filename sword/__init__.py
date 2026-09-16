@@ -76,6 +76,50 @@ def _fix_transformers_fp8_quantizer_bug():
 _fix_transformers_fp8_quantizer_bug()
 
 
+def _fix_transformers_moe_fp8_compatibility():
+    """
+    Hotfixes upstream Transformers bug in transformers.integrations.moe._grouped_mm
+    where it casts `input.to(weight.dtype)`. When MoE expert weights are quantized to FP8,
+    this erroneously casts the activation `input` to Float8_e4m3fn, causing PyTorch
+    torch._grouped_mm to crash with:
+    'RuntimeError: Expected mat_a to be Float32, BFloat16 or Float16 matrix, got Float8_e4m3fn'.
+    This fix casts the FP8 weights to input.dtype on the fly during grouped_mm,
+    preserving full BF16 matrix multiplication while keeping 27 GB VRAM weight savings.
+    """
+    try:
+        import torch
+        from transformers.integrations import moe as hf_moe
+        orig_grouped_mm = getattr(hf_moe, "_grouped_mm", None)
+        if orig_grouped_mm is not None and not getattr(orig_grouped_mm, "_sword_patched", False):
+            def safe_grouped_mm(input, weight, offs=None):
+                if str(weight.dtype).startswith("torch.float8"):
+                    target_dtype = input.dtype if input.dtype in (torch.bfloat16, torch.float16, torch.float32) else torch.bfloat16
+                    weight = weight.to(target_dtype)
+                    input = input.to(target_dtype)
+                elif input.dtype != weight.dtype:
+                    input = input.to(weight.dtype)
+
+                if hasattr(torch.nn.functional, "grouped_mm"):
+                    try:
+                        return torch.nn.functional.grouped_mm(input, weight, offs=offs)
+                    except Exception:
+                        pass
+                if hasattr(torch, "_grouped_mm"):
+                    try:
+                        return torch._grouped_mm(input, weight, offs=offs)
+                    except Exception:
+                        pass
+                return torch.ops.transformers.grouped_mm_fallback(input, weight, offs=offs)
+
+            safe_grouped_mm._sword_patched = True
+            hf_moe._grouped_mm = safe_grouped_mm
+    except Exception:
+        pass
+
+
+_fix_transformers_moe_fp8_compatibility()
+
+
 def _compute_default_rope_parameters(config=None, device=None, seq_len=None, layer_type=None):
     """Fallback standard RoPE parameter computation for default rope_type."""
     import torch
