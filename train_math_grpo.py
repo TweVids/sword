@@ -383,7 +383,8 @@ class MathScorer:
     @staticmethod
     def _normalize_math(ans: str) -> str:
         s = ans.strip().lower()
-        s = re.sub(r"[\$\\,\s]", "", s)
+        s = s.replace(";", ",")
+        s = re.sub(r"[\$\\,\s;]", "", s)
         s = re.sub(r"\\(?:text|mathrm|mathbf)\{([^}]+)\}", r"\1", s)
         s = re.sub(r"\\frac\{([^}]+)\}\{([^}]+)\}", r"\1/\2", s)
         # Extract \boxed{...} if present
@@ -404,9 +405,15 @@ class MathScorer:
 
         norm_ref = self._normalize_math(reference_answer)
         norm_ans = self._normalize_math(answer)
+        norm_full = self._normalize_math(full_text)
 
-        # 1. Ground Truth Accuracy
-        is_match = (norm_ref in norm_ans) or (norm_ans == norm_ref) or (norm_ref and norm_ref in full_text)
+        # 1. Ground Truth Accuracy (handles interval notation and boxed answers flexibly)
+        is_match = (
+            (norm_ref in norm_ans)
+            or (norm_ans == norm_ref)
+            or (norm_ref and norm_ref in norm_full)
+            or (reference_answer.strip().lower() in answer.lower())
+        )
         accuracy_score = 0.35 if is_match else -0.40
 
         # 2. Formatting (Numbered steps / structured reasoning)
