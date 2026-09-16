@@ -506,6 +506,10 @@ class MathScorer:
                 effort_score += 0.10
                 audit_flags["effort_verification_steps_rewarded"] = True
 
+        # Continuous token efficiency: slightly rewards conciseness to break ties and guarantee non-zero GRPO variance/loss
+        conciseness_bonus = max(0.0, (1.0 - min(token_count / max_budget, 1.0))) * 0.05
+        effort_score += conciseness_bonus
+
         components = {
             "ground_truth": accuracy_score,
             "output_format": format_score,
@@ -1071,7 +1075,7 @@ def format_effort_prompt(problem: str, effort_tier: str = "high", tokenizer: Opt
     """
     tier_key = effort_tier.lower().strip()
     effort_text = EFFORT_SYSTEM_PROMPTS.get(tier_key, EFFORT_SYSTEM_PROMPTS["high"])
-    system_prompt = f"{PERSISTENT_PARAGRAPH_PROMPT}\n{effort_text}\n{BOXED_ANSWER_PROMPT}"
+    system_prompt = f"{effort_text}\n{PERSISTENT_PARAGRAPH_PROMPT}\n{BOXED_ANSWER_PROMPT}"
 
     if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
         try:
