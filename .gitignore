@@ -35,3 +35,10 @@ data_cache/
 checkpoints-grpo/
 gym_state*.json
 
+# Local Trainer & Run Artifacts (strictly never committed to git)
+local_trainer/
+trainer_local/
+local_runs/
+runs/
+*.zip
+*.tar.gz
