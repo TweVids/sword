@@ -462,10 +462,10 @@ class MathScorer:
             format_score += 0.15
             audit_flags["natural_paragraph_thinking_rewarded"] = True
 
-            # Check 3-5 sentence paragraph depth for BigMath2 or when effort is higher than high (xhigh, ultra, max)
+            # Check 3+ sentence paragraph depth for BigMath2 or when effort is higher than medium (high, xhigh, ultra, max)
             is_bigmath = "bigmath" in str(dataset_name).lower()
-            is_high_effort = str(effort_tier).lower() in ("xhigh", "ultra", "max")
-            if is_bigmath or is_high_effort:
+            is_higher_than_medium = str(effort_tier).lower() in ("high", "xhigh", "ultra", "max")
+            if is_bigmath or is_higher_than_medium:
                 paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", trace) if len(p.strip()) > 15]
                 if paragraphs:
                     def count_sentences(p: str) -> int:
@@ -486,24 +486,31 @@ class MathScorer:
                         audit_flags["shallow_paragraphs_penalty"] = -0.10
 
         # B. Paragraph behavior outside <think> (in final answer)
-        # Detect reasoning evasion: markdown headers, step markers, or bullet lists in the answer
+        # 1. Detect reasoning evasion: markdown headers, step markers, or bullet lists in the answer (-0.20)
         has_headers_in_answer = bool(re.search(r"^\s*#{1,6}\s+", answer, re.MULTILINE))
         has_step_markers_in_answer = bool(re.search(r"(?i)\*\*step\s*\d+[:\.]?|\bstep\s*\d+[:\.]", answer))
         has_bullets_in_answer = bool(re.search(r"^\s*[-*•]\s+(?!\s*[\d\w\\$].*?[=<>])", answer, re.MULTILINE))
         has_numbered_in_answer = bool(re.search(r"^\s*\d+[\.)]\s+", answer, re.MULTILINE))
 
-        # Check if the model dumped its step-by-step reasoning into the answer to evade thinking constraints
         has_reasoning_dump = has_headers_in_answer or has_step_markers_in_answer or (len(answer.strip()) > 250 and (has_bullets_in_answer or has_numbered_in_answer))
+
+        # Check for bare answers (only digits/symbols or very short, without descriptive prose)
+        cleaned_words = re.sub(r"\\boxed\{[^}]*\}|[\d\s\.,;:!?'\"\(\)\$\+\-\*\/=]", "", answer).strip()
+        is_bare_answer = len(cleaned_words) < 8
 
         if has_reasoning_dump:
             format_score -= 0.20
             audit_flags["reasoning_dump_in_answer"] = True
         elif has_bullets_in_answer or has_numbered_in_answer:
-            format_score -= 0.12
+            format_score -= 0.15
             audit_flags["bullet_or_list_in_answer"] = True
+        elif is_bare_answer:
+            # Penalize naked numbers without explanatory sentence prose
+            format_score -= 0.10
+            audit_flags["bare_answer_without_prose"] = True
         elif 15 <= len(answer.strip()) <= 350:
-            # Reward coherent explanatory prose wrapping the answer without bloat
-            format_score += 0.05
+            # Reward a concise 1-2 sentence explanatory prose wrapping the answer (+0.15)
+            format_score += 0.15
             audit_flags["natural_paragraph_answer_rewarded"] = True
 
         # C. Check for \boxed{...} in final answer or full text
