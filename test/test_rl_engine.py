@@ -144,8 +144,8 @@ class TestRLEngine(unittest.TestCase):
     def test_token_budget_soft_overage_penalties(self):
         problem = DatasetRow(problem_id="t1", user_problem="test", effort_tier=EffortTier.LOW) # max 1024
 
-        # Within budget -> no penalty
-        traj_good = Trajectory(prompt="test", full_text="short", token_count=800)
+        # Within budget (between 800 and 1024) -> no bonus, no penalty
+        traj_good = Trajectory(prompt="test", full_text="short", token_count=900)
         scored = self.scorer.score_trajectory(problem, traj_good)
         self.assertEqual(scored.component_scores["token_budget"], 0.0)
 

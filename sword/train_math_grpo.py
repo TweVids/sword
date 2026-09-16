@@ -384,13 +384,14 @@ class MathScorer:
     def _normalize_math(ans: str) -> str:
         s = ans.strip().lower()
         s = s.replace(";", ",")
-        s = re.sub(r"[\$\\,\s;]", "", s)
+        # Handle LaTeX commands before stripping backslashes
         s = re.sub(r"\\(?:text|mathrm|mathbf)\{([^}]+)\}", r"\1", s)
         s = re.sub(r"\\frac\{([^}]+)\}\{([^}]+)\}", r"\1/\2", s)
         # Extract \boxed{...} if present
         boxed = re.findall(r"\\boxed\{([^}]+)\}", ans)
         if boxed:
             return MathScorer._normalize_math(boxed[-1])
+        s = re.sub(r"[\$\\,\s;]", "", s)
         # Strip trailing .0 or .00 if whole number (e.g. 357.0 -> 357)
         s = re.sub(r"\.0+(?=[^\d]|$)", "", s)
         return s
@@ -1017,7 +1018,7 @@ class StepAuditor:
             f.write(card_content)
 
         print("\n" + "=" * 68)
-        print(" 📊 200-STEP AUDIT SUMMARY")
+        print(" [Auditor] 200-STEP AUDIT SUMMARY")
         print(f" Steps Completed:       {summary['total_steps']}")
         print(f" Ground Truth Accuracy: {summary['accuracy_pct']}%")
         print(f" Tag Compliance:        {summary['thinking_tag_compliance_pct']}%")
