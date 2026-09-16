@@ -404,6 +404,7 @@ class MathScorer:
         token_count: int = 0,
     ) -> Dict[str, Any]:
         tag_score, tag_audit, trace, answer = ThinkingFormatVerifier.verify(full_text)
+        audit_flags: Dict[str, Any] = {"thinking_tags": tag_audit}
 
         norm_ref = self._normalize_math(reference_answer)
         norm_ans = self._normalize_math(answer)
@@ -432,14 +433,30 @@ class MathScorer:
             )
         accuracy_score = 0.35 if is_match else -0.40
 
-        # 2. Formatting (Numbered steps / structured reasoning)
-        has_numbered = bool(re.search(r"^\s*\d+\.\s+", answer, re.MULTILINE))
-        has_bullets = bool(re.search(r"^\s*[-*•]\s+", answer, re.MULTILINE))
-        format_score = 0.10 if (has_numbered or has_bullets) else -0.10
+        # 2. Formatting (Enforce Natural Paragraph Thinking & Boxed Final Answer)
+        format_score = 0.0
+
+        # Check for bullet points, numbered lists, or markdown headers in thinking trace
+        has_bullets_in_trace = bool(re.search(r"^\s*[-*•]\s+", trace, re.MULTILINE))
+        has_numbered_in_trace = bool(re.search(r"^\s*\d+[\.)]\s+", trace, re.MULTILINE))
+        has_headers_in_trace = bool(re.search(r"^\s*#{1,6}\s+", trace, re.MULTILINE))
+
+        if has_bullets_in_trace or has_numbered_in_trace or has_headers_in_trace:
+            format_score -= 0.15
+            audit_flags["bullet_or_list_in_thinking"] = True
+        elif len(trace.strip()) >= 20:
+            # Reward fluent continuous paragraph thinking
+            format_score += 0.15
+            audit_flags["natural_paragraph_thinking_rewarded"] = True
+
+        # Check for \boxed{...} in final answer or full text
+        has_boxed = bool(re.search(r"\\boxed\{[^}]+\}", answer or full_text))
+        if has_boxed:
+            format_score += 0.10
+            audit_flags["boxed_answer_rewarded"] = True
 
         # 3. Efficiency & Anti-Looping
         efficiency_score = 0.0
-        audit_flags: Dict[str, Any] = {"thinking_tags": tag_audit}
 
         # Check repetitive loops in reasoning trace
         sentences = [s.strip() for s in re.split(r"[.!?\n]+", trace) if len(s.split()) >= 4]
@@ -1035,10 +1052,26 @@ EFFORT_SYSTEM_PROMPTS: Dict[str, str] = {
 }
 
 
+# 1. Persistent reasoning requirement across all effort tiers
+PERSISTENT_PARAGRAPH_PROMPT = (
+    "Structure your reasoning trace as continuous, natural paragraphs of internal monologue inside <think>...</think>. "
+    "Do not use bullet points, numbered lists, or section headers in your thinking."
+)
+
+# 2. Explicit final answer formatting directive
+BOXED_ANSWER_PROMPT = "State your final answer clearly outside the thinking tags formatted as \\boxed{answer}."
+
+
 def format_effort_prompt(problem: str, effort_tier: str = "high", tokenizer: Optional[Any] = None) -> str:
-    """Formats the user problem with the exact effort prompt in the system role."""
+    """
+    Formats the system prompt with 3 clean, separated directives:
+    1. Persistent paragraph reasoning rule (all tiers)
+    2. Dynamic effort instruction (tier-specific)
+    3. Boxed final answer directive
+    """
     tier_key = effort_tier.lower().strip()
-    system_prompt = EFFORT_SYSTEM_PROMPTS.get(tier_key, EFFORT_SYSTEM_PROMPTS["high"])
+    effort_text = EFFORT_SYSTEM_PROMPTS.get(tier_key, EFFORT_SYSTEM_PROMPTS["high"])
+    system_prompt = f"{PERSISTENT_PARAGRAPH_PROMPT}\n{effort_text}\n{BOXED_ANSWER_PROMPT}"
 
     if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
         try:
