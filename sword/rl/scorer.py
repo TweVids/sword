@@ -270,11 +270,24 @@ class PrimaryScorer:
         max_budget = tier.max_tokens
         audit = {"token_count": token_count, "max_budget": max_budget, "tier": tier.value}
 
-        # Check overage
+        # Check overage & effort correctness
         if token_count <= max_budget:
-            # Complexity cross-matching: easy question with heavily inflated tokens
-            if tier == EffortTier.LOW and token_count > 1500:
-                return -0.2, {**audit, "complexity_cross_match_penalty": -0.2}
+            # Low effort: model minimized tokens properly (< 1024)
+            if tier == EffortTier.LOW:
+                if token_count <= 800:
+                    return 0.10, {**audit, "rapid_low_effort_rewarded": True}
+                elif token_count > 1500:
+                    return -0.20, {**audit, "complexity_cross_match_penalty": -0.20}
+                return 0.0, audit
+
+            # High / Ultra / Max effort: verify substantive reasoning took place
+            if tier in (EffortTier.HIGH, EffortTier.XHIGH, EffortTier.ULTRA, EffortTier.MAX):
+                if token_count >= 200:
+                    return 0.10, {**audit, "deep_effort_rewarded": True}
+                else:
+                    # Effort was set to high/ultra, but output was superficial without verification
+                    return -0.15, {**audit, "insufficient_effort_penalty": -0.15}
+
             return 0.0, audit
 
         overage_ratio = (token_count - max_budget) / max_budget

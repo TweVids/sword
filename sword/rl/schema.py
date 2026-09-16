@@ -47,6 +47,50 @@ class EffortTier(str, Enum):
     def recheck_required(self) -> bool:
         return self in (EffortTier.HIGH, EffortTier.XHIGH, EffortTier.ULTRA, EffortTier.MAX)
 
+    @property
+    def system_prompt(self) -> str:
+        return EFFORT_SYSTEM_PROMPTS.get(self, EFFORT_SYSTEM_PROMPTS[EffortTier.MEDIUM])
+
+
+EFFORT_SYSTEM_PROMPTS: Dict[EffortTier, str] = {
+    EffortTier.LOW: "Reasoning effort is set to low. Think rapidly and minimize token usage; answer directly without verification unless something is clearly wrong.",
+    EffortTier.MEDIUM: "Reasoning effort is set to medium. Validate non-obvious logic and state transitions, but don't re-check self-evident steps; keep a steady, balanced pace.",
+    EffortTier.HIGH: "Reasoning effort is set to high. Validate non-obvious logic and state transitions, verify intermediate calculations, and check common edge cases before finalizing.",
+    EffortTier.XHIGH: "Reasoning effort is set to extra high. Validate non-obvious logic and state transitions, verify intermediate calculations, check common edge cases, test key assumptions against likely counterexamples, and compare alternative solution paths before settling on one.",
+    EffortTier.ULTRA: "Reasoning effort is set to ultra. Validate non-obvious logic and state transitions, verify intermediate calculations, check common edge cases, test key assumptions against likely counterexamples, compare alternative solution paths, and break the problem into its component parts, verifying each independently and discarding approaches that fail early checks.",
+    EffortTier.MAX: "Reasoning effort is set to maximum. Validate non-obvious logic and state transitions, verify intermediate calculations, check common edge cases, test key assumptions against likely counterexamples, compare alternative solution paths, break the problem into its component parts and verify each independently, and cross-check the final answer against all stated constraints and edge cases. Stop once the answer is verified consistent—do not continue re-deriving it once no further errors are found.",
+}
+
+
+def format_chat_prompt_with_effort(
+    user_problem: str,
+    effort_tier: Union[EffortTier, str] = EffortTier.HIGH,
+    tokenizer: Optional[Any] = None,
+) -> str:
+    """
+    Formats the prompt with the exact effort system prompt in Qwen chat template format.
+    """
+    if isinstance(effort_tier, str):
+        try:
+            effort_tier = EffortTier(effort_tier.lower())
+        except ValueError:
+            effort_tier = EffortTier.HIGH
+
+    system_prompt = effort_tier.system_prompt
+
+    if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
+        try:
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_problem},
+            ]
+            return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        except Exception:
+            pass
+
+    return f"<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n{user_problem}<|im_end|>\n<|im_start|>assistant\n"
+
+
 
 class Difficulty(str, Enum):
     EASY = "easy"

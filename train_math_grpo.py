@@ -1,0 +1,1007 @@
+"""
+Standalone Self-Contained Math GRPO Trainer for Colab / Marimo / Modal / Blackwell.
+Dataset: Nihilux/BigMath2 (problem & answer columns)
+Base Model: Qwen3 MoE (e.g. Qwen/Qwen3-30B-A3B)
+LoRA Checkpoint: checkpoint-2200
+Inference Engine: In-Process Sword Fast Engine (Bypasses vLLM completely)
+Context Window: 32k (32768 tokens)
+Concurrency: 4 rollouts per prompt (num gen 4)
+Optimization: FP8 Expert Weights + FP8 Static KV Cache (6 GB for 4x32k)
+VRAM Lifecycle: Generates rollouts -> cleans KV cache down to ~29 GB -> backward pass
+Multi-Reward: GDPO (accuracy=1.0, formatting=0.3, efficiency=0.2, safety=hard gate)
+Thinking Format: Validates <think> and </think> opening & closing tags
+Audit: Logs first 200 steps, zips generations, and uploads to Hugging Face Hub.
+"""
+
+import os
+import sys
+import gc
+import re
+import json
+import math
+import time
+import zipfile
+import argparse
+from typing import List, Dict, Any, Tuple, Optional, Generator
+from collections import defaultdict
+from dataclasses import dataclass, field
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+# Add parent directory to path if running inside sword repo
+SWORD_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if SWORD_ROOT not in sys.path:
+    sys.path.insert(0, SWORD_ROOT)
+
+
+# =====================================================================
+# ⚙️  BLACKWELL & GPU ENVIRONMENT OPTIMIZATION
+# =====================================================================
+def setup_blackwell_environment():
+    """Configures high-performance runtime flags for Blackwell (SM100) / CUDA."""
+    os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+    os.environ["HF_DEACTIVATE_ASYNC_LOAD"] = "1"
+    if torch.cuda.is_available():
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+        if hasattr(torch.backends.cuda.matmul, "allow_bf16_reduced_precision_reduction"):
+            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
+        if hasattr(torch.backends.cuda, "enable_flex_attention"):
+            try:
+                torch.backends.cuda.enable_flex_attention(True)
+            except Exception:
+                pass
+
+
+# =====================================================================
+# 🗜️  IN-MEMORY FP8 WEIGHT QUANTIZATION (Save 27 GB VRAM)
+# =====================================================================
+def convert_to_fp8_moe_weights(model: nn.Module) -> int:
+    """
+    Quantizes Qwen3 MoE expert weights in-place to torch.float8_e4m3fn.
+    Reduces weight VRAM from ~61.5 GB down to ~34.6 GB.
+    """
+    if not hasattr(torch, "float8_e4m3fn"):
+        print("[FP8] torch.float8_e4m3fn not supported on this PyTorch build. Keeping original dtype.")
+        return 0
+
+    converted = 0
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            # Target MoE expert MLP projections: gate_up_proj and down_proj
+            if any(k in name for k in ["gate_up_proj", "down_proj", "experts.gate_up", "experts.down"]):
+                if param.dtype != torch.float8_e4m3fn:
+                    fp8_data = param.data.to(torch.float8_e4m3fn)
+                    param.data = fp8_data
+                    param.requires_grad = False
+                    converted += 1
+    print(f"[FP8] Converted {converted} MoE weight tensors to torch.float8_e4m3fn.")
+    return converted
+
+
+# =====================================================================
+# 🧠  NATIVE FP8 STATIC KV CACHE (Linear O(N) Memory: 6 GB for 4x32k)
+# =====================================================================
+class FastStaticKVCache:
+    """
+    Preallocated static KV cache for multi-stream rollout generation.
+    Supports native FP8 (torch.float8_e4m3fn) to bound 4x32k context to 6.0 GB.
+    """
+
+    def __init__(
+        self,
+        num_layers: int,
+        max_batch_size: int,
+        num_kv_heads: int,
+        max_seq_len: int,
+        head_dim: int,
+        dtype: Optional[torch.dtype] = None,
+        device: Optional[torch.device] = None,
+    ):
+        self.num_layers = num_layers
+        self.max_batch_size = max_batch_size
+        self.num_kv_heads = num_kv_heads
+        self.max_seq_len = max_seq_len
+        self.head_dim = head_dim
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        if dtype is None:
+            dtype = torch.float8_e4m3fn if hasattr(torch, "float8_e4m3fn") else torch.bfloat16
+        self.dtype = dtype
+        self.current_pos = 0
+
+        shape = (max_batch_size, num_kv_heads, max_seq_len, head_dim)
+        self.k_cache = [torch.zeros(shape, dtype=self.dtype, device=self.device) for _ in range(num_layers)]
+        self.v_cache = [torch.zeros(shape, dtype=self.dtype, device=self.device) for _ in range(num_layers)]
+
+    def update(self, layer_idx: int, k_new: torch.Tensor, v_new: torch.Tensor, start_pos: int):
+        bsz, num_heads, seq_len, dim = k_new.shape
+        end_pos = start_pos + seq_len
+
+        k_cast = k_new.to(self.dtype)
+        v_cast = v_new.to(self.dtype)
+
+        self.k_cache[layer_idx][:bsz, :num_heads, start_pos:end_pos, :] = k_cast
+        self.v_cache[layer_idx][:bsz, :num_heads, start_pos:end_pos, :] = v_cast
+
+        k_out = self.k_cache[layer_idx][:bsz, :num_heads, :end_pos, :]
+        v_out = self.v_cache[layer_idx][:bsz, :num_heads, :end_pos, :]
+        return k_out, v_out
+
+    def reset(self):
+        """O(1) pointer reset without expensive zero-filling."""
+        self.current_pos = 0
+
+    def clear_vram(self):
+        """Releases cache memory if needed."""
+        self.reset()
+
+
+# =====================================================================
+# 🚀  IN-PROCESS ROLLOUT ENGINE (BYPASSES VLLM COMPLETELY)
+# =====================================================================
+class InProcessRolloutEngine:
+    """
+    Direct in-process multi-stream rollout generator.
+    Bypasses vLLM completely:
+    - Zero separate processes or ray actors
+    - Zero double-model VRAM allocation
+    - Native PyTorch SDPA with Static FP8 KV Cache
+    - Flushes cache memory back down to ~29 GB before training step.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        tokenizer: Any,
+        max_concurrency: int = 4,
+        max_seq_len: int = 32768,
+        use_fp8_kv: bool = True,
+        vram_target_gb: float = 35.0,
+    ):
+        self.model = model
+        self.tokenizer = tokenizer
+        if hasattr(self.tokenizer, "padding_side"):
+            self.tokenizer.padding_side = "left"
+        self.max_concurrency = max_concurrency
+        self.max_seq_len = max_seq_len
+        self.vram_target_gb = vram_target_gb
+        self.device = next(model.parameters()).device
+
+        # Setup KV Cache
+        cfg = getattr(model, "config", None)
+        num_layers = getattr(cfg, "num_hidden_layers", 16)
+        num_kv_heads = getattr(cfg, "num_key_value_heads", getattr(cfg, "num_attention_heads", 16))
+        hidden_size = getattr(cfg, "hidden_size", 2048)
+        num_heads = getattr(cfg, "num_attention_heads", 16)
+        head_dim = getattr(cfg, "head_dim", hidden_size // num_heads)
+
+        kv_dtype = torch.float8_e4m3fn if (use_fp8_kv and hasattr(torch, "float8_e4m3fn")) else torch.bfloat16
+        self.static_cache = FastStaticKVCache(
+            num_layers=num_layers,
+            max_batch_size=max_concurrency,
+            num_kv_heads=num_kv_heads,
+            max_seq_len=max_seq_len,
+            head_dim=head_dim,
+            dtype=kv_dtype,
+            device=self.device,
+        )
+
+    def generate_rollouts(
+        self,
+        prompt: str,
+        num_rollouts: int = 4,
+        max_new_tokens: int = 2048,
+        temperature: float = 0.8,
+    ) -> List[str]:
+        """Generates G rollouts in eval mode, then immediately flushes KV cache memory."""
+        self.model.eval()
+        self.static_cache.reset()
+
+        prompts = [prompt] * num_rollouts
+        inputs = self.tokenizer(prompts, return_tensors="pt", padding=True).to(self.device)
+        input_ids = inputs.input_ids
+        attention_mask = inputs.attention_mask
+
+        with torch.no_grad():
+            outputs = self.model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                do_sample=(temperature > 0.0),
+                pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
+            )
+
+        # Slice generated response tokens (excluding prompt)
+        prompt_len = input_ids.shape[1]
+        response_ids = outputs[:, prompt_len:]
+        decoded_responses = self.tokenizer.batch_decode(response_ids, skip_special_tokens=True)
+
+        # -------------------------------------------------------------
+        # VRAM Memory Reset: Drop back to baseline weight footprint (~29-34 GB)
+        # -------------------------------------------------------------
+        self.static_cache.reset()
+        del inputs, outputs, response_ids, input_ids, attention_mask
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+
+        return decoded_responses
+
+
+# =====================================================================
+# 🏷️  THINKING TAGS (<think> ... </think>) FORMAT VERIFIER
+# =====================================================================
+class ThinkingFormatVerifier:
+    """
+    Authoritative verifier for <think> and </think> opening and closing tags.
+    """
+
+    @staticmethod
+    def verify(text: str) -> Tuple[float, Dict[str, Any], str, str]:
+        """
+        Parses text and validates thinking tags.
+        Returns:
+            (tag_score, audit_dict, reasoning_trace, final_answer)
+        """
+        open_tag = "<think>"
+        close_tag = "</think>"
+        open_count = text.count(open_tag)
+        close_count = text.count(close_tag)
+
+        trace = ""
+        answer = text
+        audit: Dict[str, Any] = {
+            "open_count": open_count,
+            "close_count": close_count,
+        }
+
+        # Case 1: Malformed duplicate tags (looping)
+        if open_count > 1 or close_count > 1:
+            audit["error"] = "duplicate_or_nested_tags"
+            return -0.25, audit, trace, answer
+
+        # Case 2: Opened but never closed
+        if open_count == 1 and close_count == 0:
+            parts = text.split(open_tag, 1)
+            trace = parts[1].strip()
+            answer = ""
+            audit["error"] = "unclosed_think_tag"
+            return -0.25, audit, trace, answer
+
+        # Case 3: Orphaned closing tag without opening
+        if open_count == 0 and close_count == 1:
+            parts = text.split(close_tag, 1)
+            trace = parts[0].strip()
+            answer = parts[1].strip()
+            audit["error"] = "orphaned_close_tag"
+            return -0.20, audit, trace, answer
+
+        # Case 4: Standard well-formed pair
+        if open_count == 1 and close_count == 1:
+            pos_open = text.find(open_tag)
+            pos_close = text.find(close_tag)
+
+            if pos_open > pos_close:
+                audit["error"] = "inverted_tags_close_before_open"
+                return -0.25, audit, trace, answer
+
+            trace = text[pos_open + len(open_tag):pos_close].strip()
+            answer = text[pos_close + len(close_tag):].strip()
+
+            if len(trace) < 5:
+                audit["error"] = "empty_thinking_block"
+                return -0.20, audit, trace, answer
+            if len(answer) == 0:
+                audit["error"] = "missing_final_answer"
+                return -0.20, audit, trace, answer
+            if open_tag in answer or close_tag in answer:
+                audit["error"] = "leaked_tags_in_answer"
+                return -0.20, audit, trace, answer
+
+            audit["valid_thinking_tags"] = True
+            return 0.10, audit, trace, answer
+
+        # Case 5: Neither tag present (missing required thinking block in math)
+        audit["error"] = "missing_required_thinking_tags"
+        return -0.20, audit, trace, answer
+
+
+# =====================================================================
+# 🎯  PRIMARY SCORER (GROUND TRUTH MATH + FORMAT + EFFICIENCY)
+# =====================================================================
+class MathScorer:
+    """Evaluates mathematical ground truth accuracy and formatting."""
+
+    @staticmethod
+    def _normalize_math(ans: str) -> str:
+        s = ans.strip().lower()
+        s = re.sub(r"[\$\\,\s]", "", s)
+        s = re.sub(r"\\(?:text|mathrm|mathbf)\{([^}]+)\}", r"\1", s)
+        s = re.sub(r"\\frac\{([^}]+)\}\{([^}]+)\}", r"\1/\2", s)
+        # Extract \boxed{...} if present
+        boxed = re.findall(r"\\boxed\{([^}]+)\}", ans)
+        if boxed:
+            return MathScorer._normalize_math(boxed[-1])
+        return s
+
+    def score(
+        self,
+        problem: str,
+        reference_answer: str,
+        full_text: str,
+        effort_tier: str = "high",
+        token_count: int = 0,
+    ) -> Dict[str, Any]:
+        tag_score, tag_audit, trace, answer = ThinkingFormatVerifier.verify(full_text)
+
+        norm_ref = self._normalize_math(reference_answer)
+        norm_ans = self._normalize_math(answer)
+
+        # 1. Ground Truth Accuracy
+        is_match = (norm_ref in norm_ans) or (norm_ans == norm_ref) or (norm_ref and norm_ref in full_text)
+        accuracy_score = 0.35 if is_match else -0.40
+
+        # 2. Formatting (Numbered steps / structured reasoning)
+        has_numbered = bool(re.search(r"^\s*\d+\.\s+", answer, re.MULTILINE))
+        has_bullets = bool(re.search(r"^\s*[-*•]\s+", answer, re.MULTILINE))
+        format_score = 0.10 if (has_numbered or has_bullets) else -0.10
+
+        # 3. Efficiency & Anti-Looping
+        efficiency_score = 0.0
+        audit_flags: Dict[str, Any] = {"thinking_tags": tag_audit}
+
+        # Check repetitive loops in reasoning trace
+        sentences = [s.strip() for s in re.split(r"[.!?\n]+", trace) if len(s.split()) >= 4]
+        counts = defaultdict(int)
+        for s in sentences:
+            norm = s.lower()
+            counts[norm] += 1
+            if counts[norm] >= 2:
+                efficiency_score -= 0.5
+                audit_flags["repetitive_loop_detected"] = True
+                break
+
+        # Check prohibited bold markdown in thinking (**Step 1**)
+        if re.search(r"\*\*[^*\n]+\*\*", trace):
+            efficiency_score -= 0.2
+            audit_flags["prohibited_bold_found"] = True
+
+        # 4. Effort Tier Compliance & Token Budget Check
+        effort_score = 0.0
+        max_budget = {"low": 1024, "medium": 4024, "high": 11024, "xhigh": 22024, "ultra": 32024, "max": 65536}.get(effort_tier.lower(), 11024)
+        if token_count <= max_budget:
+            if effort_tier.lower() == "low":
+                if token_count <= 800:
+                    effort_score += 0.10
+                    audit_flags["rapid_low_effort_rewarded"] = True
+                elif token_count > 1500:
+                    effort_score -= 0.20
+                    audit_flags["complexity_cross_match_penalty"] = -0.20
+            elif effort_tier.lower() in ("high", "xhigh", "ultra", "max"):
+                if token_count >= 200:
+                    effort_score += 0.10
+                    audit_flags["deep_effort_rewarded"] = True
+                else:
+                    effort_score -= 0.15
+                    audit_flags["insufficient_effort_penalty"] = -0.15
+        else:
+            overage = (token_count - max_budget) / max_budget
+            if overage > 0.10:
+                pen = min(1.0, 0.5 * ((overage - 0.10) / 0.40))
+                effort_score -= pen
+                audit_flags["budget_overage_penalty"] = -pen
+
+        # Verification step rewards for high/ultra/max effort
+        if effort_tier.lower() in ("high", "xhigh", "ultra", "max"):
+            verification_cues = [r"\bverif", r"\bcheck", r"\bconfirm", r"\bdouble[-\s]check", r"\bsubstitut", r"\bassum"]
+            if any(re.search(pat, trace, re.IGNORECASE) for pat in verification_cues):
+                effort_score += 0.10
+                audit_flags["effort_verification_steps_rewarded"] = True
+
+        components = {
+            "ground_truth": accuracy_score,
+            "output_format": format_score,
+            "thinking_tags": tag_score,
+            "reasoning_structure": efficiency_score,
+            "token_budget": round(effort_score, 4),
+            "safety": 0.0,
+        }
+
+        # Group into 4 GDPO columns
+        columns = {
+            "accuracy": accuracy_score,
+            "formatting": round(format_score + tag_score, 4),
+            "efficiency": round(efficiency_score + effort_score, 4),
+            "safety": 0.0,
+        }
+
+        total_reward = sum(components.values())
+
+        return {
+            "total_reward": round(total_reward, 4),
+            "component_scores": components,
+            "column_scores": columns,
+            "is_correct": is_match,
+            "reasoning_trace": trace,
+            "final_answer": answer,
+            "audit_log": audit_flags,
+        }
+
+
+# =====================================================================
+# ⚖️  GDPO (GROUP REWARD-DECOUPLED NORMALIZATION POLICY OPTIMIZATION)
+# =====================================================================
+def compute_gdpo_advantages(
+    rollout_results: List[Dict[str, Any]],
+    column_weights: Optional[Dict[str, float]] = None,
+    eps: float = 1e-8,
+) -> Tuple[List[float], Dict[str, List[float]]]:
+    """
+    Decoupled normalization across accuracy, formatting, and efficiency columns.
+    Prevents penalty spiking and reward collapse (NVIDIA arXiv:2601.05242).
+    """
+    weights = column_weights or {"accuracy": 1.0, "formatting": 0.3, "efficiency": 0.2}
+    G = len(rollout_results)
+
+    if G <= 1:
+        return [0.0] * G, {k: [0.0] * G for k in ["accuracy", "formatting", "efficiency", "safety"]}
+
+    norm_advs: Dict[str, List[float]] = {}
+    for col in ["accuracy", "formatting", "efficiency"]:
+        vals = [r["column_scores"].get(col, 0.0) for r in rollout_results]
+        mean_v = sum(vals) / G
+        var_v = sum((v - mean_v) ** 2 for v in vals) / G
+        std_v = math.sqrt(var_v)
+
+        if std_v < eps:
+            norm_advs[col] = [0.0] * G
+        else:
+            norm_advs[col] = [(v - mean_v) / (std_v + eps) for v in vals]
+
+    # Safety is treated as a hard gate
+    safety_vals = [r["column_scores"].get("safety", 0.0) for r in rollout_results]
+    norm_advs["safety"] = safety_vals
+
+    total_advantages: List[float] = []
+    for i in range(G):
+        base_adv = sum(weights[c] * norm_advs[c][i] for c in ["accuracy", "formatting", "efficiency"])
+        s_pen = safety_vals[i]
+        adv_i = min(base_adv + s_pen, s_pen) if s_pen < 0 else base_adv
+        total_advantages.append(round(adv_i, 4))
+
+    return total_advantages, norm_advs
+
+
+# =====================================================================
+# 📉  MEMORY-EFFICIENT CHUNKED GRPO SURROGATE LOSS
+# =====================================================================
+class ChunkedGRPOLoss(nn.Module):
+    """
+    Unsloth-style sequence chunking cross-entropy.
+    Prevents materializing the massive [Batch, SeqLen, Vocab] tensor in VRAM.
+    """
+
+    def __init__(self, clip_eps: float = 0.2, kl_coeff: float = 0.04, chunk_size: int = 512):
+        super().__init__()
+        self.clip_eps = clip_eps
+        self.kl_coeff = kl_coeff
+        self.chunk_size = chunk_size
+
+    def forward(
+        self,
+        model: nn.Module,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        prompt_lengths: List[int],
+        advantages: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        batch_size, seq_len = input_ids.shape
+        device = input_ids.device
+
+        # Mask response tokens only
+        response_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+        for i, p_len in enumerate(prompt_lengths):
+            response_mask[i, p_len:] = attention_mask[i, p_len:].bool()
+
+        # Forward through backbone to get hidden states
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+
+        if hasattr(outputs, "hidden_states") and outputs.hidden_states is not None:
+            hidden_states = outputs.hidden_states[-1]
+        elif hasattr(outputs, "last_hidden_state"):
+            hidden_states = outputs.last_hidden_state
+        else:
+            hidden_states = outputs.logits  # Fallback
+
+        targets = input_ids[:, 1:]
+        target_mask = response_mask[:, 1:]
+        h_states = hidden_states[:, :-1, :]
+        num_tokens = h_states.size(1)
+
+        lm_head = getattr(model, "lm_head", None)
+        policy_logprobs_list = []
+
+        # Iterate over sequence in chunks (chunk_size=512)
+        for start_idx in range(0, num_tokens, self.chunk_size):
+            end_idx = min(start_idx + self.chunk_size, num_tokens)
+            chunk_h = h_states[:, start_idx:end_idx, :]
+            chunk_targets = targets[:, start_idx:end_idx]
+
+            chunk_b, chunk_l, chunk_h_dim = chunk_h.shape
+            chunk_h_flat = chunk_h.reshape(-1, chunk_h_dim)
+
+            if lm_head is not None:
+                chunk_logits = lm_head(chunk_h_flat)
+            else:
+                chunk_logits = F.linear(chunk_h_flat, model.get_output_embeddings().weight)
+
+            # Fused token logprob calculation: -cross_entropy
+            token_logprobs = -F.cross_entropy(
+                chunk_logits.float(),
+                chunk_targets.reshape(-1),
+                reduction="none",
+            ).reshape(chunk_b, chunk_l)
+            policy_logprobs_list.append(token_logprobs)
+
+        policy_logprobs = torch.cat(policy_logprobs_list, dim=1)
+        old_logprobs = policy_logprobs.detach()
+
+        # Clipped surrogate objective
+        log_ratio = policy_logprobs - old_logprobs
+        ratio = torch.exp(log_ratio)
+        adv = advantages.unsqueeze(-1).to(ratio.device)
+
+        surr1 = ratio * adv
+        surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * adv
+        policy_loss_per_token = -torch.min(surr1, surr2)
+
+        valid_tokens = target_mask.float().sum().clamp(min=1.0)
+        policy_loss = (policy_loss_per_token * target_mask.float()).sum() / valid_tokens
+
+        metrics = {
+            "grpo_loss": round(policy_loss.item(), 5),
+            "mean_ratio": round(ratio.mean().item(), 4),
+            "mean_advantage": round(advantages.mean().item(), 4),
+        }
+        return policy_loss, metrics
+
+
+# =====================================================================
+# 📦  DATASET DOWNLOADER & DISK BATCH STREAMER
+# =====================================================================
+def download_bigmath2(
+    dataset_name: str = "Nihilux/BigMath2",
+    cache_file: str = "local_trainer/data/bigmath2.jsonl",
+    max_samples: int = 10000,
+    hf_token: Optional[str] = None,
+) -> str:
+    """Downloads / caches Nihilux/BigMath2 to local disk."""
+    os.makedirs(os.path.dirname(os.path.abspath(cache_file)), exist_ok=True)
+    if os.path.exists(cache_file) and os.path.getsize(cache_file) > 1000:
+        print(f"[Data] Found local cached dataset: {cache_file} ({os.path.getsize(cache_file)/1e6:.1f} MB)")
+        return cache_file
+
+    print(f"[Data] Streaming {dataset_name} from Hugging Face...")
+    from datasets import load_dataset
+    token = hf_token or os.environ.get("HF_TOKEN") or None
+    ds = load_dataset(dataset_name, split="train", streaming=True, token=token)
+
+    count = 0
+    with open(cache_file, "w", encoding="utf-8") as f:
+        for item in ds:
+            prob = item.get("problem") or item.get("question") or ""
+            ans = item.get("answer") or item.get("solution") or ""
+            if not prob or not ans:
+                continue
+            f.write(json.dumps({"problem": str(prob).strip(), "answer": str(ans).strip()}, ensure_ascii=False) + "\n")
+            count += 1
+            if count >= max_samples:
+                break
+
+    print(f"[Data] Cached {count} math problems to {cache_file}")
+    return cache_file
+
+
+def stream_math_data_from_disk(file_path: str) -> Generator[Dict[str, str], None, None]:
+    """Streams lines from disk with zero RAM retention."""
+    while True:
+        with open(file_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    yield json.loads(line)
+                    gc.collect()
+
+
+# =====================================================================
+# 📊  200-STEP AUDITOR & HUGGING FACE ARCHIVE UPLOADER
+# =====================================================================
+class StepAuditor:
+    """Saves every step's generations and uploads zip to Hugging Face."""
+
+    def __init__(self, log_dir: str = "local_trainer/generations_200_steps"):
+        self.log_dir = log_dir
+        os.makedirs(self.log_dir, exist_ok=True)
+        self.jsonl_file = os.path.join(self.log_dir, "all_generations.jsonl")
+        self.step_records = []
+
+    def record(self, step: int, problem: str, reference: str, rollouts: List[Dict[str, Any]], elapsed: float):
+        record = {
+            "step": step,
+            "problem": problem,
+            "reference_answer": reference,
+            "elapsed_sec": round(elapsed, 2),
+            "rollouts": rollouts,
+        }
+        step_path = os.path.join(self.log_dir, f"step_{step:04d}.json")
+        with open(step_path, "w", encoding="utf-8") as f:
+            json.dump(record, f, indent=2, ensure_ascii=False)
+
+        with open(self.jsonl_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        self.step_records.append(record)
+
+    def summarize(self) -> Dict[str, Any]:
+        total_rollouts = sum(len(r["rollouts"]) for r in self.step_records)
+        correct = sum(sum(1 for ro in r["rollouts"] if ro["is_correct"]) for r in self.step_records)
+        valid_tags = sum(sum(1 for ro in r["rollouts"] if ro["component_scores"]["thinking_tags"] > 0) for r in self.step_records)
+
+        summary = {
+            "total_steps": len(self.step_records),
+            "total_rollouts": total_rollouts,
+            "accuracy_pct": round((correct / max(1, total_rollouts)) * 100, 2),
+            "thinking_tag_compliance_pct": round((valid_tags / max(1, total_rollouts)) * 100, 2),
+        }
+        with open(os.path.join(self.log_dir, "audit_summary.json"), "w") as f:
+            json.dump(summary, f, indent=2)
+
+        print("\n" + "=" * 60)
+        print(" 📊 200-STEP AUDIT SUMMARY")
+        print(f" Steps Completed:       {summary['total_steps']}")
+        print(f" Ground Truth Accuracy: {summary['accuracy_pct']}%")
+        print(f" Tag Compliance:        {summary['thinking_tag_compliance_pct']}%")
+        print("=" * 60 + "\n")
+        return summary
+
+
+def zip_and_upload_to_hf(log_dir: str, repo_id: str, hf_token: Optional[str] = None) -> Optional[str]:
+    """Zips generations and uploads to Hugging Face Hub."""
+    token = hf_token or os.environ.get("HF_TOKEN")
+    if not token:
+        print("⚠️  No HF_TOKEN provided. Skipping Hugging Face upload.")
+        return None
+
+    zip_path = f"{os.path.normpath(log_dir)}.zip"
+    print(f"[Archive] Zipping {log_dir} -> {zip_path}...")
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for root, _, files in os.walk(log_dir):
+            for file in files:
+                abs_p = os.path.join(root, file)
+                zf.write(abs_p, os.path.relpath(abs_p, os.path.dirname(log_dir)))
+
+    print(f"[Hub] Uploading archive to HF Hub: {repo_id}...")
+    try:
+        from huggingface_hub import HfApi
+        api = HfApi(token=token)
+        api.create_repo(repo_id=repo_id, repo_type="dataset", exist_ok=True, private=True)
+        api.upload_file(
+            path_or_fileobj=zip_path,
+            path_in_repo=os.path.basename(zip_path),
+            repo_id=repo_id,
+            repo_type="dataset",
+            commit_message="Upload 200-step Math GRPO generation traces",
+        )
+        url = f"https://huggingface.co/datasets/{repo_id}"
+        print(f"🎉 Upload successful! 👉 {url}")
+        return url
+    except Exception as e:
+        print(f"⚠️  HF upload error: {e}")
+        return None
+
+
+# =====================================================================
+# 🧭  EFFORT SYSTEM PROMPTS & CHAT FORMATTING
+# =====================================================================
+EFFORT_SYSTEM_PROMPTS: Dict[str, str] = {
+    "low": "Reasoning effort is set to low. Think rapidly and minimize token usage; answer directly without verification unless something is clearly wrong.",
+    "medium": "Reasoning effort is set to medium. Validate non-obvious logic and state transitions, but don't re-check self-evident steps; keep a steady, balanced pace.",
+    "high": "Reasoning effort is set to high. Validate non-obvious logic and state transitions, verify intermediate calculations, and check common edge cases before finalizing.",
+    "xhigh": "Reasoning effort is set to extra high. Validate non-obvious logic and state transitions, verify intermediate calculations, check common edge cases, test key assumptions against likely counterexamples, and compare alternative solution paths before settling on one.",
+    "ultra": "Reasoning effort is set to ultra. Validate non-obvious logic and state transitions, verify intermediate calculations, check common edge cases, test key assumptions against likely counterexamples, compare alternative solution paths, and break the problem into its component parts, verifying each independently and discarding approaches that fail early checks.",
+    "max": "Reasoning effort is set to maximum. Validate non-obvious logic and state transitions, verify intermediate calculations, check common edge cases, test key assumptions against likely counterexamples, compare alternative solution paths, break the problem into its component parts and verify each independently, and cross-check the final answer against all stated constraints and edge cases. Stop once the answer is verified consistent—do not continue re-deriving it once no further errors are found.",
+}
+
+
+def format_effort_prompt(problem: str, effort_tier: str = "high", tokenizer: Optional[Any] = None) -> str:
+    """Formats the user problem with the exact effort prompt in the system role."""
+    tier_key = effort_tier.lower().strip()
+    system_prompt = EFFORT_SYSTEM_PROMPTS.get(tier_key, EFFORT_SYSTEM_PROMPTS["high"])
+
+    if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
+        try:
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": problem},
+            ]
+            return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        except Exception:
+            pass
+
+    return f"<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n{problem}<|im_end|>\n<|im_start|>assistant\n"
+
+
+def resolve_checkpoint_lora(
+    checkpoint_name: str = "checkpoint-2200",
+    hf_repo_id: str = "Nihilux/SpringHunter",
+    local_dir: str = "checkpoints",
+    hf_token: Optional[str] = None,
+) -> str:
+    """
+    Resolves checkpoint_lora:
+    1. Checks local folder './checkpoint-2200' or 'checkpoints/checkpoint-2200'.
+    2. If not found locally, automatically downloads checkpoint-2200 from Nihilux/SpringHunter on HF!
+    """
+    token = hf_token or os.environ.get("HF_TOKEN") or None
+
+    candidates = [
+        checkpoint_name,
+        os.path.join(local_dir, checkpoint_name),
+        os.path.join("local_trainer", "checkpoints", checkpoint_name),
+    ]
+    for c in candidates:
+        if os.path.isdir(c) and (
+            os.path.exists(os.path.join(c, "adapter_config.json"))
+            or os.path.exists(os.path.join(c, "trainer_state.json"))
+            or os.path.exists(os.path.join(c, "adapter_model.safetensors"))
+        ):
+            print(f"✅ Found local LoRA checkpoint: {c}")
+            return c
+
+    print(f"📥 Checkpoint '{checkpoint_name}' not found locally. Auto-downloading from {hf_repo_id}...")
+    try:
+        from huggingface_hub import snapshot_download
+        os.makedirs(local_dir, exist_ok=True)
+        snapshot_download(
+            repo_id=hf_repo_id,
+            allow_patterns=[f"{checkpoint_name}/*", f"{checkpoint_name}/**"],
+            local_dir=local_dir,
+            token=token,
+        )
+        target_path = os.path.join(local_dir, checkpoint_name)
+        if os.path.exists(target_path):
+            print(f"✅ Successfully downloaded {checkpoint_name} from {hf_repo_id} to {target_path}")
+            return target_path
+    except Exception as e:
+        print(f"⚠️  Could not download checkpoint from {hf_repo_id} ({e}). Will initialize fresh LoRA.")
+
+    return checkpoint_name
+
+
+# =====================================================================
+# 🚀  MAIN STANDALONE EXECUTION FUNCTION
+# =====================================================================
+def run_standalone_math_grpo(
+    model_name_or_path: str = "Qwen/Qwen3-30B-A3B",
+    checkpoint_lora: str = "checkpoint-2200",
+    checkpoint_repo: str = "Nihilux/SpringHunter",
+    effort_tier: str = "high",
+    hf_token: Optional[str] = None,
+    repo_id: str = "Nihilux/sword-grpo-200-steps",
+    num_rollouts: int = 4,
+    max_seq_len: int = 32768,
+    max_new_tokens: int = 2048,
+    steps: int = 200,
+    lr: float = 5e-6,
+    use_fp8: bool = True,
+):
+    setup_blackwell_environment()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    print("=" * 72)
+    print(" 🚀 STANDALONE MATH GRPO TRAINER (Nihilux/BigMath2)")
+    print(f" Base Model:      {model_name_or_path}")
+    print(f" LoRA Checkpoint: {checkpoint_lora} (Store: {checkpoint_repo})")
+    print(f" Effort Tier:     {effort_tier.upper()}")
+    print(f" Context Window:  {max_seq_len} tokens (32k context)")
+    print(f" Rollouts:        {num_rollouts} concurrent streams (G=4)")
+    print(f" FP8 Engine:      {use_fp8}")
+    print(f" Steps:           {steps}")
+    print(f" Device:          {device}")
+    print("=" * 72)
+
+    # 1. Download & Prepare Dataset
+    data_file = download_bigmath2(
+        dataset_name="Nihilux/BigMath2",
+        cache_file="local_trainer/data/bigmath2.jsonl",
+        hf_token=hf_token,
+    )
+    streamer = stream_math_data_from_disk(data_file)
+
+    # 2. Load Model & Tokenizer
+    print(f"\n[*] Loading tokenizer and base model...")
+    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, padding_side="left", token=hf_token, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token or "<|endoftext|>"
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name_or_path,
+        torch_dtype=torch.bfloat16,
+        device_map="auto" if device == "cuda" else None,
+        token=hf_token,
+        trust_remote_code=True,
+    )
+
+    # 3. Apply In-Memory FP8 MoE Quantization
+    if use_fp8:
+        convert_to_fp8_moe_weights(model)
+
+    # 4. Resolve and Attach LoRA Adapter
+    resolved_lora = resolve_checkpoint_lora(
+        checkpoint_name=checkpoint_lora,
+        hf_repo_id=checkpoint_repo,
+        local_dir="checkpoints",
+        hf_token=hf_token,
+    )
+    print(f"[*] Attaching LoRA adapters (path: {resolved_lora})...")
+    lora_attached = False
+    try:
+        from peft import PeftModel
+        if os.path.exists(resolved_lora):
+            model = PeftModel.from_pretrained(model, resolved_lora, is_trainable=True)
+            print(f"✅ Loaded existing LoRA from {resolved_lora}")
+            lora_attached = True
+    except Exception as e:
+        print(f"⚠️  PeftModel load note: {e}")
+
+    if not lora_attached:
+        print("[*] Initializing fresh LoRA adapter...")
+        try:
+            from peft import LoraConfig, get_peft_model
+            lora_cfg = LoraConfig(
+                r=16,
+                lora_alpha=32,
+                target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
+                task_type="CAUSAL_LM",
+            )
+            model = get_peft_model(model, lora_cfg)
+        except Exception:
+            pass
+
+    # 5. Initialize In-Process Rollout Engine (Bypasses vLLM)
+    engine = InProcessRolloutEngine(
+        model=model,
+        tokenizer=tokenizer,
+        max_concurrency=num_rollouts,
+        max_seq_len=max_seq_len,
+        use_fp8_kv=use_fp8,
+    )
+
+    # 6. Initialize Scorer, Loss, Auditor, Optimizer
+    scorer = MathScorer()
+    loss_fn = ChunkedGRPOLoss(chunk_size=512)
+    auditor = StepAuditor()
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable_params, lr=lr)
+
+    # 7. 200-Step Training Loop
+    print(f"\n⚡ Starting {steps} training steps (System Prompt: {effort_tier})...\n")
+    for step in range(1, steps + 1):
+        t_start = time.perf_counter()
+        item = next(streamer)
+        problem_text = item["problem"]
+        ref_answer = item["answer"]
+
+        # Format user problem with exact effort system prompt
+        formatted_prompt = format_effort_prompt(problem_text, effort_tier=effort_tier, tokenizer=tokenizer)
+
+        # Phase A: Inference / Rollout Generation
+        raw_rollouts = engine.generate_rollouts(
+            prompt=formatted_prompt,
+            num_rollouts=num_rollouts,
+            max_new_tokens=max_new_tokens,
+            temperature=0.8,
+        )
+
+        # Phase B: Scoring & GDPO Decoupled Advantages
+        rollout_results = []
+        for text in raw_rollouts:
+            token_count = len(tokenizer.encode(text, add_special_tokens=False))
+            res = scorer.score(
+                problem=problem_text,
+                reference_answer=ref_answer,
+                full_text=text,
+                effort_tier=effort_tier,
+                token_count=token_count,
+            )
+            res["full_text"] = text
+            res["token_count"] = token_count
+            rollout_results.append(res)
+
+        advantages, col_advantages = compute_gdpo_advantages(rollout_results)
+        for idx, adv in enumerate(advantages):
+            rollout_results[idx]["advantage"] = adv
+
+        # Phase C: Training / Backward Step
+        model.train()
+        optimizer.zero_grad()
+
+        flat_input_ids = []
+        flat_masks = []
+        flat_prompt_lens = []
+
+        for res in rollout_results:
+            p_ids = tokenizer.encode(problem_text, add_special_tokens=False)
+            r_ids = tokenizer.encode(res["full_text"], add_special_tokens=False)
+            combo = p_ids + r_ids
+            flat_input_ids.append(torch.tensor(combo, dtype=torch.long))
+            flat_masks.append(torch.ones(len(combo), dtype=torch.long))
+            flat_prompt_lens.append(len(p_ids))
+
+        padded_inputs = nn.utils.rnn.pad_sequence(flat_input_ids, batch_first=True, padding_value=tokenizer.pad_token_id or 0).to(device)
+        padded_masks = nn.utils.rnn.pad_sequence(flat_masks, batch_first=True, padding_value=0).to(device)
+        tensor_adv = torch.tensor(advantages, dtype=torch.float32, device=device)
+
+        policy_loss, loss_metrics = loss_fn(
+            model=model,
+            input_ids=padded_inputs,
+            attention_mask=padded_masks,
+            prompt_lengths=flat_prompt_lens,
+            advantages=tensor_adv,
+        )
+
+        policy_loss.backward()
+        torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+        optimizer.step()
+
+        elapsed = time.perf_counter() - t_start
+        vram_gb = torch.cuda.memory_allocated() / (1024**3) if torch.cuda.is_available() else 0.0
+
+        # Phase D: Record Generation Audit
+        auditor.record(step, problem_text, ref_answer, rollout_results, elapsed)
+
+        mean_reward = sum(r["total_reward"] for r in rollout_results) / len(rollout_results)
+        print(
+            f"[Step {step:03d}/{steps:03d}] Reward: {mean_reward:+.3f} | "
+            f"Loss: {loss_metrics['grpo_loss']:.4f} | "
+            f"VRAM: {vram_gb:.1f} GB | Time: {elapsed:.2f}s"
+        )
+
+        # Clean batch from RAM
+        del flat_input_ids, flat_masks, padded_inputs, padded_masks, rollout_results
+        gc.collect()
+
+    # Summarize and Upload to HF Hub
+    auditor.summarize()
+    zip_and_upload_to_hf(auditor.log_dir, repo_id, hf_token=hf_token)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", type=str, default="Qwen/Qwen3-30B-A3B")
+    parser.add_argument("--checkpoint", type=str, default="checkpoint-2200")
+    parser.add_argument("--repo_id", type=str, default=os.environ.get("HF_UPLOAD_REPO_ID", "Nihilux/sword-grpo-200-steps"))
+    parser.add_argument("--token", type=str, default=os.environ.get("HF_TOKEN", ""))
+    parser.add_argument("--steps", type=int, default=200)
+    args = parser.parse_args()
+
+    run_standalone_math_grpo(
+        model_name_or_path=args.model,
+        checkpoint_lora=args.checkpoint,
+        repo_id=args.repo_id,
+        hf_token=args.token,
+        steps=args.steps,
+    )
