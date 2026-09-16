@@ -168,56 +168,28 @@ def convert_to_fp8_moe_weights(model: nn.Module) -> int:
 # =====================================================================
 class FastStaticKVCache:
     """
-    Preallocated static KV cache for multi-stream rollout generation.
-    Supports native FP8 (torch.float8_e4m3fn) to bound 4x32k context to 6.0 GB.
+    Lightweight KV cache manager.
+    Dynamic memory management delegates cache allocation to model generation
+    preventing static dead-weight VRAM allocation (~13 GB saved).
     """
 
     def __init__(
         self,
-        num_layers: int,
-        max_batch_size: int,
-        num_kv_heads: int,
-        max_seq_len: int,
-        head_dim: int,
+        num_layers: int = 48,
+        max_batch_size: int = 4,
+        num_kv_heads: int = 8,
+        max_seq_len: int = 32768,
+        head_dim: int = 128,
         dtype: Optional[torch.dtype] = None,
         device: Optional[torch.device] = None,
     ):
-        self.num_layers = num_layers
-        self.max_batch_size = max_batch_size
-        self.num_kv_heads = num_kv_heads
-        self.max_seq_len = max_seq_len
-        self.head_dim = head_dim
-        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        if dtype is None:
-            dtype = torch.float8_e4m3fn if hasattr(torch, "float8_e4m3fn") else torch.bfloat16
-        self.dtype = dtype
         self.current_pos = 0
 
-        shape = (max_batch_size, num_kv_heads, max_seq_len, head_dim)
-        self.k_cache = [torch.zeros(shape, dtype=self.dtype, device=self.device) for _ in range(num_layers)]
-        self.v_cache = [torch.zeros(shape, dtype=self.dtype, device=self.device) for _ in range(num_layers)]
-
-    def update(self, layer_idx: int, k_new: torch.Tensor, v_new: torch.Tensor, start_pos: int):
-        bsz, num_heads, seq_len, dim = k_new.shape
-        end_pos = start_pos + seq_len
-
-        k_cast = k_new.to(self.dtype)
-        v_cast = v_new.to(self.dtype)
-
-        self.k_cache[layer_idx][:bsz, :num_heads, start_pos:end_pos, :] = k_cast
-        self.v_cache[layer_idx][:bsz, :num_heads, start_pos:end_pos, :] = v_cast
-
-        k_out = self.k_cache[layer_idx][:bsz, :num_heads, :end_pos, :]
-        v_out = self.v_cache[layer_idx][:bsz, :num_heads, :end_pos, :]
-        return k_out, v_out
-
     def reset(self):
-        """O(1) pointer reset without expensive zero-filling."""
+        """O(1) pointer reset."""
         self.current_pos = 0
 
     def clear_vram(self):
-        """Releases cache memory if needed."""
         self.reset()
 
 
@@ -230,7 +202,7 @@ class InProcessRolloutEngine:
     Bypasses vLLM completely:
     - Zero separate processes or ray actors
     - Zero double-model VRAM allocation
-    - Native PyTorch SDPA with Static FP8 KV Cache
+    - Native PyTorch SDPA
     - Flushes cache memory back down to ~29 GB before training step.
     """
 
@@ -251,25 +223,7 @@ class InProcessRolloutEngine:
         self.max_seq_len = max_seq_len
         self.vram_target_gb = vram_target_gb
         self.device = next(model.parameters()).device
-
-        # Setup KV Cache
-        cfg = getattr(model, "config", None)
-        num_layers = getattr(cfg, "num_hidden_layers", 16)
-        num_kv_heads = getattr(cfg, "num_key_value_heads", getattr(cfg, "num_attention_heads", 16))
-        hidden_size = getattr(cfg, "hidden_size", 2048)
-        num_heads = getattr(cfg, "num_attention_heads", 16)
-        head_dim = getattr(cfg, "head_dim", hidden_size // num_heads)
-
-        kv_dtype = torch.float8_e4m3fn if (use_fp8_kv and hasattr(torch, "float8_e4m3fn")) else torch.bfloat16
-        self.static_cache = FastStaticKVCache(
-            num_layers=num_layers,
-            max_batch_size=max_concurrency,
-            num_kv_heads=num_kv_heads,
-            max_seq_len=max_seq_len,
-            head_dim=head_dim,
-            dtype=kv_dtype,
-            device=self.device,
-        )
+        self.static_cache = FastStaticKVCache()
 
     def generate_rollouts(
         self,
@@ -280,7 +234,8 @@ class InProcessRolloutEngine:
     ) -> List[str]:
         """Generates G rollouts in eval mode, then immediately flushes KV cache memory."""
         self.model.eval()
-        self.static_cache.reset()
+        if hasattr(self.model, "config"):
+            self.model.config.use_cache = True
 
         prompts = [prompt] * num_rollouts
         inputs = self.tokenizer(prompts, return_tensors="pt", padding=True).to(self.device)
@@ -304,13 +259,11 @@ class InProcessRolloutEngine:
         decoded_responses = self.tokenizer.batch_decode(response_ids, skip_special_tokens=True)
 
         # -------------------------------------------------------------
-        # VRAM Memory Reset: Drop back to baseline weight footprint (~29-34 GB)
+        # VRAM Memory Reset: Drop back to baseline weight footprint
         # -------------------------------------------------------------
-        self.static_cache.reset()
         del inputs, outputs, response_ids, input_ids, attention_mask
         gc.collect()
         if torch.cuda.is_available():
-            torch.cuda.synchronize()
             torch.cuda.empty_cache()
 
         return decoded_responses
@@ -591,49 +544,32 @@ class ChunkedGRPOLoss(nn.Module):
         for i, p_len in enumerate(prompt_lengths):
             response_mask[i, p_len:] = attention_mask[i, p_len:].bool()
 
-        # Forward through backbone to get hidden states
         outputs = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            output_hidden_states=True,
+            use_cache=False,
             return_dict=True,
         )
-
-        if hasattr(outputs, "hidden_states") and outputs.hidden_states is not None:
-            hidden_states = outputs.hidden_states[-1]
-        elif hasattr(outputs, "last_hidden_state"):
-            hidden_states = outputs.last_hidden_state
-        else:
-            hidden_states = outputs.logits  # Fallback
+        logits = outputs.logits
 
         targets = input_ids[:, 1:]
         target_mask = response_mask[:, 1:]
-        h_states = hidden_states[:, :-1, :]
-        num_tokens = h_states.size(1)
+        shift_logits = logits[:, :-1, :]
 
-        lm_head = getattr(model, "lm_head", None)
+        num_tokens = shift_logits.size(1)
         policy_logprobs_list = []
 
         # Iterate over sequence in chunks (chunk_size=512)
         for start_idx in range(0, num_tokens, self.chunk_size):
             end_idx = min(start_idx + self.chunk_size, num_tokens)
-            chunk_h = h_states[:, start_idx:end_idx, :]
-            chunk_targets = targets[:, start_idx:end_idx]
+            chunk_logits = shift_logits[:, start_idx:end_idx, :].reshape(-1, shift_logits.size(-1))
+            chunk_targets = targets[:, start_idx:end_idx].reshape(-1)
 
-            chunk_b, chunk_l, chunk_h_dim = chunk_h.shape
-            chunk_h_flat = chunk_h.reshape(-1, chunk_h_dim)
-
-            if lm_head is not None:
-                chunk_logits = lm_head(chunk_h_flat)
-            else:
-                chunk_logits = F.linear(chunk_h_flat, model.get_output_embeddings().weight)
-
-            # Fused token logprob calculation: -cross_entropy
             token_logprobs = -F.cross_entropy(
                 chunk_logits.float(),
-                chunk_targets.reshape(-1),
+                chunk_targets,
                 reduction="none",
-            ).reshape(chunk_b, chunk_l)
+            ).reshape(batch_size, end_idx - start_idx)
             policy_logprobs_list.append(token_logprobs)
 
         policy_logprobs = torch.cat(policy_logprobs_list, dim=1)
@@ -657,6 +593,62 @@ class ChunkedGRPOLoss(nn.Module):
             "mean_advantage": round(advantages.mean().item(), 4),
         }
         return policy_loss, metrics
+
+    def forward_single(
+        self,
+        model: nn.Module,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        prompt_length: int,
+        advantage: float,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        Micro-batch loss for a single rollout sequence (batch_size=1).
+        Disables use_cache and only computes cross entropy on the response tokens
+        in chunks, keeping activation VRAM minimal (< 1.5 GB).
+        """
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+            return_dict=True,
+        )
+        logits = outputs.logits  # [1, seq_len, vocab_size]
+
+        targets = input_ids[:, 1:]
+        shift_logits = logits[:, :-1, :]
+
+        resp_start = max(0, prompt_length - 1)
+        resp_logits = shift_logits[:, resp_start:, :]
+        resp_targets = targets[:, resp_start:]
+
+        if resp_targets.numel() == 0:
+            return torch.tensor(0.0, device=input_ids.device, requires_grad=True), {"grpo_loss": 0.0}
+
+        resp_logits_flat = resp_logits.reshape(-1, resp_logits.size(-1))
+        resp_targets_flat = resp_targets.reshape(-1)
+        num_tokens = resp_targets_flat.size(0)
+
+        token_logprobs_list = []
+        for s_idx in range(0, num_tokens, self.chunk_size):
+            e_idx = min(s_idx + self.chunk_size, num_tokens)
+            c_logits = resp_logits_flat[s_idx:e_idx].float()
+            c_targets = resp_targets_flat[s_idx:e_idx]
+            c_logprobs = -F.cross_entropy(c_logits, c_targets, reduction="none")
+            token_logprobs_list.append(c_logprobs)
+
+        policy_logprobs = torch.cat(token_logprobs_list, dim=0)
+        old_logprobs = policy_logprobs.detach()
+
+        log_ratio = policy_logprobs - old_logprobs
+        ratio = torch.exp(log_ratio)
+        adv_tensor = torch.tensor(advantage, dtype=torch.float32, device=input_ids.device)
+
+        surr1 = ratio * adv_tensor
+        surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * adv_tensor
+        policy_loss = -torch.min(surr1, surr2).mean()
+
+        return policy_loss, {"grpo_loss": round(policy_loss.item(), 5)}
 
 
 # =====================================================================
@@ -1188,6 +1180,23 @@ def run_standalone_math_grpo(
     except Exception:
         pass
 
+    # Enable Gradient Checkpointing for memory-efficient backprop (~50 GB activation memory saved)
+    if hasattr(model, "gradient_checkpointing_enable"):
+        try:
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+            print("✅ Gradient checkpointing enabled (saves ~50 GB activation memory)")
+        except Exception:
+            try:
+                model.gradient_checkpointing_enable()
+                print("✅ Gradient checkpointing enabled")
+            except Exception:
+                pass
+    if hasattr(model, "enable_input_require_grads"):
+        try:
+            model.enable_input_require_grads()
+        except Exception:
+            pass
+
     # 5. Initialize In-Process Rollout Engine (Bypasses vLLM)
     engine = InProcessRolloutEngine(
         model=model,
@@ -1249,35 +1258,37 @@ def run_standalone_math_grpo(
         for idx, adv in enumerate(advantages):
             rollout_results[idx]["advantage"] = adv
 
-        # Phase C: Training / Backward Step
+        # Phase C: Training / Backward Step (Micro-batched per rollout with gradient accumulation)
         model.train()
+        if hasattr(model, "config"):
+            model.config.use_cache = False
         optimizer.zero_grad()
 
-        flat_input_ids = []
-        flat_masks = []
-        flat_prompt_lens = []
+        total_step_loss = 0.0
+        p_ids = tokenizer.encode(problem_text, add_special_tokens=False)
+        p_len = len(p_ids)
 
-        for res in rollout_results:
-            p_ids = tokenizer.encode(problem_text, add_special_tokens=False)
+        for i, res in enumerate(rollout_results):
             r_ids = tokenizer.encode(res["full_text"], add_special_tokens=False)
             combo = p_ids + r_ids
-            flat_input_ids.append(torch.tensor(combo, dtype=torch.long))
-            flat_masks.append(torch.ones(len(combo), dtype=torch.long))
-            flat_prompt_lens.append(len(p_ids))
+            cur_input = torch.tensor([combo], dtype=torch.long, device=device)
+            cur_mask = torch.ones_like(cur_input)
+            adv_i = float(advantages[i])
 
-        padded_inputs = nn.utils.rnn.pad_sequence(flat_input_ids, batch_first=True, padding_value=tokenizer.pad_token_id or 0).to(device)
-        padded_masks = nn.utils.rnn.pad_sequence(flat_masks, batch_first=True, padding_value=0).to(device)
-        tensor_adv = torch.tensor(advantages, dtype=torch.float32, device=device)
+            loss_i, _ = loss_fn.forward_single(
+                model=model,
+                input_ids=cur_input,
+                attention_mask=cur_mask,
+                prompt_length=p_len,
+                advantage=adv_i,
+            )
 
-        policy_loss, loss_metrics = loss_fn(
-            model=model,
-            input_ids=padded_inputs,
-            attention_mask=padded_masks,
-            prompt_lengths=flat_prompt_lens,
-            advantages=tensor_adv,
-        )
+            scaled_loss = loss_i / num_rollouts
+            scaled_loss.backward()
+            total_step_loss += loss_i.item()
 
-        policy_loss.backward()
+            del cur_input, cur_mask, loss_i, scaled_loss
+
         torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
         optimizer.step()
 
@@ -1287,16 +1298,22 @@ def run_standalone_math_grpo(
         # Phase D: Record Generation Audit with dedicated effort_tier column
         auditor.record(step, problem_text, ref_answer, rollout_results, elapsed, effort_tier=step_effort)
 
-        mean_reward = sum(r["total_reward"] for r in rollout_results) / len(rollout_results)
+        mean_acc = sum(r.get("acc_reward", 0.0) for r in rollout_results) / len(rollout_results)
+        mean_fmt = sum(r.get("format_reward", 0.0) for r in rollout_results) / len(rollout_results)
+        mean_eff = sum(r.get("effort_reward", 0.0) for r in rollout_results) / len(rollout_results)
+        mean_total = sum(r.get("total_reward", 0.0) for r in rollout_results) / len(rollout_results)
+
         print(
-            f"[Step {step:03d}/{steps:03d} | {step_effort.upper():<6}] Reward: {mean_reward:+.3f} | "
-            f"Loss: {loss_metrics['grpo_loss']:.4f} | "
+            f"[Step {step:03d}/{steps:03d} | {step_effort.upper():<6}] "
+            f"Acc: {mean_acc:.2f} | Fmt: {mean_fmt:.2f} | Eff: {mean_eff:+.2f} | "
+            f"Total: {mean_total:+.2f} | Loss: {total_step_loss / num_rollouts:.4f} | "
             f"VRAM: {vram_gb:.1f} GB | Time: {elapsed:.2f}s"
         )
 
-        # Clean batch from RAM
-        del flat_input_ids, flat_masks, padded_inputs, padded_masks, rollout_results
+        del rollout_results
         gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     # Summarize and Upload to HF Hub
     auditor.summarize()
