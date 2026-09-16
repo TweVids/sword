@@ -323,8 +323,8 @@ class ThinkingFormatVerifier:
             "close_count": close_count,
         }
 
-        # Case 1: Malformed duplicate tags (looping)
-        if open_count > 1 or close_count > 1:
+        # Case 1: Multiple opening tags (looping / nested generation)
+        if open_count > 1:
             audit["error"] = "duplicate_or_nested_tags"
             return -0.25, audit, trace, answer
 
@@ -337,24 +337,25 @@ class ThinkingFormatVerifier:
             return -0.25, audit, trace, answer
 
         # Case 3: Orphaned closing tag without opening
-        if open_count == 0 and close_count == 1:
+        if open_count == 0 and close_count >= 1:
             parts = text.split(close_tag, 1)
             trace = parts[0].strip()
             answer = parts[1].strip()
             audit["error"] = "orphaned_close_tag"
             return -0.20, audit, trace, answer
 
-        # Case 4: Standard well-formed pair
-        if open_count == 1 and close_count == 1:
+        # Case 4: Single opening tag with at least one closing tag
+        if open_count == 1 and close_count >= 1:
             pos_open = text.find(open_tag)
-            pos_close = text.find(close_tag)
+            # Use the final closing tag to separate thinking from answer
+            pos_last_close = text.rfind(close_tag)
 
-            if pos_open > pos_close:
+            if pos_open > pos_last_close:
                 audit["error"] = "inverted_tags_close_before_open"
                 return -0.25, audit, trace, answer
 
-            trace = text[pos_open + len(open_tag):pos_close].strip()
-            answer = text[pos_close + len(close_tag):].strip()
+            trace = text[pos_open + len(open_tag):pos_last_close].strip()
+            answer = text[pos_last_close + len(close_tag):].strip()
 
             if len(trace) < 5:
                 audit["error"] = "empty_thinking_block"
@@ -367,6 +368,8 @@ class ThinkingFormatVerifier:
                 return -0.20, audit, trace, answer
 
             audit["valid_thinking_tags"] = True
+            if close_count > 1:
+                audit["quoted_close_tag_in_trace"] = True
             return 0.10, audit, trace, answer
 
         # Case 5: Neither tag present (missing required thinking block in math)
@@ -483,13 +486,23 @@ class MathScorer:
                         audit_flags["shallow_paragraphs_penalty"] = -0.10
 
         # B. Paragraph behavior outside <think> (in final answer)
-        has_bullets_in_answer = bool(re.search(r"^\s*[-*•]\s+", answer, re.MULTILINE))
+        # Detect reasoning evasion: markdown headers, step markers, or bullet lists in the answer
+        has_headers_in_answer = bool(re.search(r"^\s*#{1,6}\s+", answer, re.MULTILINE))
+        has_step_markers_in_answer = bool(re.search(r"(?i)\*\*step\s*\d+[:\.]?|\bstep\s*\d+[:\.]", answer))
+        has_bullets_in_answer = bool(re.search(r"^\s*[-*•]\s+(?!\s*[\d\w\\$].*?[=<>])", answer, re.MULTILINE))
         has_numbered_in_answer = bool(re.search(r"^\s*\d+[\.)]\s+", answer, re.MULTILINE))
-        if has_bullets_in_answer or has_numbered_in_answer:
-            format_score -= 0.08
+
+        # Check if the model dumped its step-by-step reasoning into the answer to evade thinking constraints
+        has_reasoning_dump = has_headers_in_answer or has_step_markers_in_answer or (len(answer.strip()) > 250 and (has_bullets_in_answer or has_numbered_in_answer))
+
+        if has_reasoning_dump:
+            format_score -= 0.20
+            audit_flags["reasoning_dump_in_answer"] = True
+        elif has_bullets_in_answer or has_numbered_in_answer:
+            format_score -= 0.12
             audit_flags["bullet_or_list_in_answer"] = True
-        elif len(answer.strip()) > 15:
-            # Reward coherent explanatory prose wrapping the answer (smaller score than think, e.g. +0.05)
+        elif 15 <= len(answer.strip()) <= 350:
+            # Reward coherent explanatory prose wrapping the answer without bloat
             format_score += 0.05
             audit_flags["natural_paragraph_answer_rewarded"] = True
 

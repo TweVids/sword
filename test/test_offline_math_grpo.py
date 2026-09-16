@@ -113,6 +113,22 @@ class TestThinkingFormatVerifier(unittest.TestCase):
         self.assertEqual(score, -0.25)
         self.assertEqual(audit.get("error"), "duplicate_or_nested_tags")
 
+    def test_quoted_closing_tag_inside_thinking_trace(self):
+        # Rollout 4 scenario: model mentions '</think>' in thought sentence, followed by real closing tag
+        text = (
+            "<think>\n"
+            "We are given 238 and 119.\n"
+            "We should present reasoning inside </think> tags and the answer outside.\n"
+            "</think>\n"
+            "357"
+        )
+        score, audit, trace, ans = ThinkingFormatVerifier.verify(text)
+        self.assertEqual(score, 0.10)
+        self.assertTrue(audit.get("valid_thinking_tags"))
+        self.assertTrue(audit.get("quoted_close_tag_in_trace"))
+        self.assertIn("We are given 238 and 119", trace)
+        self.assertEqual(ans, "357")
+
 
 class TestMathScorerAccuracy(unittest.TestCase):
     """Tests numeric equivalence, intervals, LaTeX, and Russian notation."""
@@ -256,6 +272,26 @@ class TestMathScorerFormatting(unittest.TestCase):
         )
         res = self.scorer.score("prob", "357", text, effort_tier="low")
         self.assertTrue(res["audit_log"].get("bullet_or_list_in_answer"))
+
+    def test_reasoning_dump_and_headers_in_answer_penalized(self):
+        # Rollout 3 scenario: dumping # Headers, **Step 1:**, and bullet lists outside <think>
+        text = (
+            "<think>\n"
+            "We compute 238 plus 119.\n"
+            "</think>\n"
+            "# Solving Rosy Plascencia's Air Fryer Sales\n\n"
+            "**Step 1: Identify the given information**\n"
+            "- April sales: 238 air fryers\n"
+            "- May sales: 119 air fryers\n\n"
+            "**Step 2: Add them**\n"
+            "$$238 + 119 = 357$$\n\n"
+            "Rosy Plascencia sold 357 air fryers altogether."
+        )
+        res = self.scorer.score("prob", "357", text, effort_tier="low")
+        self.assertTrue(res["audit_log"].get("reasoning_dump_in_answer"))
+        self.assertNotIn("natural_paragraph_answer_rewarded", res["audit_log"])
+        # Format column must reflect the strong penalty
+        self.assertLess(res["column_scores"]["formatting"], 0.10)
 
 
 class TestParagraphSentenceDepth(unittest.TestCase):
