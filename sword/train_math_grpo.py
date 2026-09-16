@@ -39,23 +39,45 @@ if SWORD_ROOT not in sys.path:
 
 def _fix_transformers_moe_fp8_compatibility():
     """
-    Hotfixes upstream Transformers bug in transformers.integrations.moe._grouped_mm
-    where it casts `input.to(weight.dtype)`. When MoE expert weights are quantized to FP8,
-    this erroneously casts the activation `input` to Float8_e4m3fn, causing PyTorch
-    torch._grouped_mm to crash with:
-    'RuntimeError: Expected mat_a to be Float32, BFloat16 or Float16 matrix, got Float8_e4m3fn'.
-    This fix casts the FP8 weights to input.dtype on the fly during grouped_mm,
-    preserving full BF16 matrix multiplication while keeping 27 GB VRAM weight savings.
+    Hotfixes upstream Transformers bugs in transformers.integrations.moe:
+    1. `_batched_linear`: uses `torch.bmm(weight, input)`. PyTorch CUDA has no FP8 bmm kernel,
+       causing:
+       'NotImplementedError: "baddbmm_cuda" not implemented for 'Float8_e4m3fn''.
+    2. `_grouped_mm`: casts `input.to(weight.dtype)`. When MoE expert weights are in FP8,
+       this casts `input` to Float8_e4m3fn, causing PyTorch grouped_mm to crash with:
+       'RuntimeError: Expected mat_a to be Float32, BFloat16 or Float16 matrix, got Float8_e4m3fn'.
+    This fix casts the FP8 weights on the fly to input.dtype during both grouped_mm (prefill)
+    and batched_linear (decoding), preserving full BF16 tensor core matrix multiplication
+    while retaining the full ~27 GB VRAM weight savings!
     """
     try:
         from transformers.integrations import moe as hf_moe
+
+        # 1. Patch _batched_linear (used during single-token decoding)
+        orig_batched_linear = getattr(hf_moe, "_batched_linear", None)
+        if orig_batched_linear is not None and not getattr(orig_batched_linear, "_sword_patched", False):
+            def safe_batched_linear(input, weight, bias=None, is_transposed=False):
+                if str(weight.dtype).startswith("torch.float8") or str(input.dtype).startswith("torch.float8"):
+                    target_dtype = input.dtype if input.dtype in (torch.bfloat16, torch.float16, torch.float32) else torch.bfloat16
+                    if str(weight.dtype).startswith("torch.float8"):
+                        weight = weight.to(target_dtype)
+                    if str(input.dtype).startswith("torch.float8"):
+                        input = input.to(target_dtype)
+                return orig_batched_linear(input, weight, bias=bias, is_transposed=is_transposed)
+
+            safe_batched_linear._sword_patched = True
+            hf_moe._batched_linear = safe_batched_linear
+
+        # 2. Patch _grouped_mm (used during prompt prefill)
         orig_grouped_mm = getattr(hf_moe, "_grouped_mm", None)
         if orig_grouped_mm is not None and not getattr(orig_grouped_mm, "_sword_patched", False):
             def safe_grouped_mm(input, weight, offs=None):
-                if str(weight.dtype).startswith("torch.float8"):
+                if str(weight.dtype).startswith("torch.float8") or str(input.dtype).startswith("torch.float8"):
                     target_dtype = input.dtype if input.dtype in (torch.bfloat16, torch.float16, torch.float32) else torch.bfloat16
-                    weight = weight.to(target_dtype)
-                    input = input.to(target_dtype)
+                    if str(weight.dtype).startswith("torch.float8"):
+                        weight = weight.to(target_dtype)
+                    if str(input.dtype).startswith("torch.float8"):
+                        input = input.to(target_dtype)
                 elif input.dtype != weight.dtype:
                     input = input.to(weight.dtype)
 
@@ -73,6 +95,19 @@ def _fix_transformers_moe_fp8_compatibility():
 
             safe_grouped_mm._sword_patched = True
             hf_moe._grouped_mm = safe_grouped_mm
+
+        # 3. Patch _grouped_mm_fallback
+        orig_fallback = getattr(hf_moe, "_grouped_mm_fallback", None)
+        if orig_fallback is not None and not getattr(orig_fallback, "_sword_patched", False):
+            def safe_fallback(input, weight, offs):
+                if str(weight.dtype).startswith("torch.float8"):
+                    target_dtype = input.dtype if input.dtype in (torch.bfloat16, torch.float16, torch.float32) else torch.bfloat16
+                    weight = weight.to(target_dtype)
+                return orig_fallback(input, weight, offs)
+
+            safe_fallback._sword_patched = True
+            hf_moe._grouped_mm_fallback = safe_fallback
+
     except Exception:
         pass
 
@@ -1066,6 +1101,13 @@ def run_standalone_math_grpo(
     )
     print(f"[*] Attaching LoRA adapters (path: {resolved_lora})...")
     lora_attached = False
+
+    # Attempt importing unsloth if installed to enable custom MoE LoRA kernels
+    try:
+        import unsloth
+    except Exception:
+        pass
+
     try:
         from peft import PeftModel
         if os.path.exists(resolved_lora):
@@ -1074,27 +1116,59 @@ def run_standalone_math_grpo(
             lora_attached = True
     except Exception as e:
         print(f"⚠️  PeftModel standard load note: {e}")
+        # Cleanly unwrap base model before fallback
+        if hasattr(model, "unload"):
+            try:
+                model = model.unload()
+            except Exception:
+                pass
+        while hasattr(model, "base_model"):
+            model = getattr(model.base_model, "model", model.base_model)
+
         try:
-            from peft import PeftConfig, get_peft_model
+            from peft import LoraConfig, get_peft_model
             from safetensors.torch import load_file as load_safetensors
             adapter_file = os.path.join(resolved_lora, "adapter_model.safetensors")
             if not os.path.exists(adapter_file):
                 adapter_file = os.path.join(resolved_lora, "adapter_model.bin")
             if os.path.exists(adapter_file):
-                p_cfg = PeftConfig.from_pretrained(resolved_lora)
-                model = get_peft_model(model, p_cfg)
+                # Target standard attention projections which are always 100% compatible
+                lora_cfg = LoraConfig(
+                    r=32,
+                    lora_alpha=64,
+                    target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+                    use_rslora=True,
+                    task_type="CAUSAL_LM",
+                )
+                model = get_peft_model(model, lora_cfg)
                 sd = load_safetensors(adapter_file) if adapter_file.endswith(".safetensors") else torch.load(adapter_file, map_location="cpu")
                 model_sd = model.state_dict()
-                matching_sd = {k: v for k, v in sd.items() if k in model_sd and v.shape == model_sd[k].shape}
-                model.load_state_dict(matching_sd, strict=False)
-                print(f"✅ Tolerant LoRA load: initialized {len(matching_sd)}/{len(sd)} matching adapter layers from {resolved_lora}")
-                lora_attached = True
+                matching_sd = {}
+                for k, v in sd.items():
+                    if k in model_sd and v.shape == model_sd[k].shape:
+                        matching_sd[k] = v
+                    else:
+                        k_default = k.replace(".lora_A.weight", ".lora_A.default.weight").replace(".lora_B.weight", ".lora_B.default.weight")
+                        if k_default in model_sd and v.shape == model_sd[k_default].shape:
+                            matching_sd[k_default] = v
+
+                if matching_sd:
+                    model.load_state_dict(matching_sd, strict=False)
+                    print(f"✅ Tolerant LoRA load: initialized {len(matching_sd)}/{len(sd)} matching attention adapter layers from {resolved_lora}")
+                    lora_attached = True
         except Exception as e2:
             print(f"⚠️  Tolerant LoRA load note: {e2}")
 
     if not lora_attached:
         print("[*] Initializing fresh LoRA adapter...")
         try:
+            if hasattr(model, "unload"):
+                try:
+                    model = model.unload()
+                except Exception:
+                    pass
+            while hasattr(model, "base_model"):
+                model = getattr(model.base_model, "model", model.base_model)
             from peft import LoraConfig, get_peft_model
             lora_cfg = LoraConfig(
                 r=16,
@@ -1103,8 +1177,9 @@ def run_standalone_math_grpo(
                 task_type="CAUSAL_LM",
             )
             model = get_peft_model(model, lora_cfg)
-        except Exception:
-            pass
+            print("✅ Initialized fresh LoRA adapter on attention projections")
+        except Exception as e3:
+            print(f"⚠️  Fresh LoRA init note: {e3}")
 
     # Optional: Apply Sword FlashAttention SDPA patch to attention modules
     try:

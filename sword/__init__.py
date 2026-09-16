@@ -78,24 +78,46 @@ _fix_transformers_fp8_quantizer_bug()
 
 def _fix_transformers_moe_fp8_compatibility():
     """
-    Hotfixes upstream Transformers bug in transformers.integrations.moe._grouped_mm
-    where it casts `input.to(weight.dtype)`. When MoE expert weights are quantized to FP8,
-    this erroneously casts the activation `input` to Float8_e4m3fn, causing PyTorch
-    torch._grouped_mm to crash with:
-    'RuntimeError: Expected mat_a to be Float32, BFloat16 or Float16 matrix, got Float8_e4m3fn'.
-    This fix casts the FP8 weights to input.dtype on the fly during grouped_mm,
-    preserving full BF16 matrix multiplication while keeping 27 GB VRAM weight savings.
+    Hotfixes upstream Transformers bugs in transformers.integrations.moe:
+    1. `_batched_linear`: uses `torch.bmm(weight, input)`. PyTorch CUDA has no FP8 bmm kernel,
+       causing:
+       'NotImplementedError: "baddbmm_cuda" not implemented for 'Float8_e4m3fn''.
+    2. `_grouped_mm`: casts `input.to(weight.dtype)`. When MoE expert weights are in FP8,
+       this casts `input` to Float8_e4m3fn, causing PyTorch grouped_mm to crash with:
+       'RuntimeError: Expected mat_a to be Float32, BFloat16 or Float16 matrix, got Float8_e4m3fn'.
+    This fix casts the FP8 weights on the fly to input.dtype during both grouped_mm (prefill)
+    and batched_linear (decoding), preserving full BF16 tensor core matrix multiplication
+    while retaining the full ~27 GB VRAM weight savings!
     """
     try:
         import torch
         from transformers.integrations import moe as hf_moe
+
+        # 1. Patch _batched_linear (used during single-token decoding)
+        orig_batched_linear = getattr(hf_moe, "_batched_linear", None)
+        if orig_batched_linear is not None and not getattr(orig_batched_linear, "_sword_patched", False):
+            def safe_batched_linear(input, weight, bias=None, is_transposed=False):
+                if str(weight.dtype).startswith("torch.float8") or str(input.dtype).startswith("torch.float8"):
+                    target_dtype = input.dtype if input.dtype in (torch.bfloat16, torch.float16, torch.float32) else torch.bfloat16
+                    if str(weight.dtype).startswith("torch.float8"):
+                        weight = weight.to(target_dtype)
+                    if str(input.dtype).startswith("torch.float8"):
+                        input = input.to(target_dtype)
+                return orig_batched_linear(input, weight, bias=bias, is_transposed=is_transposed)
+
+            safe_batched_linear._sword_patched = True
+            hf_moe._batched_linear = safe_batched_linear
+
+        # 2. Patch _grouped_mm (used during prompt prefill)
         orig_grouped_mm = getattr(hf_moe, "_grouped_mm", None)
         if orig_grouped_mm is not None and not getattr(orig_grouped_mm, "_sword_patched", False):
             def safe_grouped_mm(input, weight, offs=None):
-                if str(weight.dtype).startswith("torch.float8"):
+                if str(weight.dtype).startswith("torch.float8") or str(input.dtype).startswith("torch.float8"):
                     target_dtype = input.dtype if input.dtype in (torch.bfloat16, torch.float16, torch.float32) else torch.bfloat16
-                    weight = weight.to(target_dtype)
-                    input = input.to(target_dtype)
+                    if str(weight.dtype).startswith("torch.float8"):
+                        weight = weight.to(target_dtype)
+                    if str(input.dtype).startswith("torch.float8"):
+                        input = input.to(target_dtype)
                 elif input.dtype != weight.dtype:
                     input = input.to(weight.dtype)
 
@@ -113,6 +135,19 @@ def _fix_transformers_moe_fp8_compatibility():
 
             safe_grouped_mm._sword_patched = True
             hf_moe._grouped_mm = safe_grouped_mm
+
+        # 3. Patch _grouped_mm_fallback
+        orig_fallback = getattr(hf_moe, "_grouped_mm_fallback", None)
+        if orig_fallback is not None and not getattr(orig_fallback, "_sword_patched", False):
+            def safe_fallback(input, weight, offs):
+                if str(weight.dtype).startswith("torch.float8"):
+                    target_dtype = input.dtype if input.dtype in (torch.bfloat16, torch.float16, torch.float32) else torch.bfloat16
+                    weight = weight.to(target_dtype)
+                return orig_fallback(input, weight, offs)
+
+            safe_fallback._sword_patched = True
+            hf_moe._grouped_mm_fallback = safe_fallback
+
     except Exception:
         pass
 
@@ -278,7 +313,7 @@ from .gym import (
     extract_unified_diff,
 )
 
-__version__ = "0.8.5"
+__version__ = "0.8.6"
 print(f"[Sword] Version {__version__} loaded successfully.")
 
 
