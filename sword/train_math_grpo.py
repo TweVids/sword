@@ -242,11 +242,15 @@ class InProcessRolloutEngine:
         input_ids = inputs.input_ids
         attention_mask = inputs.attention_mask
 
+        prompt_len = input_ids.shape[1]
+        allowed_new = min(max_new_tokens, max(1, self.max_seq_len - prompt_len))
+
         with torch.no_grad():
             outputs = self.model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                max_new_tokens=max_new_tokens,
+                max_new_tokens=allowed_new,
+                max_length=None,
                 temperature=temperature,
                 do_sample=(temperature > 0.0),
                 pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
@@ -254,7 +258,6 @@ class InProcessRolloutEngine:
             )
 
         # Slice generated response tokens (excluding prompt)
-        prompt_len = input_ids.shape[1]
         response_ids = outputs[:, prompt_len:]
         decoded_responses = self.tokenizer.batch_decode(response_ids, skip_special_tokens=True)
 
@@ -1038,7 +1041,7 @@ def run_standalone_math_grpo(
     repo_id: str = "Nihilux/sword-grpo-200-steps",
     num_rollouts: int = 4,
     max_seq_len: int = 32768,
-    max_new_tokens: int = 2048,
+    max_new_tokens: int = 32768,
     steps: int = 200,
     lr: float = 5e-6,
     use_fp8: bool = True,
@@ -1051,7 +1054,7 @@ def run_standalone_math_grpo(
     print(f" Base Model:      {model_name_or_path}")
     print(f" LoRA Checkpoint: {checkpoint_lora} (Store: {checkpoint_repo})")
     print(f" Effort Mode:     {effort_tier.upper()} (Balanced round-robin across 6 tiers if 'balanced')")
-    print(f" Context Window:  {max_seq_len} tokens (32k context)")
+    print(f" Context Window:  {max_seq_len} tokens (32k context, max new: {max_new_tokens})")
     print(f" Rollouts:        {num_rollouts} concurrent streams (G=4)")
     print(f" FP8 Engine:      {use_fp8}")
     print(f" Steps:           {steps}")
