@@ -402,6 +402,7 @@ class MathScorer:
         full_text: str,
         effort_tier: str = "high",
         token_count: int = 0,
+        dataset_name: str = "",
     ) -> Dict[str, Any]:
         tag_score, tag_audit, trace, answer = ThinkingFormatVerifier.verify(full_text)
         audit_flags: Dict[str, Any] = {"thinking_tags": tag_audit}
@@ -433,10 +434,10 @@ class MathScorer:
             )
         accuracy_score = 0.35 if is_match else -0.40
 
-        # 2. Formatting (Enforce Natural Paragraph Thinking & Boxed Final Answer)
+        # 2. Formatting: Paragraph Thinking, Outside Paragraph Answer, and Boxed Output
         format_score = 0.0
 
-        # Check for bullet points, numbered lists, or markdown headers in thinking trace
+        # A. Check for bullet points, numbered lists, or markdown headers in thinking trace
         has_bullets_in_trace = bool(re.search(r"^\s*[-*•]\s+", trace, re.MULTILINE))
         has_numbered_in_trace = bool(re.search(r"^\s*\d+[\.)]\s+", trace, re.MULTILINE))
         has_headers_in_trace = bool(re.search(r"^\s*#{1,6}\s+", trace, re.MULTILINE))
@@ -449,7 +450,36 @@ class MathScorer:
             format_score += 0.15
             audit_flags["natural_paragraph_thinking_rewarded"] = True
 
-        # Check for \boxed{...} in final answer or full text
+            # Check 3-5 sentence paragraph depth for BigMath2 or when effort is higher than high (xhigh, ultra, max)
+            is_bigmath = "bigmath" in str(dataset_name).lower()
+            is_high_effort = str(effort_tier).lower() in ("xhigh", "ultra", "max")
+            if is_bigmath or is_high_effort:
+                paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", trace) if len(p.strip()) > 15]
+                if paragraphs:
+                    def count_sentences(p: str) -> int:
+                        cleaned = re.sub(r"\$\$.*?\$\$|\$.*?\$", " FORMULA ", p, flags=re.DOTALL)
+                        return len([s for s in re.split(r"(?<=[.!?])\s+", cleaned) if len(s.strip()) > 4])
+                    counts = [count_sentences(p) for p in paragraphs]
+                    avg_sents = sum(counts) / len(counts)
+                    if avg_sents >= 3.0 or any(c >= 3 for c in counts):
+                        format_score += 0.10
+                        audit_flags["deep_paragraph_sentences_rewarded"] = True
+                    else:
+                        format_score -= 0.10
+                        audit_flags["shallow_paragraphs_penalty"] = -0.10
+
+        # B. Paragraph behavior outside <think> (in final answer)
+        has_bullets_in_answer = bool(re.search(r"^\s*[-*•]\s+", answer, re.MULTILINE))
+        has_numbered_in_answer = bool(re.search(r"^\s*\d+[\.)]\s+", answer, re.MULTILINE))
+        if has_bullets_in_answer or has_numbered_in_answer:
+            format_score -= 0.08
+            audit_flags["bullet_or_list_in_answer"] = True
+        elif len(answer.strip()) > 15:
+            # Reward coherent explanatory prose wrapping the answer (smaller score than think, e.g. +0.05)
+            format_score += 0.05
+            audit_flags["natural_paragraph_answer_rewarded"] = True
+
+        # C. Check for \boxed{...} in final answer or full text
         has_boxed = bool(re.search(r"\\boxed\{[^}]+\}", answer or full_text))
         if has_boxed:
             format_score += 0.10
@@ -1423,6 +1453,7 @@ def run_standalone_math_grpo(
                 full_text=text,
                 effort_tier=step_effort,
                 token_count=token_count,
+                dataset_name=item_dataset,
             )
             res["full_text"] = text
             res["token_count"] = token_count
