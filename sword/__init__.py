@@ -313,7 +313,7 @@ from .gym import (
     extract_unified_diff,
 )
 
-__version__ = "0.8.8"
+__version__ = "0.8.9"
 print(f"[Sword] Version {__version__} loaded successfully.")
 
 

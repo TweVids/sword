@@ -245,6 +245,18 @@ class InProcessRolloutEngine:
         prompt_len = input_ids.shape[1]
         allowed_new = min(max_new_tokens, max(1, self.max_seq_len - prompt_len))
 
+        # Collect all chat & base EOS stop tokens (<|im_end|>, <|endoftext|>, </s>)
+        stop_token_ids = []
+        if self.tokenizer.eos_token_id is not None:
+            if isinstance(self.tokenizer.eos_token_id, list):
+                stop_token_ids.extend(self.tokenizer.eos_token_id)
+            else:
+                stop_token_ids.append(self.tokenizer.eos_token_id)
+        for stop_str in ["<|im_end|>", "<|endoftext|>", "</s>"]:
+            sid = self.tokenizer.convert_tokens_to_ids(stop_str)
+            if sid is not None and isinstance(sid, int) and sid > 0 and sid not in stop_token_ids:
+                stop_token_ids.append(sid)
+
         with torch.no_grad():
             outputs = self.model.generate(
                 input_ids=input_ids,
@@ -254,7 +266,7 @@ class InProcessRolloutEngine:
                 temperature=temperature,
                 do_sample=(temperature > 0.0),
                 pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
+                eos_token_id=stop_token_ids,
             )
 
         # Slice generated response tokens (excluding prompt)
@@ -1233,6 +1245,8 @@ def run_standalone_math_grpo(
         # Format user problem with exact effort system prompt
         formatted_prompt = format_effort_prompt(problem_text, effort_tier=step_effort, tokenizer=tokenizer)
 
+        print(f"[Step {step:03d}/{steps:03d} | {step_effort.upper():<6}] ⏳ Generating {num_rollouts} rollouts...", end="", flush=True)
+
         # Phase A: Inference / Rollout Generation
         raw_rollouts = engine.generate_rollouts(
             prompt=formatted_prompt,
@@ -1240,6 +1254,10 @@ def run_standalone_math_grpo(
             max_new_tokens=max_new_tokens,
             temperature=0.8,
         )
+
+        t_gen = time.perf_counter() - t_start
+        avg_tokens = sum(len(tokenizer.encode(r, add_special_tokens=False)) for r in raw_rollouts) / len(raw_rollouts)
+        print(f" done in {t_gen:.1f}s (avg: {avg_tokens:.0f} tokens)")
 
         # Phase B: Scoring & GDPO Decoupled Advantages
         rollout_results = []
@@ -1262,6 +1280,7 @@ def run_standalone_math_grpo(
             rollout_results[idx]["advantage"] = adv
 
         # Phase C: Training / Backward Step (Micro-batched per rollout with gradient accumulation)
+        print(f"[Step {step:03d}/{steps:03d} | {step_effort.upper():<6}] 🔄 Scoring & Backprop (rollouts 1/{num_rollouts}..{num_rollouts}/{num_rollouts})...", end="", flush=True)
         model.train()
         if hasattr(model, "config"):
             model.config.use_cache = False
@@ -1294,6 +1313,7 @@ def run_standalone_math_grpo(
 
         torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
         optimizer.step()
+        print(" done")
 
         elapsed = time.perf_counter() - t_start
         vram_gb = torch.cuda.memory_allocated() / (1024**3) if torch.cuda.is_available() else 0.0
@@ -1310,7 +1330,7 @@ def run_standalone_math_grpo(
             f"[Step {step:03d}/{steps:03d} | {step_effort.upper():<6}] "
             f"Acc: {mean_acc:.2f} | Fmt: {mean_fmt:.2f} | Eff: {mean_eff:+.2f} | "
             f"Total: {mean_total:+.2f} | Loss: {total_step_loss / num_rollouts:.4f} | "
-            f"VRAM: {vram_gb:.1f} GB | Time: {elapsed:.2f}s"
+            f"VRAM: {vram_gb:.1f} GB | Step Time: {elapsed:.2f}s\n"
         )
 
         del rollout_results
