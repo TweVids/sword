@@ -27,6 +27,7 @@ from .schema import (
     EffortTier,
     FailureReason,
 )
+from .loss import DEFAULT_COLUMN_MAPPING
 
 
 class PrimaryScorer:
@@ -97,10 +98,12 @@ class PrimaryScorer:
             failure_reason = FailureReason.SAFETY_VIOLATION
             # Terminal override clamp (-1.0 to -2.0)
             total_reward = max(self.safety_penalty_clamp, safety_score)
+            col_scores = {"accuracy": 0.0, "formatting": 0.0, "efficiency": 0.0, "safety": total_reward}
             return ScoredTrajectory(
                 trajectory=traj,
                 total_reward=total_reward,
                 component_scores=components,
+                column_scores=col_scores,
                 failure_reason=failure_reason,
                 is_safe=False,
                 audit_log=audit,
@@ -146,6 +149,15 @@ class PrimaryScorer:
         thinking_fmt_score, thinking_fmt_audit = self._score_thinking_formatting(traj.reasoning_trace)
         components["thinking_formatting"] = thinking_fmt_score
         audit["thinking_formatting"] = thinking_fmt_audit
+
+        # =========================================================
+        # 4c. Thinking Tags: Opening <think> and Closing </think> Verification
+        # =========================================================
+        tag_score, tag_audit = self._score_thinking_tags(problem, traj)
+        components["thinking_tags"] = tag_score
+        audit["thinking_tags"] = tag_audit
+        if tag_score < -0.15 and not failure_reason:
+            failure_reason = FailureReason.FORMAT_VIOLATION
 
         # =========================================================
         # 5. Domain-Specific Structural Rules
@@ -212,6 +224,7 @@ class PrimaryScorer:
                 capped_components[k] = v
 
         total_reward = sum(capped_components.values())
+        column_scores = self.group_components_to_columns(capped_components)
 
         # Determine overall failure reason if negative reward
         if total_reward < 0 and not failure_reason:
@@ -221,6 +234,7 @@ class PrimaryScorer:
             trajectory=traj,
             total_reward=round(total_reward, 4),
             component_scores=capped_components,
+            column_scores=column_scores,
             failure_reason=failure_reason,
             is_safe=is_safe,
             audit_log=audit,
@@ -435,6 +449,165 @@ class PrimaryScorer:
                 audit["substantive_list_allowed"] = True
 
         return max(-0.4, score), audit
+
+    @staticmethod
+    def group_components_to_columns(
+        components: Dict[str, float],
+        mapping: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, float]:
+        """
+        Groups fine-grained component scores into the 4 GDPO columns:
+        accuracy, formatting, efficiency, safety.
+        """
+        mapping = mapping or DEFAULT_COLUMN_MAPPING
+        columns = {"accuracy": 0.0, "formatting": 0.0, "efficiency": 0.0, "safety": 0.0}
+        for comp_name, score in components.items():
+            target_col = mapping.get(comp_name, "accuracy")
+            if target_col not in columns:
+                columns[target_col] = 0.0
+            columns[target_col] += float(score)
+        return {k: round(v, 4) for k, v in columns.items()}
+
+    @staticmethod
+    def is_thinking_required(problem: DatasetRow) -> bool:
+        """
+        Determines whether the thinking block (<think> ... </think>) is required or expected.
+        Triggered when:
+        1. Explicit metadata / flag overrides (e.g. require_thinking=True)
+        2. High/Ultra effort tiers (recheck_required is True, effort_tier >= HIGH)
+        3. Reasoning domains (Math, Science, Code)
+        4. Problem prompt explicitly cues reasoning/step-by-step thinking
+        5. Explain flag is True
+        """
+        if problem.extra_metadata.get("require_thinking") is not None:
+            return bool(problem.extra_metadata["require_thinking"])
+        if problem.recheck_required:
+            return True
+        if problem.effort_tier in (EffortTier.HIGH, EffortTier.XHIGH, EffortTier.ULTRA, EffortTier.MAX):
+            return True
+        if problem.explain_flag:
+            return True
+        if problem.domain in (DomainType.MATH, DomainType.SCIENCE, DomainType.CODE):
+            return True
+
+        # Check prompt for thinking/reasoning trigger keywords
+        prompt_text = problem.user_problem.lower()
+        triggers = [
+            r"\bthink\b", r"\bthought\b", r"\breason\b", r"\breasoning\b",
+            r"\bstep[-\s]by[-\s]step\b", r"\bshow\s+your\s+work\b",
+            r"\bderive\b", r"\banalyze\b", r"\bexplain\b",
+        ]
+        return any(re.search(pat, prompt_text) for pat in triggers)
+
+    # ------------------------------------------------------------------
+    # Section 6a: Thinking Tags (<think> ... </think>) Structural Check
+    # ------------------------------------------------------------------
+    def _score_thinking_tags(self, problem: DatasetRow, traj: Trajectory) -> Tuple[float, Dict[str, Any]]:
+        """
+        Validates proper <think> ... </think> structural tag adherence.
+        Checks:
+        - Opening tag <think> and closing tag </think> balance and ordering
+        - Non-empty reasoning content inside the thinking block
+        - Presence of final answer following the closing </think> tag
+        - Absence of leaked or unclosed tags in the final answer
+        - Condition-based requirement (rewards proper tags when conditioned,
+          penalizes missing tags when thinking was requested, and avoids false
+          penalties on simple direct-response prompts).
+        """
+        full_text = traj.full_text
+        audit: Dict[str, Any] = {}
+        condition_met = self.is_thinking_required(problem)
+        audit["thinking_conditioned"] = condition_met
+
+        open_tag = "<think>"
+        close_tag = "</think>"
+
+        open_count = full_text.count(open_tag)
+        close_count = full_text.count(close_tag)
+        audit["open_tag_count"] = open_count
+        audit["close_tag_count"] = close_count
+
+        prompt_opened = open_tag in traj.prompt and traj.prompt.rstrip().endswith(open_tag)
+
+        # 1. Malformed duplicate/multiple tags (hallucinated chat loop)
+        if open_count > 1 or close_count > 1:
+            audit["error"] = "duplicate_or_nested_tags"
+            audit["penalty"] = -0.25
+            return -0.25, audit
+
+        # 2. Case: Opened <think> but never closed </think>
+        if open_count == 1 and close_count == 0:
+            audit["error"] = "unclosed_think_tag"
+            audit["penalty"] = -0.25
+            return -0.25, audit
+
+        # 3. Case: Orphaned </think> without opening <think>
+        if open_count == 0 and close_count == 1:
+            if prompt_opened:
+                # Prompt prefilled <think>, so model emitting single </think> is valid!
+                pos_close = full_text.find(close_tag)
+                thought = full_text[:pos_close].strip()
+                answer = full_text[pos_close + len(close_tag):].strip()
+                if len(thought) >= 5 and len(answer) > 0:
+                    audit["valid_prefilled_thinking"] = True
+                    audit["reward"] = 0.10
+                    return 0.10, audit
+                elif len(thought) < 5:
+                    audit["error"] = "empty_prefilled_thought"
+                    audit["penalty"] = -0.20
+                    return -0.20, audit
+                else:
+                    audit["error"] = "missing_final_answer"
+                    audit["penalty"] = -0.20
+                    return -0.20, audit
+            else:
+                audit["error"] = "orphaned_close_tag"
+                audit["penalty"] = -0.20
+                return -0.20, audit
+
+        # 4. Case: Standard pair (open_count == 1 and close_count == 1)
+        if open_count == 1 and close_count == 1:
+            pos_open = full_text.find(open_tag)
+            pos_close = full_text.find(close_tag)
+
+            if pos_open > pos_close:
+                audit["error"] = "inverted_tags_close_before_open"
+                audit["penalty"] = -0.25
+                return -0.25, audit
+
+            thought = full_text[pos_open + len(open_tag):pos_close].strip()
+            answer = full_text[pos_close + len(close_tag):].strip()
+
+            if len(thought) < 5:
+                audit["error"] = "empty_thinking_block"
+                audit["penalty"] = -0.20
+                return -0.20, audit
+
+            if len(answer) == 0:
+                audit["error"] = "missing_final_answer"
+                audit["penalty"] = -0.20
+                return -0.20, audit
+
+            if open_tag in answer or close_tag in answer:
+                audit["error"] = "leaked_tags_in_final_answer"
+                audit["penalty"] = -0.20
+                return -0.20, audit
+
+            audit["valid_thinking_tags"] = True
+            reward = 0.10 if condition_met else 0.05
+            audit["reward"] = reward
+            return reward, audit
+
+        # 5. Case: Neither tag present (open_count == 0 and close_count == 0)
+        if condition_met:
+            # Thinking was expected by condition, but tags were omitted
+            audit["error"] = "missing_required_thinking_tags"
+            audit["penalty"] = -0.20
+            return -0.20, audit
+        else:
+            # Simple direct response, no tags expected -> neutral 0.0
+            audit["tags_omitted_allowed"] = True
+            return 0.0, audit
 
     # ------------------------------------------------------------------
     # Section 7 & 7a: Code Editing & Destructive Edit Guard

@@ -145,6 +145,8 @@ class ScoredTrajectory:
     total_reward: float = 0.0
     advantage: float = 0.0
     component_scores: Dict[str, float] = field(default_factory=dict)
+    column_scores: Dict[str, float] = field(default_factory=dict)
+    column_advantages: Dict[str, float] = field(default_factory=dict)
     failure_reason: Optional[FailureReason] = None
     verifier_answers: Optional[Dict[str, Any]] = None
     is_safe: bool = True

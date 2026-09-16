@@ -69,6 +69,7 @@ class GRPOTrainer:
         use_docker_gym: bool = False,
         remote_gym_endpoint: Optional[str] = None,
         docker_gym_image: str = "sword-coding-gym:latest",
+        device: Optional[str] = None,
     ):
         setup_blackwell_environment()
 
@@ -82,7 +83,7 @@ class GRPOTrainer:
         self.save_limit = save_limit
         self.hf_repo_id = hf_repo_id
         self.hf_token = hf_token
-        self.device = device
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.global_step = 0
 
         os.makedirs(self.output_dir, exist_ok=True)
@@ -305,10 +306,12 @@ class GRPOTrainer:
                     group_scored.append(scored)
                     group_rewards.append(scored.total_reward)
 
-                # 4. Group Advantage Normalization (GRPO)
-                advantages = ChunkedGRPOLoss.compute_group_advantages(group_rewards)
+                # 4. Group Advantage Normalization (GDPO - Decoupled Multi-Reward Normalization)
+                advantages, col_advantages = ChunkedGRPOLoss.compute_gdpo_advantages(group_scored)
                 for idx, adv in enumerate(advantages):
                     group_scored[idx].advantage = adv
+                    for col, col_advs in col_advantages.items():
+                        group_scored[idx].column_advantages[col] = col_advs[idx]
 
                 all_scored_trajectories.append(group_scored)
 
