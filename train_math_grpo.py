@@ -583,13 +583,19 @@ class ChunkedGRPOLoss(nn.Module):
 # =====================================================================
 # 📦  DATASET DOWNLOADER & DISK BATCH STREAMER
 # =====================================================================
+EFFORT_TIERS_LIST: List[str] = ["low", "medium", "high", "xhigh", "ultra", "max"]
+
+
 def download_bigmath2(
     dataset_name: str = "Nihilux/BigMath2",
     cache_file: str = "local_trainer/data/bigmath2.jsonl",
     max_samples: int = 10000,
     hf_token: Optional[str] = None,
 ) -> str:
-    """Downloads / caches Nihilux/BigMath2 to local disk."""
+    """
+    Downloads / caches Nihilux/BigMath2 to local disk.
+    Assigns a balanced round-robin effort tier across [low, medium, high, xhigh, ultra, max].
+    """
     os.makedirs(os.path.dirname(os.path.abspath(cache_file)), exist_ok=True)
     if os.path.exists(cache_file) and os.path.getsize(cache_file) > 1000:
         print(f"[Data] Found local cached dataset: {cache_file} ({os.path.getsize(cache_file)/1e6:.1f} MB)")
@@ -607,16 +613,22 @@ def download_bigmath2(
             ans = item.get("answer") or item.get("solution") or ""
             if not prob or not ans:
                 continue
-            f.write(json.dumps({"problem": str(prob).strip(), "answer": str(ans).strip()}, ensure_ascii=False) + "\n")
+            tier = EFFORT_TIERS_LIST[count % len(EFFORT_TIERS_LIST)]
+            f.write(json.dumps({
+                "idx": count,
+                "problem": str(prob).strip(),
+                "answer": str(ans).strip(),
+                "effort_tier": tier,
+            }, ensure_ascii=False) + "\n")
             count += 1
             if count >= max_samples:
                 break
 
-    print(f"[Data] Cached {count} math problems to {cache_file}")
+    print(f"[Data] Cached {count} math problems to {cache_file} (balanced across 6 effort tiers)")
     return cache_file
 
 
-def stream_math_data_from_disk(file_path: str) -> Generator[Dict[str, str], None, None]:
+def stream_math_data_from_disk(file_path: str) -> Generator[Dict[str, Any], None, None]:
     """Streams lines from disk with zero RAM retention."""
     while True:
         with open(file_path, "r", encoding="utf-8") as f:
@@ -631,17 +643,89 @@ def stream_math_data_from_disk(file_path: str) -> Generator[Dict[str, str], None
 # 📊  200-STEP AUDITOR & HUGGING FACE ARCHIVE UPLOADER
 # =====================================================================
 class StepAuditor:
-    """Saves every step's generations and uploads zip to Hugging Face."""
+    """
+    Saves every step's generations, exports flat tabular dataset,
+    and uploads zip archive to Hugging Face Hub.
+    Dedicated 'effort_tier' column enables studying token scaling per effort level.
+    """
 
     def __init__(self, log_dir: str = "local_trainer/generations_200_steps"):
         self.log_dir = log_dir
         os.makedirs(self.log_dir, exist_ok=True)
         self.jsonl_file = os.path.join(self.log_dir, "all_generations.jsonl")
+        self.tabular_jsonl = os.path.join(self.log_dir, "generations_table.jsonl")
+        self.tabular_csv = os.path.join(self.log_dir, "generations_table.csv")
         self.step_records = []
+        self.effort_stats = defaultdict(lambda: {
+            "steps": 0,
+            "rollouts": 0,
+            "correct": 0,
+            "valid_tags": 0,
+            "unclosed_tags": 0,
+            "loops": 0,
+            "total_tokens": 0,
+            "total_reward": 0.0,
+        })
 
-    def record(self, step: int, problem: str, reference: str, rollouts: List[Dict[str, Any]], elapsed: float):
+    def record(
+        self,
+        step: int,
+        problem: str,
+        reference: str,
+        rollouts: List[Dict[str, Any]],
+        elapsed: float,
+        effort_tier: str = "high",
+    ):
+        tier_key = str(effort_tier).lower()
+        self.effort_stats[tier_key]["steps"] += 1
+
+        tabular_rows = []
+        for r in rollouts:
+            r["effort_tier"] = tier_key
+            st = self.effort_stats[tier_key]
+            st["rollouts"] += 1
+            st["total_tokens"] += r.get("token_count", 0)
+            st["total_reward"] += r.get("total_reward", 0.0)
+
+            is_corr = bool(r.get("is_correct", False))
+            has_valid_tags = bool(r.get("component_scores", {}).get("thinking_tags", 0.0) > 0)
+            is_unclosed = r.get("audit_log", {}).get("thinking_tags", {}).get("error") == "unclosed_think_tag"
+            has_loop = bool(r.get("audit_log", {}).get("repetitive_loop_detected", False))
+
+            if is_corr:
+                st["correct"] += 1
+            if has_valid_tags:
+                st["valid_tags"] += 1
+            if is_unclosed:
+                st["unclosed_tags"] += 1
+            if has_loop:
+                st["loops"] += 1
+
+            cols = r.get("column_scores", {})
+            tabular_rows.append({
+                "step": step,
+                "problem": problem,
+                "reference_answer": reference,
+                "effort_tier": tier_key,
+                "rollout_idx": r.get("rollout_index", len(tabular_rows)),
+                "token_count": r.get("token_count", 0),
+                "total_reward": round(r.get("total_reward", 0.0), 4),
+                "accuracy_reward": round(cols.get("accuracy", 0.0), 4),
+                "formatting_reward": round(cols.get("formatting", 0.0), 4),
+                "efficiency_reward": round(cols.get("efficiency", 0.0), 4),
+                "advantage": round(r.get("advantage", 0.0), 4),
+                "is_correct": is_corr,
+                "valid_think_tags": has_valid_tags,
+                "unclosed_think_tag": is_unclosed,
+                "repetitive_loop": has_loop,
+                "final_answer": r.get("final_answer", ""),
+                "reasoning_trace": r.get("reasoning_trace", ""),
+                "full_text": r.get("full_text", ""),
+            })
+
         record = {
             "step": step,
+            "effort_tier": tier_key,
             "problem": problem,
             "reference_answer": reference,
             "elapsed_sec": round(elapsed, 2),
@@ -653,28 +737,108 @@ class StepAuditor:
 
         with open(self.jsonl_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+        with open(self.tabular_jsonl, "a", encoding="utf-8") as f_tab:
+            for row in tabular_rows:
+                f_tab.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+        if tabular_rows:
+            import csv
+            csv_fields = [
+                "step", "effort_tier", "rollout_idx", "token_count", "total_reward",
+                "accuracy_reward", "formatting_reward", "efficiency_reward", "advantage",
+                "is_correct", "valid_think_tags", "unclosed_think_tag", "repetitive_loop",
+                "problem", "reference_answer", "final_answer"
+            ]
+            write_header = not os.path.exists(self.tabular_csv) or os.path.getsize(self.tabular_csv) == 0
+            with open(self.tabular_csv, "a", newline="", encoding="utf-8") as f_csv:
+                writer = csv.DictWriter(f_csv, fieldnames=csv_fields, extrasaction="ignore")
+                if write_header:
+                    writer.writeheader()
+                for row in tabular_rows:
+                    writer.writerow(row)
+
         self.step_records.append(record)
 
     def summarize(self) -> Dict[str, Any]:
         total_rollouts = sum(len(r["rollouts"]) for r in self.step_records)
-        correct = sum(sum(1 for ro in r["rollouts"] if ro["is_correct"]) for r in self.step_records)
-        valid_tags = sum(sum(1 for ro in r["rollouts"] if ro["component_scores"]["thinking_tags"] > 0) for r in self.step_records)
+        correct = sum(sum(1 for ro in r["rollouts"] if ro.get("is_correct", False)) for r in self.step_records)
+        valid_tags = sum(sum(1 for ro in r["rollouts"] if ro.get("component_scores", {}).get("thinking_tags", 0) > 0) for r in self.step_records)
+
+        tier_order = ["low", "medium", "high", "xhigh", "ultra", "max"]
+        tier_breakdown: Dict[str, Any] = {}
+        for t in tier_order:
+            if t in self.effort_stats:
+                st = self.effort_stats[t]
+                n_ro = max(1, st["rollouts"])
+                tier_breakdown[t] = {
+                    "steps": st["steps"],
+                    "rollouts": st["rollouts"],
+                    "accuracy_pct": round((st["correct"] / n_ro) * 100, 2),
+                    "thinking_tag_compliance_pct": round((st["valid_tags"] / n_ro) * 100, 2),
+                    "unclosed_tag_pct": round((st["unclosed_tags"] / n_ro) * 100, 2),
+                    "looping_pct": round((st["loops"] / n_ro) * 100, 2),
+                    "mean_tokens": round(st["total_tokens"] / n_ro, 1),
+                    "mean_reward": round(st["total_reward"] / n_ro, 4),
+                }
 
         summary = {
             "total_steps": len(self.step_records),
             "total_rollouts": total_rollouts,
             "accuracy_pct": round((correct / max(1, total_rollouts)) * 100, 2),
             "thinking_tag_compliance_pct": round((valid_tags / max(1, total_rollouts)) * 100, 2),
+            "effort_tier_breakdown": tier_breakdown,
         }
         with open(os.path.join(self.log_dir, "audit_summary.json"), "w") as f:
             json.dump(summary, f, indent=2)
 
-        print("\n" + "=" * 60)
+        # Generate HF Dataset Card README.md for interactive table viewing
+        readme_path = os.path.join(self.log_dir, "README.md")
+        card_content = (
+            "---\n"
+            "configs:\n"
+            "- config_name: default\n"
+            "  data_files:\n"
+            "  - split: train\n"
+            "    path: generations_table.jsonl\n"
+            "---\n\n"
+            "# 🗡️ Sword 200-Step Math GRPO Generation Dataset\n\n"
+            "Traces and multi-reward metrics from a 200-step Math GRPO training run on `Nihilux/BigMath2`.\n\n"
+            "### Columns\n"
+            "- **`step`**: Training step index (1-200)\n"
+            "- **`effort_tier`**: Reasoning effort tier (`low`, `medium`, `high`, `xhigh`, `ultra`, `max`)\n"
+            "- **`rollout_idx`**: Trajectory index (0 to 3 for G=4)\n"
+            "- **`problem`**: User mathematical problem statement\n"
+            "- **`reference_answer`**: Ground truth solution\n"
+            "- **`token_count`**: Generated token count\n"
+            "- **`total_reward`**: GDPO composite reward\n"
+            "- **`advantage`**: Decoupled normalized advantage\n"
+            "- **`is_correct`**: Mathematical ground truth match\n"
+            "- **`valid_think_tags`**: `<think>` and `</think>` opening & closing tag compliance\n"
+            "- **`full_text`**: Complete model response\n"
+        )
+        with open(readme_path, "w", encoding="utf-8") as f:
+            f.write(card_content)
+
+        print("\n" + "=" * 68)
         print(" 📊 200-STEP AUDIT SUMMARY")
         print(f" Steps Completed:       {summary['total_steps']}")
         print(f" Ground Truth Accuracy: {summary['accuracy_pct']}%")
         print(f" Tag Compliance:        {summary['thinking_tag_compliance_pct']}%")
-        print("=" * 60 + "\n")
+
+        if tier_breakdown:
+            print("-" * 68)
+            print(f" {'Tier':<8} {'Steps':<7} {'Rollouts':<10} {'Accuracy':<10} {'AvgToks':<10} {'Tag%':<8} {'Reward':<8}")
+            print("-" * 68)
+            for t, data in tier_breakdown.items():
+                print(
+                    f" {t:<8} {data['steps']:<7} {data['rollouts']:<10} "
+                    f"{data['accuracy_pct']:>5.1f}%    "
+                    f"{data['mean_tokens']:>6.1f}    "
+                    f"{data['thinking_tag_compliance_pct']:>5.1f}%  "
+                    f"{data['mean_reward']:>+6.3f}"
+                )
+        print("=" * 68 + "\n")
         return summary
 
 
@@ -798,7 +962,7 @@ def run_standalone_math_grpo(
     model_name_or_path: str = "Qwen/Qwen3-30B-A3B",
     checkpoint_lora: str = "checkpoint-2200",
     checkpoint_repo: str = "Nihilux/SpringHunter",
-    effort_tier: str = "high",
+    effort_tier: str = "balanced",
     hf_token: Optional[str] = None,
     repo_id: str = "Nihilux/sword-grpo-200-steps",
     num_rollouts: int = 4,
@@ -815,7 +979,7 @@ def run_standalone_math_grpo(
     print(" 🚀 STANDALONE MATH GRPO TRAINER (Nihilux/BigMath2)")
     print(f" Base Model:      {model_name_or_path}")
     print(f" LoRA Checkpoint: {checkpoint_lora} (Store: {checkpoint_repo})")
-    print(f" Effort Tier:     {effort_tier.upper()}")
+    print(f" Effort Mode:     {effort_tier.upper()} (Balanced round-robin across 6 tiers if 'balanced')")
     print(f" Context Window:  {max_seq_len} tokens (32k context)")
     print(f" Rollouts:        {num_rollouts} concurrent streams (G=4)")
     print(f" FP8 Engine:      {use_fp8}")
@@ -898,15 +1062,21 @@ def run_standalone_math_grpo(
     optimizer = torch.optim.AdamW(trainable_params, lr=lr)
 
     # 7. 200-Step Training Loop
-    print(f"\n⚡ Starting {steps} training steps (System Prompt: {effort_tier})...\n")
+    print(f"\n⚡ Starting {steps} training steps (Effort Mode: {effort_tier})...\n")
     for step in range(1, steps + 1):
         t_start = time.perf_counter()
         item = next(streamer)
         problem_text = item["problem"]
         ref_answer = item["answer"]
 
+        # Resolve effort tier for this step (balanced round-robin vs forced single tier)
+        if effort_tier.lower() in ("balanced", "all"):
+            step_effort = item.get("effort_tier", "high")
+        else:
+            step_effort = effort_tier.lower()
+
         # Format user problem with exact effort system prompt
-        formatted_prompt = format_effort_prompt(problem_text, effort_tier=effort_tier, tokenizer=tokenizer)
+        formatted_prompt = format_effort_prompt(problem_text, effort_tier=step_effort, tokenizer=tokenizer)
 
         # Phase A: Inference / Rollout Generation
         raw_rollouts = engine.generate_rollouts(
@@ -924,11 +1094,12 @@ def run_standalone_math_grpo(
                 problem=problem_text,
                 reference_answer=ref_answer,
                 full_text=text,
-                effort_tier=effort_tier,
+                effort_tier=step_effort,
                 token_count=token_count,
             )
             res["full_text"] = text
             res["token_count"] = token_count
+            res["effort_tier"] = step_effort
             rollout_results.append(res)
 
         advantages, col_advantages = compute_gdpo_advantages(rollout_results)
@@ -970,12 +1141,12 @@ def run_standalone_math_grpo(
         elapsed = time.perf_counter() - t_start
         vram_gb = torch.cuda.memory_allocated() / (1024**3) if torch.cuda.is_available() else 0.0
 
-        # Phase D: Record Generation Audit
-        auditor.record(step, problem_text, ref_answer, rollout_results, elapsed)
+        # Phase D: Record Generation Audit with dedicated effort_tier column
+        auditor.record(step, problem_text, ref_answer, rollout_results, elapsed, effort_tier=step_effort)
 
         mean_reward = sum(r["total_reward"] for r in rollout_results) / len(rollout_results)
         print(
-            f"[Step {step:03d}/{steps:03d}] Reward: {mean_reward:+.3f} | "
+            f"[Step {step:03d}/{steps:03d} | {step_effort.upper():<6}] Reward: {mean_reward:+.3f} | "
             f"Loss: {loss_metrics['grpo_loss']:.4f} | "
             f"VRAM: {vram_gb:.1f} GB | Time: {elapsed:.2f}s"
         )
@@ -995,13 +1166,24 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint", type=str, default="checkpoint-2200")
     parser.add_argument("--repo_id", type=str, default=os.environ.get("HF_UPLOAD_REPO_ID", "Nihilux/sword-grpo-200-steps"))
     parser.add_argument("--token", type=str, default=os.environ.get("HF_TOKEN", ""))
+    parser.add_argument("--effort_tier", type=str, default="balanced", choices=["balanced", "all", "low", "medium", "high", "xhigh", "ultra", "max"], help="Reasoning effort tier or 'balanced' for round-robin split across all 6 tiers")
     parser.add_argument("--steps", type=int, default=200)
+    parser.add_argument("--test_stream_only", action="store_true", help="Only stream 1 row of Nihilux/BigMath2 to inspect and exit")
     args = parser.parse_args()
+
+    if args.test_stream_only:
+        data_file = download_bigmath2(dataset_name="Nihilux/BigMath2", hf_token=args.token or None)
+        streamer = stream_math_data_from_disk(data_file)
+        row = next(streamer)
+        print("\n[Test Stream] Inspected 1 sample row:")
+        print(json.dumps(row, indent=2))
+        sys.exit(0)
 
     run_standalone_math_grpo(
         model_name_or_path=args.model,
         checkpoint_lora=args.checkpoint,
         repo_id=args.repo_id,
         hf_token=args.token,
+        effort_tier=args.effort_tier,
         steps=args.steps,
     )
