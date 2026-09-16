@@ -4,6 +4,11 @@ Sword: Pure-PyTorch High-Throughput Attention & Generation Speed Engine.
 
 import sys
 
+try:
+    import unsloth
+except Exception:
+    pass
+
 
 def _fix_torchvision_compatibility():
     """
@@ -313,7 +318,7 @@ from .gym import (
     extract_unified_diff,
 )
 
-__version__ = "0.8.9"
+__version__ = "0.9.0"
 print(f"[Sword] Version {__version__} loaded successfully.")
 
 

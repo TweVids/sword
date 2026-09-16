@@ -26,6 +26,14 @@ from typing import List, Dict, Any, Tuple, Optional, Generator
 from collections import defaultdict
 from dataclasses import dataclass, field
 
+# Import unsloth at the very top before transformers/peft to activate Unsloth optimizations
+try:
+    import unsloth
+    from unsloth import FastLanguageModel
+    HAS_UNSLOTH = True
+except Exception:
+    HAS_UNSLOTH = False
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -159,6 +167,10 @@ def convert_to_fp8_moe_weights(model: nn.Module) -> int:
                     param.data = fp8_data
                     param.requires_grad = False
                     converted += 1
+    if converted > 0:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     print(f"[FP8] Converted {converted} MoE weight tensors to torch.float8_e4m3fn.")
     return converted
 
@@ -1081,94 +1093,80 @@ def run_standalone_math_grpo(
     )
     streamer = stream_math_data_from_disk(data_file)
 
-    # 2. Load Model & Tokenizer
-    print(f"\n[*] Loading tokenizer and base model...")
-    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, padding_side="left", token=hf_token, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token or "<|endoftext|>"
-
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name_or_path,
-        torch_dtype=torch.bfloat16,
-        device_map="auto" if device == "cuda" else None,
-        token=hf_token,
-        trust_remote_code=True,
-    )
-
-    # 3. Apply In-Memory FP8 MoE Quantization
-    if use_fp8:
-        convert_to_fp8_moe_weights(model)
-
-    # 4. Resolve and Attach LoRA Adapter
+    # 2. Resolve LoRA Checkpoint First
     resolved_lora = resolve_checkpoint_lora(
         checkpoint_name=checkpoint_lora,
         hf_repo_id=checkpoint_repo,
         local_dir="checkpoints",
         hf_token=hf_token,
     )
-    print(f"[*] Attaching LoRA adapters (path: {resolved_lora})...")
+
+    # 3. Load Model & Tokenizer
+    print(f"\n[*] Loading tokenizer and model...")
     lora_attached = False
+    model = None
+    tokenizer = None
 
-    # Attempt importing unsloth if installed to enable custom MoE LoRA kernels
-    try:
-        import unsloth
-    except Exception:
-        pass
-
-    try:
-        from peft import PeftModel
-        if os.path.exists(resolved_lora):
-            model = PeftModel.from_pretrained(model, resolved_lora, is_trainable=True)
-            print(f"✅ Loaded existing LoRA from {resolved_lora}")
-            lora_attached = True
-    except Exception as e:
-        print(f"⚠️  PeftModel standard load note: {e}")
-        # Cleanly unwrap base model before fallback
-        if hasattr(model, "unload"):
-            try:
-                model = model.unload()
-            except Exception:
-                pass
-        while hasattr(model, "base_model"):
-            model = getattr(model.base_model, "model", model.base_model)
-
+    if HAS_UNSLOTH:
+        print("[*] Unsloth detected: Loading via FastLanguageModel...")
         try:
-            from peft import LoraConfig, get_peft_model
-            from safetensors.torch import load_file as load_safetensors
-            adapter_file = os.path.join(resolved_lora, "adapter_model.safetensors")
-            if not os.path.exists(adapter_file):
-                adapter_file = os.path.join(resolved_lora, "adapter_model.bin")
-            if os.path.exists(adapter_file):
-                # Target standard attention projections which are always 100% compatible
-                lora_cfg = LoraConfig(
-                    r=32,
-                    lora_alpha=64,
-                    target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-                    use_rslora=True,
-                    task_type="CAUSAL_LM",
+            if os.path.isdir(resolved_lora) and (
+                os.path.exists(os.path.join(resolved_lora, "adapter_config.json"))
+            ):
+                print(f"[*] Loading base model + LoRA adapter together from {resolved_lora}...")
+                model, tokenizer = FastLanguageModel.from_pretrained(
+                    model_name=resolved_lora,
+                    max_seq_length=max_seq_len,
+                    dtype=torch.bfloat16,
+                    load_in_4bit=False,
+                    token=hf_token,
+                    device_map="auto" if device == "cuda" else None,
                 )
-                model = get_peft_model(model, lora_cfg)
-                sd = load_safetensors(adapter_file) if adapter_file.endswith(".safetensors") else torch.load(adapter_file, map_location="cpu")
-                model_sd = model.state_dict()
-                matching_sd = {}
-                for k, v in sd.items():
-                    if k in model_sd and v.shape == model_sd[k].shape:
-                        matching_sd[k] = v
-                    else:
-                        k_default = k.replace(".lora_A.weight", ".lora_A.default.weight").replace(".lora_B.weight", ".lora_B.default.weight")
-                        if k_default in model_sd and v.shape == model_sd[k_default].shape:
-                            matching_sd[k_default] = v
+                lora_attached = True
+                print(f"✅ Loaded base model + LoRA from {resolved_lora} in a single pass via FastLanguageModel")
+            else:
+                model, tokenizer = FastLanguageModel.from_pretrained(
+                    model_name=model_name_or_path,
+                    max_seq_length=max_seq_len,
+                    dtype=torch.bfloat16,
+                    load_in_4bit=False,
+                    token=hf_token,
+                    device_map="auto" if device == "cuda" else None,
+                )
+        except Exception as e_uns:
+            print(f"⚠️  FastLanguageModel notice: {e_uns}. Falling back to standard loader...")
+            model = None
 
-                if matching_sd:
-                    model.load_state_dict(matching_sd, strict=False)
-                    print(f"✅ Tolerant LoRA load: initialized {len(matching_sd)}/{len(sd)} matching attention adapter layers from {resolved_lora}")
-                    lora_attached = True
-        except Exception as e2:
-            print(f"⚠️  Tolerant LoRA load note: {e2}")
+    if model is None:
+        tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, padding_side="left", token=hf_token, trust_remote_code=True)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token or "<|endoftext|>"
 
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name_or_path,
+            torch_dtype=torch.bfloat16,
+            device_map="auto" if device == "cuda" else None,
+            token=hf_token,
+            trust_remote_code=True,
+        )
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token or "<|endoftext|>"
+    if hasattr(tokenizer, "padding_side"):
+        tokenizer.padding_side = "left"
+
+    # 4. Attach LoRA Adapter (if not already attached in single pass)
     if not lora_attached:
-        print("[*] Initializing fresh LoRA adapter...")
+        print(f"[*] Attaching LoRA adapters (path: {resolved_lora})...")
         try:
+            from peft import PeftModel
+            if os.path.exists(resolved_lora):
+                model = PeftModel.from_pretrained(model, resolved_lora, is_trainable=True)
+                print(f"✅ Loaded existing LoRA from {resolved_lora}")
+                lora_attached = True
+        except Exception as e:
+            print(f"⚠️  PeftModel standard load note: {e}")
+            # Cleanly unwrap base model before fallback
             if hasattr(model, "unload"):
                 try:
                     model = model.unload()
@@ -1176,17 +1174,76 @@ def run_standalone_math_grpo(
                     pass
             while hasattr(model, "base_model"):
                 model = getattr(model.base_model, "model", model.base_model)
-            from peft import LoraConfig, get_peft_model
-            lora_cfg = LoraConfig(
-                r=16,
-                lora_alpha=32,
-                target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
-                task_type="CAUSAL_LM",
-            )
-            model = get_peft_model(model, lora_cfg)
-            print("✅ Initialized fresh LoRA adapter on attention projections")
-        except Exception as e3:
-            print(f"⚠️  Fresh LoRA init note: {e3}")
+
+            try:
+                from peft import LoraConfig, get_peft_model
+                from safetensors.torch import load_file as load_safetensors
+                adapter_file = os.path.join(resolved_lora, "adapter_model.safetensors")
+                if not os.path.exists(adapter_file):
+                    adapter_file = os.path.join(resolved_lora, "adapter_model.bin")
+                if os.path.exists(adapter_file):
+                    lora_cfg = LoraConfig(
+                        r=32,
+                        lora_alpha=64,
+                        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+                        use_rslora=True,
+                        task_type="CAUSAL_LM",
+                    )
+                    model = get_peft_model(model, lora_cfg)
+                    sd = load_safetensors(adapter_file) if adapter_file.endswith(".safetensors") else torch.load(adapter_file, map_location="cpu")
+                    model_sd = model.state_dict()
+                    matching_sd = {}
+                    for k, v in sd.items():
+                        if k in model_sd and v.shape == model_sd[k].shape:
+                            matching_sd[k] = v
+                        else:
+                            k_default = k.replace(".lora_A.weight", ".lora_A.default.weight").replace(".lora_B.weight", ".lora_B.default.weight")
+                            if k_default in model_sd and v.shape == model_sd[k_default].shape:
+                                matching_sd[k_default] = v
+
+                    if matching_sd:
+                        model.load_state_dict(matching_sd, strict=False)
+                        print(f"✅ Tolerant LoRA load: initialized {len(matching_sd)}/{len(sd)} matching attention adapter layers from {resolved_lora}")
+                        lora_attached = True
+            except Exception as e2:
+                print(f"⚠️  Tolerant LoRA load note: {e2}")
+
+        if not lora_attached:
+            print("[*] Initializing fresh LoRA adapter...")
+            try:
+                if hasattr(model, "unload"):
+                    try:
+                        model = model.unload()
+                    except Exception:
+                        pass
+                while hasattr(model, "base_model"):
+                    model = getattr(model.base_model, "model", model.base_model)
+                from peft import LoraConfig, get_peft_model
+                lora_cfg = LoraConfig(
+                    r=16,
+                    lora_alpha=32,
+                    target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
+                    task_type="CAUSAL_LM",
+                )
+                model = get_peft_model(model, lora_cfg)
+                print("✅ Initialized fresh LoRA adapter on attention projections")
+            except Exception as e3:
+                print(f"⚠️  Fresh LoRA init note: {e3}")
+
+    # 5. Apply In-Memory FP8 MoE Quantization
+    if use_fp8:
+        convert_to_fp8_moe_weights(model)
+
+    vram_after_load = torch.cuda.memory_allocated() / (1024**3) if torch.cuda.is_available() else 0.0
+    print(f"[*] Active Model VRAM: {vram_after_load:.2f} GB (Headroom: {95.0 - vram_after_load:.1f} GB)")
+
+    # 6. Configure Training Mode & Gradient Checkpointing
+    if HAS_UNSLOTH:
+        try:
+            FastLanguageModel.for_training(model)
+            print("✅ Configured Unsloth fast training mode")
+        except Exception:
+            pass
 
     # Optional: Apply Sword FlashAttention SDPA patch to attention modules
     try:
