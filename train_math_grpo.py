@@ -391,6 +391,8 @@ class MathScorer:
         boxed = re.findall(r"\\boxed\{([^}]+)\}", ans)
         if boxed:
             return MathScorer._normalize_math(boxed[-1])
+        # Strip trailing .0 or .00 if whole number (e.g. 357.0 -> 357)
+        s = re.sub(r"\.0+(?=[^\d]|$)", "", s)
         return s
 
     def score(
@@ -407,13 +409,27 @@ class MathScorer:
         norm_ans = self._normalize_math(answer)
         norm_full = self._normalize_math(full_text)
 
-        # 1. Ground Truth Accuracy (handles interval notation and boxed answers flexibly)
-        is_match = (
-            (norm_ref in norm_ans)
-            or (norm_ans == norm_ref)
-            or (norm_ref and norm_ref in norm_full)
-            or (reference_answer.strip().lower() in answer.lower())
-        )
+        # 1. Ground Truth Accuracy (handles float/integer equivalence, interval notation, and boxed answers)
+        is_match = False
+        try:
+            ref_num = float(norm_ref)
+            ans_numbers = [float(x) for x in re.findall(r"[-+]?(?:\d*\.\d+|\d+)", answer)]
+            if any(abs(n - ref_num) < 1e-4 for n in ans_numbers):
+                is_match = True
+            else:
+                boxed_nums = [float(x) for x in re.findall(r"[-+]?(?:\d*\.\d+|\d+)", norm_ans)]
+                if any(abs(n - ref_num) < 1e-4 for n in boxed_nums):
+                    is_match = True
+        except (ValueError, TypeError):
+            pass
+
+        if not is_match:
+            is_match = (
+                (norm_ref in norm_ans)
+                or (norm_ans == norm_ref)
+                or (norm_ref and norm_ref in norm_full)
+                or (reference_answer.strip().lower() in answer.lower())
+            )
         accuracy_score = 0.35 if is_match else -0.40
 
         # 2. Formatting (Numbered steps / structured reasoning)
@@ -691,16 +707,20 @@ class ChunkedGRPOLoss(nn.Module):
 EFFORT_TIERS_LIST: List[str] = ["low", "medium", "high", "xhigh", "ultra", "max"]
 
 
-def download_bigmath2(
-    dataset_name: str = "Nihilux/BigMath2",
-    cache_file: str = "local_trainer/data/bigmath2.jsonl",
+def download_math_dataset(
+    dataset_name: str = "math-ai/TemplateGSM",
+    cache_file: Optional[str] = None,
     max_samples: int = 10000,
     hf_token: Optional[str] = None,
 ) -> str:
     """
-    Downloads / caches Nihilux/BigMath2 to local disk.
-    Assigns a balanced round-robin effort tier across [low, medium, high, xhigh, ultra, max].
+    Downloads / caches a math dataset (e.g. math-ai/TemplateGSM, Nihilux/BigMath2) to local disk.
+    Extracts problem and answer/result, annotating each sample with the dataset source and an effort tier.
     """
+    if cache_file is None:
+        safe_name = dataset_name.replace("/", "_").replace("\\", "_")
+        cache_file = f"local_trainer/data/{safe_name}.jsonl"
+
     os.makedirs(os.path.dirname(os.path.abspath(cache_file)), exist_ok=True)
     if os.path.exists(cache_file) and os.path.getsize(cache_file) > 1000:
         print(f"[Data] Found local cached dataset: {cache_file} ({os.path.getsize(cache_file)/1e6:.1f} MB)")
@@ -709,18 +729,28 @@ def download_bigmath2(
     print(f"[Data] Streaming {dataset_name} from Hugging Face...")
     from datasets import load_dataset
     token = hf_token or os.environ.get("HF_TOKEN") or None
-    ds = load_dataset(dataset_name, split="train", streaming=True, token=token)
+
+    try:
+        ds = load_dataset(dataset_name, split="train", streaming=True, token=token)
+    except Exception as e:
+        print(f"[Data] Notice: standard streaming load for {dataset_name} reported: {e}. Trying default config...")
+        try:
+            ds = load_dataset(dataset_name, "templategsm-1000-1k", split="train", streaming=True, token=token)
+        except Exception:
+            ds = load_dataset(dataset_name, split="train", token=token)
 
     count = 0
     with open(cache_file, "w", encoding="utf-8") as f:
         for item in ds:
             prob = item.get("problem") or item.get("question") or ""
-            ans = item.get("answer") or item.get("solution") or ""
+            # Support TemplateGSM ('result'), BigMath2 / GSM8K ('answer', 'solution')
+            ans = item.get("result") or item.get("answer") or item.get("solution") or ""
             if not prob or not ans:
                 continue
             tier = EFFORT_TIERS_LIST[count % len(EFFORT_TIERS_LIST)]
             f.write(json.dumps({
                 "idx": count,
+                "dataset": dataset_name,
                 "problem": str(prob).strip(),
                 "answer": str(ans).strip(),
                 "effort_tier": tier,
@@ -729,8 +759,12 @@ def download_bigmath2(
             if count >= max_samples:
                 break
 
-    print(f"[Data] Cached {count} math problems to {cache_file} (balanced across 6 effort tiers)")
+    print(f"[Data] Cached {count} math problems from '{dataset_name}' to {cache_file} (balanced across 6 effort tiers)")
     return cache_file
+
+
+# Backward compatibility alias
+download_bigmath2 = download_math_dataset
 
 
 def stream_math_data_from_disk(file_path: str) -> Generator[Dict[str, Any], None, None]:
@@ -754,8 +788,9 @@ class StepAuditor:
     Dedicated 'effort_tier' column enables studying token scaling per effort level.
     """
 
-    def __init__(self, log_dir: str = "local_trainer/generations_200_steps"):
+    def __init__(self, log_dir: str = "local_trainer/generations_200_steps", dataset_name: str = "math-ai/TemplateGSM"):
         self.log_dir = log_dir
+        self.dataset_name = dataset_name
         os.makedirs(self.log_dir, exist_ok=True)
         self.jsonl_file = os.path.join(self.log_dir, "all_generations.jsonl")
         self.tabular_jsonl = os.path.join(self.log_dir, "generations_table.jsonl")
@@ -780,13 +815,16 @@ class StepAuditor:
         rollouts: List[Dict[str, Any]],
         elapsed: float,
         effort_tier: str = "high",
+        dataset_name: Optional[str] = None,
     ):
         tier_key = str(effort_tier).lower()
+        ds_name = dataset_name or self.dataset_name
         self.effort_stats[tier_key]["steps"] += 1
 
         tabular_rows = []
         for r in rollouts:
             r["effort_tier"] = tier_key
+            r["dataset"] = ds_name
             st = self.effort_stats[tier_key]
             st["rollouts"] += 1
             st["total_tokens"] += r.get("token_count", 0)
@@ -809,6 +847,7 @@ class StepAuditor:
             cols = r.get("column_scores", {})
             tabular_rows.append({
                 "step": step,
+                "dataset": ds_name,
                 "problem": problem,
                 "reference_answer": reference,
                 "effort_tier": tier_key,
@@ -830,6 +869,7 @@ class StepAuditor:
 
         record = {
             "step": step,
+            "dataset": ds_name,
             "effort_tier": tier_key,
             "problem": problem,
             "reference_answer": reference,
@@ -850,7 +890,7 @@ class StepAuditor:
         if tabular_rows:
             import csv
             csv_fields = [
-                "step", "effort_tier", "rollout_idx", "token_count", "total_reward",
+                "step", "dataset", "effort_tier", "rollout_idx", "token_count", "total_reward",
                 "accuracy_reward", "formatting_reward", "efficiency_reward", "advantage",
                 "is_correct", "valid_think_tags", "unclosed_think_tag", "repetitive_loop",
                 "problem", "reference_answer", "final_answer"
@@ -1067,6 +1107,7 @@ def run_standalone_math_grpo(
     model_name_or_path: str = "Qwen/Qwen3-30B-A3B",
     checkpoint_lora: str = "checkpoint-2200",
     checkpoint_repo: str = "Nihilux/SpringHunter",
+    dataset_name: str = "math-ai/TemplateGSM",
     effort_tier: str = "balanced",
     hf_token: Optional[str] = None,
     repo_id: str = "Nihilux/sword-grpo-200-steps",
@@ -1076,13 +1117,19 @@ def run_standalone_math_grpo(
     steps: int = 200,
     lr: float = 5e-6,
     use_fp8: bool = True,
+    study_mode: bool = False,
+    max_samples: Optional[int] = None,
+    verbose_study: bool = True,
 ):
     setup_blackwell_environment()
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    mode_str = "🔍 STUDY & AUDIT ONLY (No training/backprop)" if study_mode else "⚡ FULL REINFORCEMENT TRAINING (GDPO)"
     print("=" * 72)
-    print(" 🚀 STANDALONE MATH GRPO TRAINER (Nihilux/BigMath2)")
+    print(f" 🚀 STANDALONE MATH GRPO ENGINE ({dataset_name})")
+    print(f" Operating Mode:  {mode_str}")
     print(f" Base Model:      {model_name_or_path}")
+    print(f" Dataset:         {dataset_name}")
     print(f" LoRA Checkpoint: {checkpoint_lora} (Store: {checkpoint_repo})")
     print(f" Effort Mode:     {effort_tier.upper()} (Balanced round-robin across 6 tiers if 'balanced')")
     print(f" Context Window:  {max_seq_len} tokens (32k context, max new: {max_new_tokens})")
@@ -1092,10 +1139,15 @@ def run_standalone_math_grpo(
     print(f" Device:          {device}")
     print("=" * 72)
 
-    # 1. Download & Prepare Dataset
-    data_file = download_bigmath2(
-        dataset_name="Nihilux/BigMath2",
-        cache_file="local_trainer/data/bigmath2.jsonl",
+    # 1. Download & Prepare Dataset (download just enough samples for this study run)
+    if max_samples is None:
+        effective_samples = max(steps * 2, 200)
+    else:
+        effective_samples = max_samples
+
+    data_file = download_math_dataset(
+        dataset_name=dataset_name,
+        max_samples=effective_samples,
         hf_token=hf_token,
     )
     streamer = stream_math_data_from_disk(data_file)
@@ -1288,7 +1340,7 @@ def run_standalone_math_grpo(
     # 6. Initialize Scorer, Loss, Auditor, Optimizer
     scorer = MathScorer()
     loss_fn = ChunkedGRPOLoss(chunk_size=512)
-    auditor = StepAuditor()
+    auditor = StepAuditor(dataset_name=dataset_name)
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable_params, lr=lr)
 
@@ -1299,6 +1351,7 @@ def run_standalone_math_grpo(
         item = next(streamer)
         problem_text = item["problem"]
         ref_answer = item["answer"]
+        item_dataset = item.get("dataset", dataset_name)
 
         # Resolve effort tier for this step (balanced round-robin vs forced single tier)
         if effort_tier.lower() in ("balanced", "all"):
@@ -1337,6 +1390,10 @@ def run_standalone_math_grpo(
             res["full_text"] = text
             res["token_count"] = token_count
             res["effort_tier"] = step_effort
+            res["dataset"] = item_dataset
+            res["acc_reward"] = res.get("column_scores", {}).get("accuracy", 0.0)
+            res["format_reward"] = res.get("column_scores", {}).get("formatting", 0.0)
+            res["effort_reward"] = res.get("column_scores", {}).get("efficiency", 0.0)
             rollout_results.append(res)
 
         advantages, col_advantages = compute_gdpo_advantages(rollout_results)
@@ -1344,58 +1401,79 @@ def run_standalone_math_grpo(
             rollout_results[idx]["advantage"] = adv
 
         # Phase C: Training / Backward Step (Micro-batched per rollout with gradient accumulation)
-        print(f"[Step {step:03d}/{steps:03d} | {step_effort.upper():<6}] 🔄 Scoring & Backprop (rollouts 1/{num_rollouts}..{num_rollouts}/{num_rollouts})...", end="", flush=True)
-        model.train()
-        if hasattr(model, "config"):
-            model.config.use_cache = False
-        optimizer.zero_grad()
-
         total_step_loss = 0.0
-        p_ids = tokenizer.encode(problem_text, add_special_tokens=False)
-        p_len = len(p_ids)
+        if not study_mode:
+            print(f"[Step {step:03d}/{steps:03d} | {step_effort.upper():<6}] 🔄 Scoring & Backprop (rollouts 1/{num_rollouts}..{num_rollouts}/{num_rollouts})...", end="", flush=True)
+            model.train()
+            if hasattr(model, "config"):
+                model.config.use_cache = False
+            optimizer.zero_grad()
 
-        for i, res in enumerate(rollout_results):
-            r_ids = tokenizer.encode(res["full_text"], add_special_tokens=False)
-            combo = p_ids + r_ids
-            cur_input = torch.tensor([combo], dtype=torch.long, device=device)
-            cur_mask = torch.ones_like(cur_input)
-            adv_i = float(advantages[i])
+            p_ids = tokenizer.encode(problem_text, add_special_tokens=False)
+            p_len = len(p_ids)
 
-            loss_i, _ = loss_fn.forward_single(
-                model=model,
-                input_ids=cur_input,
-                attention_mask=cur_mask,
-                prompt_length=p_len,
-                advantage=adv_i,
-            )
+            for i, res in enumerate(rollout_results):
+                r_ids = tokenizer.encode(res["full_text"], add_special_tokens=False)
+                combo = p_ids + r_ids
+                cur_input = torch.tensor([combo], dtype=torch.long, device=device)
+                cur_mask = torch.ones_like(cur_input)
+                adv_i = float(advantages[i])
 
-            scaled_loss = loss_i / num_rollouts
-            scaled_loss.backward()
-            total_step_loss += loss_i.item()
+                loss_i, _ = loss_fn.forward_single(
+                    model=model,
+                    input_ids=cur_input,
+                    attention_mask=cur_mask,
+                    prompt_length=p_len,
+                    advantage=adv_i,
+                )
 
-            del cur_input, cur_mask, loss_i, scaled_loss
+                scaled_loss = loss_i / num_rollouts
+                scaled_loss.backward()
+                total_step_loss += loss_i.item()
 
-        torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
-        optimizer.step()
-        print(" done")
+                del cur_input, cur_mask, loss_i, scaled_loss
+
+            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+            optimizer.step()
+            print(" done")
+        else:
+            print(f"[Step {step:03d}/{steps:03d} | {step_effort.upper():<6}] 🔍 Study Mode: Evaluated {num_rollouts} rollouts (Backprop skipped)")
 
         elapsed = time.perf_counter() - t_start
         vram_gb = torch.cuda.memory_allocated() / (1024**3) if torch.cuda.is_available() else 0.0
 
-        # Phase D: Record Generation Audit with dedicated effort_tier column
-        auditor.record(step, problem_text, ref_answer, rollout_results, elapsed, effort_tier=step_effort)
+        # Phase D: Record Generation Audit with dedicated effort_tier and dataset columns
+        auditor.record(step, problem_text, ref_answer, rollout_results, elapsed, effort_tier=step_effort, dataset_name=item_dataset)
 
         mean_acc = sum(r.get("acc_reward", 0.0) for r in rollout_results) / len(rollout_results)
         mean_fmt = sum(r.get("format_reward", 0.0) for r in rollout_results) / len(rollout_results)
         mean_eff = sum(r.get("effort_reward", 0.0) for r in rollout_results) / len(rollout_results)
         mean_total = sum(r.get("total_reward", 0.0) for r in rollout_results) / len(rollout_results)
 
+        loss_str = f"{total_step_loss / num_rollouts:.4f}" if not study_mode else "N/A (study)"
         print(
             f"[Step {step:03d}/{steps:03d} | {step_effort.upper():<6}] "
             f"Acc: {mean_acc:.2f} | Fmt: {mean_fmt:.2f} | Eff: {mean_eff:+.2f} | "
-            f"Total: {mean_total:+.2f} | Loss: {total_step_loss / num_rollouts:.4f} | "
-            f"VRAM: {vram_gb:.1f} GB | Step Time: {elapsed:.2f}s\n"
+            f"Total: {mean_total:+.2f} | Loss: {loss_str} | "
+            f"VRAM: {vram_gb:.1f} GB | Step Time: {elapsed:.2f}s"
         )
+
+        # Live Study Preview: inspect model's thinking and answers in real-time
+        if study_mode or verbose_study:
+            print(f"{'─'*72}")
+            print(f"📖 STUDY SAMPLE [Step {step:03d}/{steps:03d} | {step_effort.upper()}]")
+            print(f"❓ Problem:  {problem_text}")
+            print(f"🎯 Expected: {ref_answer}")
+            for idx, ro in enumerate(rollout_results):
+                status = "✅ Correct" if ro.get("is_correct") else "❌ Incorrect"
+                final_ans = ro.get("final_answer", "").strip() or "(no answer found)"
+                trace = ro.get("reasoning_trace", "").strip()
+                trace_preview = (trace[:240] + "...") if len(trace) > 240 else trace
+                print(f"   [Rollout {idx+1}/{num_rollouts} | {status} | Total Reward: {ro.get('total_reward', 0.0):+.2f} | Tokens: {ro.get('token_count', 0)}]")
+                if trace_preview:
+                    print(f"     <think> {trace_preview} </think>")
+                print(f"     Answer: {final_ans}")
+            print(f"{'─'*72}\n")
 
         del rollout_results
         gc.collect()
@@ -1411,28 +1489,34 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-30B-A3B")
     parser.add_argument("--checkpoint", type=str, default="checkpoint-2200")
+    parser.add_argument("--dataset", type=str, default="math-ai/TemplateGSM", help="Dataset name on Hugging Face (default: math-ai/TemplateGSM)")
+    parser.add_argument("--study_mode", "--study", action="store_true", help="Study mode: generate and audit model answers without backpropagation training")
+    parser.add_argument("--max_samples", type=int, default=None, help="Maximum dataset samples to download/cache")
     parser.add_argument("--repo_id", type=str, default=os.environ.get("HF_UPLOAD_REPO_ID", "Nihilux/sword-grpo-200-steps"))
     parser.add_argument("--token", type=str, default=os.environ.get("HF_TOKEN", ""))
     parser.add_argument("--effort_tier", type=str, default="balanced", choices=["balanced", "all", "low", "medium", "high", "xhigh", "ultra", "max"], help="Reasoning effort tier or 'balanced' for round-robin split across all 6 tiers")
     parser.add_argument("--steps", type=int, default=200)
-    parser.add_argument("--test_stream_only", action="store_true", help="Only stream 1 row of Nihilux/BigMath2 to inspect and exit")
+    parser.add_argument("--test_stream_only", action="store_true", help="Only stream 1 row of dataset to inspect and exit")
     args = parser.parse_args()
 
     if args.test_stream_only:
-        data_file = download_bigmath2(dataset_name="Nihilux/BigMath2", hf_token=args.token or None)
+        data_file = download_math_dataset(dataset_name=args.dataset, hf_token=args.token or None)
         streamer = stream_math_data_from_disk(data_file)
         row = next(streamer)
-        print("\n[Test Stream] Inspected 1 sample row:")
+        print(f"\n[Test Stream] Inspected 1 sample row from {args.dataset}:")
         print(json.dumps(row, indent=2))
         sys.exit(0)
 
     run_standalone_math_grpo(
         model_name_or_path=args.model,
         checkpoint_lora=args.checkpoint,
+        dataset_name=args.dataset,
         repo_id=args.repo_id,
         hf_token=args.token,
         effort_tier=args.effort_tier,
         steps=args.steps,
+        study_mode=args.study_mode,
+        max_samples=args.max_samples,
     )
 
 
