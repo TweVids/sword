@@ -439,9 +439,17 @@ class MathScorer:
         format_score = 0.0
 
         # A. Check for bullet points, numbered lists, or markdown headers in thinking trace
-        has_bullets_in_trace = bool(re.search(r"^\s*[-*•]\s+", trace, re.MULTILINE))
-        has_numbered_in_trace = bool(re.search(r"^\s*\d+[\.)]\s+", trace, re.MULTILINE))
-        has_headers_in_trace = bool(re.search(r"^\s*#{1,6}\s+", trace, re.MULTILINE))
+        # Strip display math environments ($$..$$, \[..\], \begin{..}..\end{..}) before bullet checking
+        # so equations containing minus signs, asterisks or numbered tags are not penalized as bullets.
+        trace_text_for_lists = re.sub(
+            r"\$\$.*?\$\$|\\\[.*?\\\]|\\begin\{[a-z*]*\}.*?\\end\{[a-z*]*\}",
+            "",
+            trace,
+            flags=re.DOTALL,
+        )
+        has_bullets_in_trace = bool(re.search(r"^\s*[-*•]\s+(?!\s*[\d\w\\$].*?[=<>])", trace_text_for_lists, re.MULTILINE))
+        has_numbered_in_trace = bool(re.search(r"^\s*\d+[\.)]\s+", trace_text_for_lists, re.MULTILINE))
+        has_headers_in_trace = bool(re.search(r"^\s*#{1,6}\s+", trace_text_for_lists, re.MULTILINE))
 
         if has_bullets_in_trace or has_numbered_in_trace or has_headers_in_trace:
             format_score -= 0.15
@@ -458,7 +466,12 @@ class MathScorer:
                 paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", trace) if len(p.strip()) > 15]
                 if paragraphs:
                     def count_sentences(p: str) -> int:
-                        cleaned = re.sub(r"\$\$.*?\$\$|\$.*?\$", " FORMULA ", p, flags=re.DOTALL)
+                        cleaned = re.sub(
+                            r"\$\$.*?\$\$|\$.*?\$|\\\[.*?\\\]|\\\(.*?\\\)|\s*\\begin\{[a-z*]*\}.*?\\end\{[a-z*]*\}",
+                            " FORMULA ",
+                            p,
+                            flags=re.DOTALL,
+                        )
                         return len([s for s in re.split(r"(?<=[.!?])\s+", cleaned) if len(s.strip()) > 4])
                     counts = [count_sentences(p) for p in paragraphs]
                     avg_sents = sum(counts) / len(counts)
@@ -750,7 +763,14 @@ class ChunkedGRPOLoss(nn.Module):
         surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * adv_tensor
         policy_loss = -torch.min(surr1, surr2).mean()
 
-        return policy_loss, {"grpo_loss": round(policy_loss.item(), 5)}
+        token_nll = -policy_logprobs.mean().item()
+        pg_loss = -(policy_logprobs * adv_tensor).mean().item()
+
+        return policy_loss, {
+            "grpo_loss": round(policy_loss.item(), 5),
+            "nll": round(token_nll, 4),
+            "pg_loss": round(pg_loss, 4),
+        }
 
 
 # =====================================================================
@@ -868,6 +888,8 @@ class StepAuditor:
         elapsed: float,
         effort_tier: str = "high",
         dataset_name: Optional[str] = None,
+        step_loss: Optional[float] = None,
+        grad_norm: Optional[float] = None,
     ):
         tier_key = str(effort_tier).lower()
         ds_name = dataset_name or self.dataset_name
@@ -914,6 +936,8 @@ class StepAuditor:
                 "valid_think_tags": has_valid_tags,
                 "unclosed_think_tag": is_unclosed,
                 "repetitive_loop": has_loop,
+                "step_loss": round(step_loss, 4) if step_loss is not None else None,
+                "grad_norm": round(grad_norm, 4) if grad_norm is not None else None,
                 "final_answer": r.get("final_answer", ""),
                 "reasoning_trace": r.get("reasoning_trace", ""),
                 "full_text": r.get("full_text", ""),
@@ -926,6 +950,8 @@ class StepAuditor:
             "problem": problem,
             "reference_answer": reference,
             "elapsed_sec": round(elapsed, 2),
+            "step_loss": round(step_loss, 4) if step_loss is not None else None,
+            "grad_norm": round(grad_norm, 4) if grad_norm is not None else None,
             "rollouts": rollouts,
         }
         step_path = os.path.join(self.log_dir, f"step_{step:04d}.json")
@@ -1471,6 +1497,8 @@ def run_standalone_math_grpo(
 
         # Phase C: Training / Backward Step (Micro-batched per rollout with gradient accumulation)
         total_step_loss = 0.0
+        total_step_nll = 0.0
+        grad_norm_val = 0.0
         if not study_mode:
             print(f"[Step {step:03d}/{steps:03d} | {step_effort.upper():<6}] 🔄 Scoring & Backprop (rollouts 1/{num_rollouts}..{num_rollouts}/{num_rollouts})...", end="", flush=True)
             model.train()
@@ -1488,7 +1516,7 @@ def run_standalone_math_grpo(
                 cur_mask = torch.ones_like(cur_input)
                 adv_i = float(advantages[i])
 
-                loss_i, _ = loss_fn.forward_single(
+                loss_i, metrics_i = loss_fn.forward_single(
                     model=model,
                     input_ids=cur_input,
                     attention_mask=cur_mask,
@@ -1499,10 +1527,12 @@ def run_standalone_math_grpo(
                 scaled_loss = loss_i / num_rollouts
                 scaled_loss.backward()
                 total_step_loss += loss_i.item()
+                total_step_nll += metrics_i.get("nll", 0.0)
 
                 del cur_input, cur_mask, loss_i, scaled_loss
 
-            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+            grad_norm_val = float(grad_norm)
             optimizer.step()
             print(" done")
         else:
@@ -1511,19 +1541,27 @@ def run_standalone_math_grpo(
         elapsed = time.perf_counter() - t_start
         vram_gb = torch.cuda.memory_allocated() / (1024**3) if torch.cuda.is_available() else 0.0
 
+        avg_nll = (total_step_nll / num_rollouts) if not study_mode else 0.0
+
         # Phase D: Record Generation Audit with dedicated effort_tier and dataset columns
-        auditor.record(step, problem_text, ref_answer, rollout_results, elapsed, effort_tier=step_effort, dataset_name=item_dataset)
+        auditor.record(
+            step, problem_text, ref_answer, rollout_results, elapsed,
+            effort_tier=step_effort, dataset_name=item_dataset,
+            step_loss=avg_nll if not study_mode else None,
+            grad_norm=grad_norm_val if not study_mode else None,
+        )
 
         mean_acc = sum(r.get("acc_reward", 0.0) for r in rollout_results) / len(rollout_results)
         mean_fmt = sum(r.get("format_reward", 0.0) for r in rollout_results) / len(rollout_results)
         mean_eff = sum(r.get("effort_reward", 0.0) for r in rollout_results) / len(rollout_results)
         mean_total = sum(r.get("total_reward", 0.0) for r in rollout_results) / len(rollout_results)
 
-        loss_str = f"{total_step_loss / num_rollouts:.4f}" if not study_mode else "N/A (study)"
+        loss_str = f"{avg_nll:.4f}" if not study_mode else "N/A (study)"
+        grad_str = f"{grad_norm_val:.2f}" if not study_mode else "N/A"
         print(
             f"[Step {step:03d}/{steps:03d} | {step_effort.upper():<6}] "
             f"Acc: {mean_acc:.2f} | Fmt: {mean_fmt:.2f} | Eff: {mean_eff:+.2f} | "
-            f"Total: {mean_total:+.2f} | Loss: {loss_str} | "
+            f"Total: {mean_total:+.2f} | Loss: {loss_str} | |g|: {grad_str} | "
             f"VRAM: {vram_gb:.1f} GB | Step Time: {elapsed:.2f}s"
         )
 

@@ -221,6 +221,21 @@ class TestMathScorerFormatting(unittest.TestCase):
         self.assertNotIn("bullet_or_list_in_thinking", res["audit_log"])
         self.assertTrue(res["audit_log"].get("natural_paragraph_thinking_rewarded"))
 
+    def test_latex_display_math_and_negative_equations_not_penalized_as_bullets(self):
+        text = (
+            "<think>\n"
+            "We solve the projectile equation under standard gravity.\n"
+            "\\[ h(t) = -16t^2 + 64t + 80 \\]\n"
+            "Setting the height equation equal to zero yields the time of impact:\n"
+            "- 16t^2 + 64t + 80 = 0\n"
+            "Factoring out -16 gives (t - 5)(t + 1) = 0. Therefore t = 5.\n"
+            "</think>\n"
+            "\\boxed{5}"
+        )
+        res = self.scorer.score("prob", "5", text, effort_tier="low")
+        self.assertNotIn("bullet_or_list_in_thinking", res["audit_log"])
+        self.assertTrue(res["audit_log"].get("natural_paragraph_thinking_rewarded"))
+
     def test_outside_think_paragraph_rewarded(self):
         text = (
             "<think>\n"
@@ -280,6 +295,21 @@ class TestParagraphSentenceDepth(unittest.TestCase):
         text = "<think> Just one quick sentence. </think> \\boxed{357}"
         res = self.scorer.score("prob", "357", text, effort_tier="xhigh", dataset_name="math-ai/TemplateGSM")
         self.assertTrue(res["audit_log"].get("shallow_paragraphs_penalty"))
+
+    def test_display_math_inside_paragraph_sentence_counting(self):
+        text = (
+            "<think>\n"
+            "We consider the indefinite integral of the exponential decay function. "
+            "\\[ \\int e^{-2x} dx = -\\frac{1}{2}e^{-2x} + C \\] "
+            "Evaluating this antiderivative from zero to infinity gives the total area. "
+            "At infinity the exponential term approaches zero identically. "
+            "Therefore the definite integral converges to exactly 0.5.\n"
+            "</think>\n"
+            "\\boxed{0.5}"
+        )
+        res = self.scorer.score("prob", "0.5", text, effort_tier="medium", dataset_name="Nihilux/BigMath2")
+        self.assertTrue(res["audit_log"].get("deep_paragraph_sentences_rewarded"))
+        self.assertNotIn("shallow_paragraphs_penalty", res["audit_log"])
 
 
 class TestSystemPromptsAndOrdering(unittest.TestCase):
@@ -366,6 +396,9 @@ class TestChunkedGRPOLossAndMicrobatch(unittest.TestCase):
         self.assertTrue(torch.is_tensor(loss))
         self.assertTrue(loss.requires_grad)
         self.assertFalse(torch.isnan(loss))
+        self.assertIn("nll", metrics)
+        self.assertGreater(metrics["nll"], 0.0)
+        self.assertIn("pg_loss", metrics)
 
         # Backward pass
         loss.backward()
@@ -409,6 +442,8 @@ class TestStepAuditor(unittest.TestCase):
             elapsed=1.23,
             effort_tier="low",
             dataset_name="math-ai/TemplateGSM",
+            step_loss=1.4520,
+            grad_norm=0.38,
         )
 
         # Check step JSON file
@@ -418,6 +453,8 @@ class TestStepAuditor(unittest.TestCase):
             data = json.load(f)
             self.assertEqual(data["dataset"], "math-ai/TemplateGSM")
             self.assertEqual(data["step"], 1)
+            self.assertEqual(data["step_loss"], 1.4520)
+            self.assertEqual(data["grad_norm"], 0.38)
 
         # Check CSV export
         csv_file = os.path.join(self.temp_dir, "generations_table.csv")
