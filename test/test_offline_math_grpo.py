@@ -43,6 +43,8 @@ from train_math_grpo import (
     format_explanation_turn_prompt,
     save_checkpoint,
     upload_checkpoint_to_hf,
+    prepare_study_records,
+    get_step_schedule,
     ChunkedGRPOLoss,
     StepAuditor,
     format_effort_prompt,
@@ -947,5 +949,143 @@ class TestCheckpointSavingAndUpload(unittest.TestCase):
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+class TestStepSchedule(unittest.TestCase):
+    """Verifies solve/explain batch switching, effort cycling, and problem pairing."""
+
+    def setUp(self):
+        # 100 mock problems mimicking the canonical dataset order
+        self.mock_records = [
+            {"idx": i, "dataset": "gsm8k" if i < 35 else ("aops_c4_high_school_math" if i < 65 else "BigMath2"), "problem": f"P{i}", "answer": f"A{i}"}
+            for i in range(100)
+        ]
+
+    def test_effort_cycle_solving_then_explaining_batches(self):
+        expected_tiers = ["low", "medium", "high", "xhigh", "ultra", "max"]
+
+        # Batch 1 (Steps 1..6): Solving batch through all 6 efforts
+        for s in range(1, 7):
+            sched = get_step_schedule(step=s, total_steps=200, records=self.mock_records, explanation_mode="effort_cycle")
+            self.assertFalse(sched["is_explain_step"], f"Step {s} should be SOLVE")
+            self.assertEqual(sched["mode_label"], "SOLVE")
+            self.assertEqual(sched["step_effort"], expected_tiers[s - 1])
+
+        # Batch 2 (Steps 7..12): Explaining batch through all 6 efforts
+        for s in range(7, 13):
+            sched = get_step_schedule(step=s, total_steps=200, records=self.mock_records, explanation_mode="effort_cycle")
+            self.assertTrue(sched["is_explain_step"], f"Step {s} should be EXPLAIN")
+            self.assertEqual(sched["mode_label"], "EXPLAIN")
+            self.assertEqual(sched["step_effort"], expected_tiers[s - 7])
+
+        # Step 13 starts next solving batch with low effort
+        sched13 = get_step_schedule(step=13, total_steps=200, records=self.mock_records, explanation_mode="effort_cycle")
+        self.assertFalse(sched13["is_explain_step"])
+        self.assertEqual(sched13["mode_label"], "SOLVE")
+        self.assertEqual(sched13["step_effort"], "low")
+
+    def test_paired_problem_reuse_in_effort_cycle(self):
+        # Steps 1..6 and Steps 7..12 should solve then explain the EXACT same problems 0..5
+        for i in range(6):
+            solve_sched = get_step_schedule(step=i + 1, total_steps=200, records=self.mock_records, explanation_mode="effort_cycle", pair_problems=True)
+            explain_sched = get_step_schedule(step=i + 7, total_steps=200, records=self.mock_records, explanation_mode="effort_cycle", pair_problems=True)
+            self.assertEqual(solve_sched["problem_index"], explain_sched["problem_index"], f"Effort tier {i} should solve and explain same problem")
+            self.assertEqual(solve_sched["problem_index"], i)
+
+        # Steps 13..18 should move to next problems 6..11
+        for i in range(6):
+            solve_sched2 = get_step_schedule(step=i + 13, total_steps=200, records=self.mock_records, explanation_mode="effort_cycle", pair_problems=True)
+            explain_sched2 = get_step_schedule(step=i + 19, total_steps=200, records=self.mock_records, explanation_mode="effort_cycle", pair_problems=True)
+            self.assertEqual(solve_sched2["problem_index"], explain_sched2["problem_index"])
+            self.assertEqual(solve_sched2["problem_index"], i + 6)
+
+    def test_unpaired_streaming(self):
+        # With pair_problems=False, problem indices advance sequentially
+        for s in range(1, 13):
+            sched = get_step_schedule(step=s, total_steps=200, records=self.mock_records, explanation_mode="effort_cycle", pair_problems=False)
+            self.assertEqual(sched["problem_index"], s - 1)
+
+    def test_interleaved_mode(self):
+        # Step 1: SOLVE (P0, low), Step 2: EXPLAIN (P0, low)
+        s1 = get_step_schedule(step=1, total_steps=200, records=self.mock_records, explanation_mode="interleaved", pair_problems=True)
+        s2 = get_step_schedule(step=2, total_steps=200, records=self.mock_records, explanation_mode="interleaved", pair_problems=True)
+        self.assertFalse(s1["is_explain_step"])
+        self.assertTrue(s2["is_explain_step"])
+        self.assertEqual(s1["problem_index"], s2["problem_index"])
+
+    def test_split_mode(self):
+        # Steps 1..100 SOLVE, Steps 101..200 EXPLAIN
+        s100 = get_step_schedule(step=100, total_steps=200, records=self.mock_records, explanation_mode="split")
+        s101 = get_step_schedule(step=101, total_steps=200, records=self.mock_records, explanation_mode="split")
+        self.assertFalse(s100["is_explain_step"])
+        self.assertTrue(s101["is_explain_step"])
+
+
+class TestPrepareStudyRecords(unittest.TestCase):
+    """Verifies that dataset records follow strict order or stratified shuffle."""
+
+    def test_strict_order_preservation(self):
+        temp_dir = tempfile.mkdtemp()
+        try:
+            fpath = os.path.join(temp_dir, "test_dataset.jsonl")
+            with open(fpath, "w", encoding="utf-8") as f:
+                for i in range(10):
+                    f.write(json.dumps({"idx": i, "dataset": "gsm8k" if i < 4 else ("aops_c4" if i < 7 else "BigMath2")}) + "\n")
+
+            # With shuffle_mode=False, order must be strictly preserved
+            recs = prepare_study_records(fpath, shuffle_mode=False)
+            self.assertEqual(len(recs), 10)
+            self.assertEqual([r["idx"] for r in recs], list(range(10)))
+            self.assertEqual(recs[0]["dataset"], "gsm8k")
+            self.assertEqual(recs[4]["dataset"], "aops_c4")
+            self.assertEqual(recs[7]["dataset"], "BigMath2")
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_stratified_shuffling_interleaves_datasets(self):
+        temp_dir = tempfile.mkdtemp()
+        try:
+            fpath = os.path.join(temp_dir, "test_strat.jsonl")
+            with open(fpath, "w", encoding="utf-8") as f:
+                for i in range(30):
+                    f.write(json.dumps({"idx": i, "dataset": "gsm8k" if i < 10 else ("aops_c4_high_school_math" if i < 20 else "BigMath2")}) + "\n")
+
+            recs = prepare_study_records(fpath, shuffle_mode="stratified", seed=42)
+            self.assertEqual(len(recs), 30)
+            # Triplet round-robin: first 3 must have 1 from each
+            first_three_datasets = set(r["dataset"] for r in recs[:3])
+            self.assertEqual(len(first_three_datasets), 3)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+class TestStepAuditorStepMode(unittest.TestCase):
+    """Verifies StepAuditor records step_mode ('SOLVE' vs 'EXPLAIN')."""
+
+    def test_auditor_records_step_mode(self):
+        temp_dir = tempfile.mkdtemp()
+        try:
+            auditor = StepAuditor(log_dir=temp_dir, dataset_name="curated_study_100")
+            dummy_ro = [{
+                "rollout_index": 0, "token_count": 100, "total_reward": 0.5,
+                "is_correct": True, "final_answer": "42", "reasoning_trace": "test",
+                "component_scores": {"thinking_tags": 0.1}, "column_scores": {"accuracy": 0.3, "formatting": 0.2, "efficiency": 0.0}
+            }]
+            auditor.record(1, "Prob 1", "42", dummy_ro, elapsed=1.0, effort_tier="low", step_mode="SOLVE")
+            auditor.record(2, "Prob 1", "42", dummy_ro, elapsed=1.0, effort_tier="low", step_mode="EXPLAIN")
+
+            with open(auditor.jsonl_file, "r", encoding="utf-8") as f:
+                lines = [json.loads(l) for l in f if l.strip()]
+            self.assertEqual(len(lines), 2)
+            self.assertEqual(lines[0]["step_mode"], "SOLVE")
+            self.assertEqual(lines[1]["step_mode"], "EXPLAIN")
+
+            with open(auditor.tabular_jsonl, "r", encoding="utf-8") as f:
+                tab_lines = [json.loads(l) for l in f if l.strip()]
+            self.assertEqual(tab_lines[0]["step_mode"], "SOLVE")
+            self.assertEqual(tab_lines[1]["step_mode"], "EXPLAIN")
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()
+

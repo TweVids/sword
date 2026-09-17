@@ -21,8 +21,9 @@ import json
 import math
 import time
 import zipfile
+import random
 import argparse
-from typing import List, Dict, Any, Tuple, Optional, Generator
+from typing import List, Dict, Any, Tuple, Optional, Generator, Union
 from collections import defaultdict
 from dataclasses import dataclass, field
 
@@ -1401,6 +1402,179 @@ def stream_math_data_from_disk(file_path: str) -> Generator[Dict[str, Any], None
                     gc.collect()
 
 
+def prepare_study_records(
+    file_path: str,
+    shuffle_mode: Union[bool, str] = "stratified",
+    seed: int = 42,
+) -> List[Dict[str, Any]]:
+    """
+    Loads records from JSONL file on disk and optionally applies deterministic shuffling.
+    Modes:
+      - True / "stratified" / "balanced": Groups by dataset source (GSM8K, AoPS C4, BigMath2),
+        shuffles within each source, and round-robin interleaves them. This guarantees that
+        every consecutive window has an even distribution of all problem sources.
+      - "random" / "uniform": Shuffles all problems uniformly at random using the seed.
+      - False / "none" / "off": Preserves canonical file order.
+    """
+    records: List[Dict[str, Any]] = []
+    with open(file_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+
+    if not records:
+        return records
+
+    mode_str = str(shuffle_mode).lower().strip()
+    if mode_str in ("false", "none", "off", "0", "no"):
+        return records
+
+    rng = random.Random(seed)
+
+    if mode_str in ("true", "stratified", "balanced", "interleaved", "1", "yes"):
+        # Split into dataset buckets
+        gsm_list = [r for r in records if "gsm" in r.get("dataset", "").lower()]
+        aops_list = [r for r in records if "aops" in r.get("dataset", "").lower()]
+        bm_list = [r for r in records if "bigmath" in r.get("dataset", "").lower()]
+        other_list = [
+            r for r in records
+            if r not in gsm_list and r not in aops_list and r not in bm_list
+        ]
+
+        # Shuffle each bucket independently
+        rng.shuffle(gsm_list)
+        rng.shuffle(aops_list)
+        rng.shuffle(bm_list)
+        rng.shuffle(other_list)
+
+        # Interleave buckets round-robin
+        buckets = [b for b in [gsm_list, aops_list, bm_list, other_list] if b]
+        interleaved: List[Dict[str, Any]] = []
+        while any(len(b) > 0 for b in buckets):
+            for b in buckets:
+                if b:
+                    interleaved.append(b.pop(0))
+        return interleaved
+
+    # Default fallback: uniform random permutation
+    shuffled = list(records)
+    rng.shuffle(shuffled)
+    return shuffled
+
+
+def get_step_schedule(
+    step: int,
+    total_steps: int = 200,
+    records: Optional[List[Dict[str, Any]]] = None,
+    explanation_mode: Union[str, bool] = "effort_cycle",
+    effort_tier: str = "balanced",
+    pair_problems: bool = True,
+) -> Dict[str, Any]:
+    """
+    Determines the operating mode (SOLVE vs EXPLAIN), effort tier, and dataset problem for a given training step.
+    
+    Supported explanation_mode values:
+      - 'effort_cycle' / 'cycle' / 'effort_blocks':
+        Passes all effort tiers (low -> max) in SOLVE mode, then passes all effort tiers in EXPLAIN mode, and repeats!
+        Cycle length = 2 * len(EFFORT_TIERS_LIST) = 12 steps.
+        Steps 1-6:   SOLVE   (low, medium, high, xhigh, ultra, max)
+        Steps 7-12:  EXPLAIN (low, medium, high, xhigh, ultra, max)
+        Steps 13-18: SOLVE   (low, medium, high, xhigh, ultra, max)
+        ...
+        If pair_problems=True: the 6 problems solved in steps 1-6 are the exact same 6 problems explained in steps 7-12!
+      - 'interleaved' / 'paired' / 'alternate':
+        Alternates SOLVE and EXPLAIN every single step:
+        Step 1: SOLVE (Problem 0, low), Step 2: EXPLAIN (Problem 0, low), Step 3: SOLVE (Problem 1, med), etc.
+      - 'split' / 'hybrid' / 'both':
+        First half (steps 1 to total_steps // 2) is SOLVE; second half is EXPLAIN.
+      - True / 'explain':
+        All steps are EXPLAIN.
+      - False / 'solve' / 'direct':
+        All steps are SOLVE.
+    """
+    num_efforts = len(EFFORT_TIERS_LIST)
+    num_records = len(records) if records else total_steps
+    mode_raw = str(explanation_mode).lower().strip()
+
+    is_explain_step = False
+    mode_label = "SOLVE"
+    tier_idx = 0
+    prob_idx = (step - 1) % num_records
+
+    if mode_raw in ("effort_cycle", "cycle", "effort_blocks", "effort_schedule", "repeat"):
+        cycle_len = num_efforts * 2  # 12 steps
+        step_in_cycle = (step - 1) % cycle_len
+        cycle_idx = (step - 1) // cycle_len
+
+        if step_in_cycle < num_efforts:
+            is_explain_step = False
+            mode_label = "SOLVE"
+            tier_idx = step_in_cycle
+        else:
+            is_explain_step = True
+            mode_label = "EXPLAIN"
+            tier_idx = step_in_cycle - num_efforts
+
+        if pair_problems and num_records > 0:
+            prob_base = (cycle_idx * num_efforts) % num_records
+            prob_idx = (prob_base + tier_idx) % num_records
+        else:
+            prob_idx = (step - 1) % num_records
+
+    elif mode_raw in ("interleaved", "paired", "alternate", "toggle", "pingpong"):
+        is_explain_step = (step % 2 == 0)
+        mode_label = "EXPLAIN" if is_explain_step else "SOLVE"
+        pair_idx = (step - 1) // 2
+        tier_idx = pair_idx % num_efforts
+
+        if pair_problems and num_records > 0:
+            prob_idx = pair_idx % num_records
+        else:
+            prob_idx = (step - 1) % num_records
+
+    elif mode_raw in ("split", "hybrid", "both", "auto"):
+        half = total_steps // 2
+        is_explain_step = (step > half)
+        mode_label = "EXPLAIN" if is_explain_step else "SOLVE"
+        if pair_problems and num_records > 0:
+            prob_idx = ((step - 1) % max(1, half)) % num_records
+        else:
+            prob_idx = (step - 1) % num_records
+        tier_idx = prob_idx % num_efforts
+
+    elif mode_raw in ("true", "explain", "explanation", "pedagogical", "1", "yes"):
+        is_explain_step = True
+        mode_label = "EXPLAIN"
+        prob_idx = (step - 1) % num_records
+        tier_idx = prob_idx % num_efforts
+
+    else:
+        # Default: SOLVE only (False, "solve", "none", "off", "0")
+        is_explain_step = False
+        mode_label = "SOLVE"
+        prob_idx = (step - 1) % num_records
+        tier_idx = prob_idx % num_efforts
+
+    # Resolve effort tier
+    if effort_tier.lower() in ("balanced", "all", "roundrobin", "cycle"):
+        step_effort = EFFORT_TIERS_LIST[tier_idx]
+    else:
+        step_effort = effort_tier.lower()
+
+    item = records[prob_idx] if records and 0 <= prob_idx < len(records) else None
+
+    return {
+        "step": step,
+        "is_explain_step": is_explain_step,
+        "mode_label": mode_label,
+        "step_effort": step_effort,
+        "tier_index": tier_idx,
+        "problem_index": prob_idx,
+        "item": item,
+    }
+
+
 # =====================================================================
 # 📊  200-STEP AUDITOR & HUGGING FACE ARCHIVE UPLOADER
 # =====================================================================
@@ -1441,15 +1615,18 @@ class StepAuditor:
         dataset_name: Optional[str] = None,
         step_loss: Optional[float] = None,
         grad_norm: Optional[float] = None,
+        step_mode: Optional[str] = None,
     ):
         tier_key = str(effort_tier).lower()
         ds_name = dataset_name or self.dataset_name
+        mode_key = str(step_mode or "SOLVE").upper()
         self.effort_stats[tier_key]["steps"] += 1
 
         tabular_rows = []
         for r in rollouts:
             r["effort_tier"] = tier_key
             r["dataset"] = ds_name
+            r["step_mode"] = mode_key
             st = self.effort_stats[tier_key]
             st["rollouts"] += 1
             st["total_tokens"] += r.get("token_count", 0)
@@ -1472,6 +1649,7 @@ class StepAuditor:
             cols = r.get("column_scores", {})
             tabular_rows.append({
                 "step": step,
+                "step_mode": mode_key,
                 "dataset": ds_name,
                 "problem": problem,
                 "reference_answer": reference,
@@ -1496,6 +1674,7 @@ class StepAuditor:
 
         record = {
             "step": step,
+            "step_mode": mode_key,
             "dataset": ds_name,
             "effort_tier": tier_key,
             "problem": problem,
@@ -1519,7 +1698,7 @@ class StepAuditor:
         if tabular_rows:
             import csv
             csv_fields = [
-                "step", "dataset", "effort_tier", "rollout_idx", "token_count", "total_reward",
+                "step", "step_mode", "dataset", "effort_tier", "rollout_idx", "token_count", "total_reward",
                 "accuracy_reward", "formatting_reward", "efficiency_reward", "advantage",
                 "is_correct", "valid_think_tags", "unclosed_think_tag", "repetitive_loop",
                 "problem", "reference_answer", "final_answer"
@@ -1950,27 +2129,46 @@ def run_standalone_math_grpo(
     study_mode: bool = False,
     max_samples: Optional[int] = None,
     verbose_study: bool = True,
-    explanation_mode: bool = False,
+    explanation_mode: Union[str, bool] = "effort_cycle",
+    shuffle_dataset: Union[bool, str] = False,
+    shuffle_seed: int = 42,
+    pair_problems: bool = True,
     checkpoint_at_100: bool = True,
 ):
     setup_blackwell_environment()
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    mode_str = "🔍 STUDY & AUDIT ONLY (No training/backprop)" if study_mode else "⚡ FULL REINFORCEMENT TRAINING (GDPO)"
-    domain_str = "🎓 MULTI-TURN EXPLANATION (Turn 1: Direct -> Turn 2: Pedagogical)" if explanation_mode else "🎯 DIRECT SOLVING (Turn 1: Problem -> \\boxed{answer})"
+    mode_str = "STUDY & AUDIT ONLY (No training/backprop)" if study_mode else "FULL REINFORCEMENT TRAINING (GDPO)"
+    mode_raw = str(explanation_mode).lower().strip()
+    if mode_raw in ("effort_cycle", "cycle", "effort_blocks", "effort_schedule", "repeat"):
+        domain_str = "EFFORT CYCLE (6 Steps SOLVE [low->max] -> 6 Steps EXPLAIN [low->max] -> Repeat)"
+    elif mode_raw in ("interleaved", "paired", "alternate", "toggle"):
+        domain_str = "INTERLEAVED (Alternating 1 Step SOLVE <-> 1 Step EXPLAIN)"
+    elif mode_raw in ("split", "hybrid", "both", "auto"):
+        domain_str = f"SPLIT / HYBRID (Steps 1-{steps//2} SOLVE -> Steps {steps//2+1}-{steps} EXPLAIN)"
+    elif mode_raw in ("true", "explain", "pedagogical", "1"):
+        domain_str = "MULTI-TURN EXPLANATION (100% Pedagogical Explanation)"
+    else:
+        domain_str = "DIRECT SOLVING (100% Turn 1: Problem -> \\boxed{answer})"
+
+    order_str = "STRICT ORDER (gsm8k -> openreasoning -> big math)" if not shuffle_dataset or str(shuffle_dataset).lower() in ("false", "none", "off") else f"SHUFFLED ({shuffle_dataset}, seed={shuffle_seed})"
+    pairing_str = "PAIRED (Each 6-problem batch is solved then explained)" if pair_problems else "STREAMING (Sequential next problem each step)"
+
     print("=" * 72)
-    print(f" 🚀 STANDALONE MATH GRPO ENGINE ({dataset_name})")
-    print(f" Operating Mode:  {mode_str}")
-    print(f" Dialogue Domain: {domain_str}")
-    print(f" Base Model:      {model_name_or_path}")
-    print(f" Dataset:         {dataset_name}")
-    print(f" LoRA Checkpoint: {checkpoint_lora} (Store: {checkpoint_repo})")
-    print(f" Effort Mode:     {effort_tier.upper()} (Balanced round-robin across 6 tiers if 'balanced')")
-    print(f" Context Window:  {max_seq_len} tokens (32k context, max new: {max_new_tokens})")
-    print(f" Rollouts:        {num_rollouts} concurrent streams (G=4)")
-    print(f" FP8 Engine:      {use_fp8}")
-    print(f" Steps:           {steps}")
-    print(f" Device:          {device}")
+    print(f" [Sword Engine] STANDALONE MATH GRPO ({dataset_name})")
+    print(f" Operating Mode:   {mode_str}")
+    print(f" Dialogue Domain:  {domain_str}")
+    print(f" Dataset Sequence: {order_str}")
+    print(f" Problem Pairing:  {pairing_str}")
+    print(f" Base Model:       {model_name_or_path}")
+    print(f" Dataset:          {dataset_name}")
+    print(f" LoRA Checkpoint:  {checkpoint_lora} (Store: {checkpoint_repo})")
+    print(f" Effort Mode:      {effort_tier.upper()} (Balanced round-robin across 6 tiers if 'balanced')")
+    print(f" Context Window:   {max_seq_len} tokens (32k context, max new: {max_new_tokens})")
+    print(f" Rollouts:         {num_rollouts} concurrent streams (G=4)")
+    print(f" FP8 Engine:       {use_fp8}")
+    print(f" Steps:            {steps}")
+    print(f" Device:           {device}")
     print("=" * 72)
 
     # 1. Download & Prepare Dataset
@@ -1990,7 +2188,13 @@ def run_standalone_math_grpo(
             max_samples=effective_samples,
             hf_token=hf_token,
         )
-    streamer = stream_math_data_from_disk(data_file)
+
+    study_records = prepare_study_records(
+        data_file,
+        shuffle_mode=shuffle_dataset,
+        seed=shuffle_seed,
+    )
+    print(f"[*] Prepared {len(study_records)} problems from {data_file} ({order_str})")
 
     # 2. Resolve LoRA Checkpoint First
     resolved_lora = resolve_checkpoint_lora(
@@ -2189,26 +2393,23 @@ def run_standalone_math_grpo(
     print(f"\n⚡ Starting {steps} training steps (Effort Mode: {effort_tier} | Mode: {explanation_mode})...\n")
     for step in range(1, steps + 1):
         t_start = time.perf_counter()
-        item = next(streamer)
+        sched = get_step_schedule(
+            step=step,
+            total_steps=steps,
+            records=study_records,
+            explanation_mode=explanation_mode,
+            effort_tier=effort_tier,
+            pair_problems=pair_problems,
+        )
+        item = sched["item"] or study_records[(step - 1) % len(study_records)]
         problem_text = item["problem"]
         ref_answer = item["answer"]
         item_dataset = item.get("dataset", dataset_name)
-
-        # Resolve effort tier for this step (balanced round-robin vs forced single tier)
-        if effort_tier.lower() in ("balanced", "all"):
-            step_effort = item.get("effort_tier", "high")
-        else:
-            step_effort = effort_tier.lower()
-
-        # Determine whether current step is explanation mode or direct solving mode
-        # In 'split' / 'hybrid' mode: Steps 1-100 are SOLVE, Steps 101-200 are EXPLAIN
-        if str(explanation_mode).lower() in ("split", "hybrid", "auto", "both"):
-            is_explain_step = (step > (steps // 2))
-        else:
-            is_explain_step = bool(explanation_mode and str(explanation_mode).lower() not in ("false", "0", "none"))
+        step_effort = sched["step_effort"]
+        is_explain_step = sched["is_explain_step"]
+        mode_label = sched["mode_label"]
 
         step_scorer = explanation_scorer if is_explain_step else math_scorer
-        mode_label = "EXPLAIN" if is_explain_step else "SOLVE"
 
         # Format user problem with exact effort system prompt (or 2-turn explanation prompt)
         if is_explain_step:
@@ -2320,6 +2521,7 @@ def run_standalone_math_grpo(
             effort_tier=step_effort, dataset_name=item_dataset,
             step_loss=avg_nll if not study_mode else None,
             grad_norm=grad_norm_val if not study_mode else None,
+            step_mode=mode_label,
         )
 
         mean_acc = sum(r.get("acc_reward", 0.0) for r in rollout_results) / len(rollout_results)
@@ -2382,7 +2584,9 @@ def main():
     parser.add_argument("--checkpoint", type=str, default="checkpoint-2200")
     parser.add_argument("--dataset", type=str, default="math-ai/TemplateGSM", help="Dataset name on Hugging Face (default: math-ai/TemplateGSM)")
     parser.add_argument("--study_mode", "--study", action="store_true", help="Study mode: generate and audit model answers without backpropagation training")
-    parser.add_argument("--explanation_mode", "--explain", action="store_true", help="Explanation mode: run multi-turn dialog (Turn 1: direct answer, Turn 2: pedagogical explanation) using ExplanationScorer")
+    parser.add_argument("--explanation_mode", "--explain", type=str, default="effort_cycle", help="Explanation schedule: 'effort_cycle' (6 solve low->max then 6 explain low->max), 'interleaved', 'split', 'solve', or 'explain'")
+    parser.add_argument("--shuffle_dataset", action="store_true", default=False, help="Shuffle dataset problems (default: False, strictly gsm8k -> openreasoning -> big math)")
+    parser.add_argument("--no_pair_problems", action="store_false", dest="pair_problems", default=True, help="Disable problem pairing between solve and explain batches")
     parser.add_argument("--curated_dataset", action="store_true", help="Use curated 100-problem study dataset (35 GSM8K, 30 AoPS C4, 35 BigMath2)")
     parser.add_argument("--max_samples", type=int, default=None, help="Maximum dataset samples to download/cache")
     parser.add_argument("--repo_id", type=str, default=os.environ.get("HF_UPLOAD_REPO_ID", "Nihilux/sword-grpo-200-steps"))
@@ -2416,6 +2620,8 @@ def main():
         study_mode=args.study_mode,
         max_samples=args.max_samples,
         explanation_mode=args.explanation_mode,
+        shuffle_dataset=args.shuffle_dataset,
+        pair_problems=args.pair_problems,
         checkpoint_at_100=True,
     )
 
