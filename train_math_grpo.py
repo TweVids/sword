@@ -529,22 +529,51 @@ class MathScorer:
         # 2. Formatting: Paragraph Thinking, Outside Paragraph Answer, and Boxed Output
         format_score = 0.0
 
-        # A. Check for bullet points, numbered lists, or markdown headers in thinking trace
-        # Strip display math environments ($$..$$, \[..\], \begin{..}..\end{..}) before bullet checking
-        # so equations containing minus signs, asterisks or numbered tags are not penalized as bullets.
+        # A. Check for short fragment lines (< 15 words) starting with bullets, numbered lists, or step markers, or markdown headers
+        # Strip display math environments ($$..$$, \[..\], \begin{..}..\end{..}) before checking
         trace_text_for_lists = re.sub(
             r"\$\$.*?\$\$|\\\[.*?\\\]|\\begin\{[a-z*]*\}.*?\\end\{[a-z*]*\}",
             "",
             trace,
             flags=re.DOTALL,
         )
-        has_bullets_in_trace = bool(re.search(r"^\s*[-*•]\s+(?!\s*[\d\w\\$].*?[=<>])", trace_text_for_lists, re.MULTILINE))
-        has_numbered_in_trace = bool(re.search(r"^\s*\d+[\.)]\s+", trace_text_for_lists, re.MULTILINE))
         has_headers_in_trace = bool(re.search(r"^\s*#{1,6}\s+", trace_text_for_lists, re.MULTILINE))
 
-        if has_bullets_in_trace or has_numbered_in_trace or has_headers_in_trace:
+        short_fragment_lines = []
+        has_bullets_in_trace = False
+        has_numbered_in_trace = False
+        has_step_fragments_in_trace = False
+
+        for raw_line in trace_text_for_lists.split("\n"):
+            line = raw_line.strip()
+            if not line:
+                continue
+            is_bullet = bool(re.match(r"^[-*•]\s+(?!\s*[\d\w\\$].*?[=<>])", line))
+            is_numbered = bool(re.match(r"^(?:\d+[\.)]|\(\d+\))\s+(?!\s*[\d\w\\$].*?[=<>])", line))
+            is_step = bool(re.match(r"^step\s*\d+[:\.\-]?\s*", line, re.IGNORECASE))
+
+            if is_bullet or is_numbered or is_step:
+                word_count = len(line.split())
+                if word_count < 15:
+                    short_fragment_lines.append(line)
+                    if is_bullet:
+                        has_bullets_in_trace = True
+                    if is_numbered:
+                        has_numbered_in_trace = True
+                    if is_step:
+                        has_step_fragments_in_trace = True
+
+        if has_headers_in_trace or short_fragment_lines:
             format_score -= 0.15
-            audit_flags["bullet_or_list_in_thinking"] = True
+            if has_headers_in_trace:
+                audit_flags["headers_in_thinking"] = True
+                audit_flags["bullet_or_list_in_thinking"] = True
+            if short_fragment_lines:
+                audit_flags["short_fragment_list_in_thinking"] = True
+                if has_bullets_in_trace or has_numbered_in_trace:
+                    audit_flags["bullet_or_list_in_thinking"] = True
+                if has_step_fragments_in_trace:
+                    audit_flags["step_fragment_in_thinking"] = True
         elif len(trace.strip()) >= 20:
             # Reward fluent continuous paragraph thinking
             format_score += 0.15
@@ -740,13 +769,43 @@ class ExplanationScorer:
             trace,
             flags=re.DOTALL,
         )
-        has_bullets_in_trace = bool(re.search(r"^\s*[-*•]\s+(?!\s*[\d\w\\$].*?[=<>])", trace_text_for_lists, re.MULTILINE))
-        has_numbered_in_trace = bool(re.search(r"^\s*\d+[\.)]\s+", trace_text_for_lists, re.MULTILINE))
         has_headers_in_trace = bool(re.search(r"^\s*#{1,6}\s+", trace_text_for_lists, re.MULTILINE))
 
-        if has_bullets_in_trace or has_numbered_in_trace or has_headers_in_trace:
+        short_fragment_lines = []
+        has_bullets_in_trace = False
+        has_numbered_in_trace = False
+        has_step_fragments_in_trace = False
+
+        for raw_line in trace_text_for_lists.split("\n"):
+            line = raw_line.strip()
+            if not line:
+                continue
+            is_bullet = bool(re.match(r"^[-*•]\s+(?!\s*[\d\w\\$].*?[=<>])", line))
+            is_numbered = bool(re.match(r"^(?:\d+[\.)]|\(\d+\))\s+(?!\s*[\d\w\\$].*?[=<>])", line))
+            is_step = bool(re.match(r"^step\s*\d+[:\.\-]?\s*", line, re.IGNORECASE))
+
+            if is_bullet or is_numbered or is_step:
+                word_count = len(line.split())
+                if word_count < 15:
+                    short_fragment_lines.append(line)
+                    if is_bullet:
+                        has_bullets_in_trace = True
+                    if is_numbered:
+                        has_numbered_in_trace = True
+                    if is_step:
+                        has_step_fragments_in_trace = True
+
+        if has_headers_in_trace or short_fragment_lines:
             thinking_format_score -= 0.15
-            audit_flags["bullet_or_list_in_thinking"] = True
+            if has_headers_in_trace:
+                audit_flags["headers_in_thinking"] = True
+                audit_flags["bullet_or_list_in_thinking"] = True
+            if short_fragment_lines:
+                audit_flags["short_fragment_list_in_thinking"] = True
+                if has_bullets_in_trace or has_numbered_in_trace:
+                    audit_flags["bullet_or_list_in_thinking"] = True
+                if has_step_fragments_in_trace:
+                    audit_flags["step_fragment_in_thinking"] = True
         elif len(trace.strip()) >= 20:
             thinking_format_score += 0.15
             audit_flags["natural_paragraph_thinking_rewarded"] = True
@@ -1856,7 +1915,7 @@ EFFORT_SYSTEM_PROMPTS: Dict[str, str] = {
 # 1. Persistent reasoning requirement across all effort tiers
 PERSISTENT_PARAGRAPH_PROMPT = (
     "Structure your reasoning trace as continuous, natural paragraphs of internal monologue inside <think>...</think>. "
-    "Do not use bullet points, numbered lists, or section headers in your thinking."
+    "Avoid short bullet points, rapid numbered lists, or fragmented step lines under 15 words; elaborate your thoughts in complete, flowing narrative paragraphs."
 )
 
 # 2. Explicit final answer formatting directive
@@ -2559,7 +2618,23 @@ def run_standalone_math_grpo(
                 final_ans = ro.get("final_answer", "").strip() or "(no answer found)"
                 trace = ro.get("reasoning_trace", "").strip()
                 trace_preview = (trace[:240] + "...") if len(trace) > 240 else trace
-                print(f"   [Rollout {idx+1}/{num_rollouts} | {status} | Total Reward: {ro.get('total_reward', 0.0):+.2f} | Tokens: {ro.get('token_count', 0)}]")
+                audit = ro.get("audit_log", {})
+
+                # Paragraph Reasoning Watchlist badges
+                watchlist = []
+                if audit.get("natural_paragraph_thinking_rewarded"):
+                    watchlist.append("🌊 Pure Paragraph Flow")
+                if audit.get("step_fragment_in_thinking"):
+                    watchlist.append("⚠️ Short Step Fragment (<15w)")
+                if audit.get("bullet_or_list_in_thinking"):
+                    watchlist.append("⚠️ Short Bullet/List (<15w)")
+                if audit.get("headers_in_thinking"):
+                    watchlist.append("⚠️ Header in Think")
+                if audit.get("natural_paragraph_answer_rewarded"):
+                    watchlist.append("💬 Prose Answer")
+                badge_str = f" | [{', '.join(watchlist)}]" if watchlist else ""
+
+                print(f"   [Rollout {idx+1}/{num_rollouts} | {status} | Total Reward: {ro.get('total_reward', 0.0):+.2f} | Tokens: {ro.get('token_count', 0)}{badge_str}]")
                 if trace_preview:
                     print(f"     <think> {trace_preview} </think>")
                 print(f"     Answer: {final_ans}")

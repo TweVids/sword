@@ -282,6 +282,35 @@ class TestMathScorerFormatting(unittest.TestCase):
         self.assertNotIn("bullet_or_list_in_thinking", res["audit_log"])
         self.assertTrue(res["audit_log"].get("natural_paragraph_thinking_rewarded"))
 
+    def test_step_mention_in_substantive_paragraph_rewarded(self):
+        # Full flowing paragraph (>= 15 words) discussing steps is rewarded, NOT penalized
+        text = (
+            "<think>\n"
+            "Our first step is to calculate the number of clips sold in April, which is given as 48 friends. "
+            "Then in the next step we find half of that amount for May, giving us 24 clips. "
+            "Finally, adding both quantities together yields exactly 72 clips in total.\n"
+            "</think>\n"
+            "Natalia sold a total of \\boxed{72} clips altogether."
+        )
+        res = self.scorer.score("prob", "72", text, effort_tier="low")
+        self.assertTrue(res["audit_log"].get("natural_paragraph_thinking_rewarded"))
+        self.assertNotIn("step_fragment_in_thinking", res["audit_log"])
+        self.assertNotIn("short_fragment_list_in_thinking", res["audit_log"])
+
+    def test_short_step_fragment_under_15_words_penalized(self):
+        # Short staccato step line (< 15 words) is penalized as a broken list
+        text = (
+            "<think>\n"
+            "Step 1: 48 / 2 = 24\n"
+            "Step 2: 48 + 24 = 72\n"
+            "</think>\n"
+            "\\boxed{72}"
+        )
+        res = self.scorer.score("prob", "72", text, effort_tier="low")
+        self.assertTrue(res["audit_log"].get("short_fragment_list_in_thinking"))
+        self.assertTrue(res["audit_log"].get("step_fragment_in_thinking"))
+        self.assertNotIn("natural_paragraph_thinking_rewarded", res["audit_log"])
+
     def test_outside_think_paragraph_rewarded(self):
         text = (
             "<think>\n"
