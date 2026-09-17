@@ -628,34 +628,54 @@ class MathScorer:
                         audit_flags["shallow_paragraphs_penalty"] = -0.10
 
         # B. Paragraph behavior outside <think> (in final answer)
-        # 1. Detect reasoning evasion: markdown headers, step markers, or bullet lists in the answer (-0.20)
-        has_headers_in_answer = bool(re.search(r"^\s*#{1,6}\s+", answer, re.MULTILINE))
-        has_step_markers_in_answer = bool(re.search(r"(?i)\*\*step\s*\d+[:\.]?|\bstep\s*\d+[:\.]", answer))
+        # 1. Detect reasoning evasion: markdown headers, step markers, bullet lists, bold section headers, or multi-paragraph reasoning dumps in the answer
+        ans_clean = answer.strip()
+        has_headers_in_answer = bool(re.search(r"^\s*#{1,6}\s+", ans_clean, re.MULTILINE))
+        has_step_markers_in_answer = bool(
+            re.search(r"^\s*(?:\*\*|\*|#{1,6}\s*)?step\s*[\d\w]+(?:\*\*|\*)?[:\.\-]?\s*", ans_clean, re.IGNORECASE | re.MULTILINE)
+            or re.search(r"(?i)\*\*step\s*[\d\w]+[:\.]?|\bstep\s*[\d\w]+[:\.]", ans_clean)
+        )
         has_bullets_in_answer = bool(
-            re.search(r"^\s*[*•]\s+", answer, re.MULTILINE)
-            or re.search(r"^\s*-\s+(?:[A-Za-z]{2,}|(?!\s*[\d\w\\$].*?[=<>]))", answer, re.MULTILINE)
+            re.search(r"^\s*[*•]\s+", ans_clean, re.MULTILINE)
+            or re.search(r"^\s*-\s+(?:[A-Za-z]{2,}|(?!\s*[\d\w\\$].*?[=<>]))", ans_clean, re.MULTILINE)
         )
         has_numbered_in_answer = bool(
-            re.search(r"^\s*(?:\d+[\.)]|\(\d+\))\s+(?:[A-Za-z]{2,}|(?!\s*[\d\w\\$].*?[=<>]))", answer, re.MULTILINE)
+            re.search(r"^\s*(?:\d+[\.)]|\(\d+\))\s+(?:[A-Za-z]{2,}|(?!\s*[\d\w\\$].*?[=<>]))", ans_clean, re.MULTILINE)
+        )
+        bold_lines_in_answer = len(re.findall(r"^\s*\*\*[^*\n]{5,}\*\*\s*$", ans_clean, re.MULTILINE))
+        ans_paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", ans_clean) if len(p.strip()) > 10]
+
+        has_reasoning_dump = (
+            has_headers_in_answer
+            or has_step_markers_in_answer
+            or has_bullets_in_answer
+            or has_numbered_in_answer
+            or bold_lines_in_answer >= 2
+            or (len(ans_paragraphs) >= 2 and len(ans_clean) > 200)
+            or len(ans_clean) > 400
         )
 
-        has_reasoning_dump = has_headers_in_answer or has_step_markers_in_answer or (len(answer.strip()) > 250 and (has_bullets_in_answer or has_numbered_in_answer))
-
         # Check for bare answers (only digits/symbols or very short, without descriptive prose)
-        cleaned_words = re.sub(r"\\boxed\{[^}]*\}|[\d\s\.,;:!?'\"\(\)\$\+\-\*\/=]", "", answer).strip()
+        cleaned_words = re.sub(r"\\boxed\{[^}]*\}|[\d\s\.,;:!?'\"\(\)\$\+\-\*\/=]", "", ans_clean).strip()
         is_bare_answer = len(cleaned_words) < 8
 
         if has_reasoning_dump:
-            format_score -= 0.20
+            format_score -= 0.40
             audit_flags["reasoning_dump_in_answer"] = True
+            if has_bullets_in_answer or has_numbered_in_answer:
+                audit_flags["bullet_or_list_in_answer"] = True
+            # Disqualify thinking paragraph flow reward: you cannot claim pure paragraph thinking if you dumped reasoning outside <think>!
+            if audit_flags.get("natural_paragraph_thinking_rewarded"):
+                del audit_flags["natural_paragraph_thinking_rewarded"]
+                format_score -= 0.15
         elif has_bullets_in_answer or has_numbered_in_answer:
-            format_score -= 0.15
+            format_score -= 0.20
             audit_flags["bullet_or_list_in_answer"] = True
         elif is_bare_answer:
             # Penalize naked numbers without explanatory sentence prose
             format_score -= 0.10
             audit_flags["bare_answer_without_prose"] = True
-        elif 15 <= len(answer.strip()) <= 350:
+        elif 15 <= len(ans_clean) <= 350 and len(ans_paragraphs) <= 1:
             # Reward a concise 1-2 sentence explanatory prose wrapping the answer (+0.15)
             format_score += 0.15
             audit_flags["natural_paragraph_answer_rewarded"] = True
@@ -2693,6 +2713,12 @@ def run_standalone_math_grpo(
                     watchlist.append("⚠️ Short Bullet/List (<15w)")
                 if audit.get("headers_in_thinking"):
                     watchlist.append("⚠️ Header in Think")
+                if audit.get("reasoning_dump_in_answer"):
+                    watchlist.append("🚨 Reasoning Dump in Answer")
+                if audit.get("bullet_or_list_in_answer"):
+                    watchlist.append("⚠️ Bullets in Answer")
+                if audit.get("bare_answer_without_prose"):
+                    watchlist.append("⚠️ Bare Answer")
                 if audit.get("natural_paragraph_answer_rewarded"):
                     watchlist.append("💬 Prose Answer")
                 badge_str = f" | [{', '.join(watchlist)}]" if watchlist else ""
