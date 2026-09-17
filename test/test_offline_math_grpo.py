@@ -33,7 +33,16 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from train_math_grpo import (
     ThinkingFormatVerifier,
     MathScorer,
+    ExplanationScorer,
+    count_sentences,
+    extract_bullet_items,
+    is_valid_bullet_archetype,
     compute_gdpo_advantages,
+    compute_explanation_gdpo_advantages,
+    download_curated_study_dataset,
+    format_explanation_turn_prompt,
+    save_checkpoint,
+    upload_checkpoint_to_hf,
     ChunkedGRPOLoss,
     StepAuditor,
     format_effort_prompt,
@@ -596,6 +605,344 @@ class TestFullOfflineSimulation(unittest.TestCase):
             self.assertEqual(summary["total_steps"], 3)
             self.assertGreater(summary["accuracy_pct"], 0.0)
 
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+
+class TestExplanationScorerHeaders(unittest.TestCase):
+    """Verifies that headers in explanation answer field require > 5 words."""
+
+    def setUp(self):
+        self.scorer = ExplanationScorer()
+
+    def test_short_header_penalized(self):
+        # Header has 3 words (<= 5)
+        text = (
+            "<think> We analyze the algebraic steps in deep continuous paragraphs. "
+            "The calculation confirms that x equals five without ambiguity. "
+            "Everything is verified and ready to be explained. </think> "
+            "## Understand the problem\n"
+            "First we consider the expression and expand it carefully. "
+            "Then we simplify all intermediate terms to find the solution. "
+            "The expected result is 5."
+        )
+        res = self.scorer.score("Problem", "5", text, effort_tier="high", dataset_name="BigMath2")
+        self.assertIn("short_header_penalty", res["audit_log"])
+        self.assertLess(res["column_scores"]["explanation_structure"], 0.0)
+
+    def test_rich_header_rewarded(self):
+        # Header has 8 words (> 5)
+        text = (
+            "<think> We analyze the algebraic steps in deep continuous paragraphs. "
+            "The calculation confirms that x equals five without ambiguity. "
+            "Everything is verified and ready to be explained. </think> "
+            "## Comprehensive Mathematical Formulation and Rigorous Step Analysis\n"
+            "Here we expand the expressions and thoroughly evaluate all boundary conditions. "
+            "The final computed value yields 5."
+        )
+        res = self.scorer.score("Problem", "5", text, effort_tier="high", dataset_name="BigMath2")
+        self.assertIn("rich_header_rewarded", res["audit_log"])
+        self.assertGreater(res["column_scores"]["explanation_structure"], 0.0)
+
+
+class TestExplanationScorerBullets(unittest.TestCase):
+    """Verifies bullet quantity (>= 5) and Archetypes A and B."""
+
+    def setUp(self):
+        self.scorer = ExplanationScorer()
+
+    def test_insufficient_bullets_penalized(self):
+        # 3 bullets (< 5)
+        text = (
+            "<think> Continuous reasoning paragraph. We verify everything step by step. All logic holds. </think> "
+            "* First bullet item with some text.\n"
+            "* Second bullet item with some text.\n"
+            "* Third bullet item with some text."
+        )
+        res = self.scorer.score("Problem", "5", text, effort_tier="high", dataset_name="BigMath2")
+        self.assertIn("insufficient_bullets_penalty", res["audit_log"])
+        self.assertLess(res["column_scores"]["explanation_structure"], 0.0)
+
+    def test_archetype_a_valid_with_separator(self):
+        # 5 bullets, each matching Archetype A: ** title >=5 words - ** body >=3 sentences
+        # The ' - ' separator before the closing ** is strictly mandatory!
+        bullets_text = "\n".join([
+            f"* ** Detailed Conceptual Step {i+1} for Problem Setup - ** "
+            f"First we set up the algebraic equations for step {i+1}. "
+            f"Next we substitute all known constants into the expression. "
+            f"Finally we verify that the equality holds consistently."
+            for i in range(5)
+        ])
+        text = (
+            "<think> Continuous thinking paragraph one. Next sentence in thinking. Concluding sentence in thinking. </think> "
+            f"{bullets_text}\n"
+            "Thus the final result is 42."
+        )
+        res = self.scorer.score("Problem", "42", text, effort_tier="high", dataset_name="BigMath2")
+        self.assertIn("valid_bullet_archetypes_rewarded", res["audit_log"])
+        self.assertGreater(res["column_scores"]["explanation_structure"], 0.0)
+
+    def test_archetype_a_missing_separator_fails(self):
+        # Missing ' - ' before closing ** (uses ': **' instead)
+        bullets_text = "\n".join([
+            f"* ** Detailed Conceptual Step {i+1} for Problem Setup: ** "
+            f"First we set up the algebraic equations for step {i+1}. "
+            f"Next we substitute all known constants into the expression. "
+            f"Finally we verify that the equality holds consistently."
+            for i in range(5)
+        ])
+        text = (
+            "<think> Continuous thinking paragraph one. Next sentence in thinking. Concluding sentence in thinking. </think> "
+            f"{bullets_text}"
+        )
+        res = self.scorer.score("Problem", "42", text, effort_tier="high", dataset_name="BigMath2")
+        self.assertIn("invalid_bullet_archetype_penalty", res["audit_log"])
+
+    def test_archetype_a_short_title_fails(self):
+        # Title has only 2 words (< 5)
+        bullets_text = "\n".join([
+            f"* ** Step {i+1} - ** "
+            f"First we set up the algebraic equations for step {i+1}. "
+            f"Next we substitute all known constants into the expression. "
+            f"Finally we verify that the equality holds consistently."
+            for i in range(5)
+        ])
+        text = (
+            "<think> Continuous thinking paragraph one. Next sentence in thinking. Concluding sentence in thinking. </think> "
+            f"{bullets_text}"
+        )
+        res = self.scorer.score("Problem", "42", text, effort_tier="high", dataset_name="BigMath2")
+        self.assertIn("invalid_bullet_archetype_penalty", res["audit_log"])
+
+    def test_archetype_b_valid_continuous_paragraph(self):
+        # 5 bullets, each matching Archetype B: >= 4 sentences paragraph
+        bullets_text = "\n".join([
+            f"* In this stage we carefully inspect variable {i+1} from the prompt. "
+            f"Then we formulate the corresponding mathematical constraints. "
+            f"After that we eliminate intermediate parameters algebraically. "
+            f"Finally we confirm that the boundary condition is satisfied."
+            for i in range(5)
+        ])
+        text = (
+            "<think> Continuous thinking paragraph one. Next sentence in thinking. Concluding sentence in thinking. </think> "
+            f"{bullets_text}\n"
+            "The expected solution is 100."
+        )
+        res = self.scorer.score("Problem", "100", text, effort_tier="high", dataset_name="aops_c4_high_school_math")
+        self.assertIn("valid_bullet_archetypes_rewarded", res["audit_log"])
+        self.assertGreater(res["column_scores"]["explanation_structure"], 0.0)
+
+    def test_archetype_b_too_few_sentences_fails(self):
+        # 5 bullets, but each has only 2 sentences (< 4) and no Archetype A title
+        bullets_text = "\n".join([
+            f"* In this stage we inspect variable {i+1}. Then we eliminate parameters."
+            for i in range(5)
+        ])
+        text = (
+            "<think> Continuous thinking paragraph one. Next sentence in thinking. Concluding sentence in thinking. </think> "
+            f"{bullets_text}"
+        )
+        res = self.scorer.score("Problem", "100", text, effort_tier="high", dataset_name="aops_c4_high_school_math")
+        self.assertIn("invalid_bullet_archetype_penalty", res["audit_log"])
+
+
+class TestGSM8KSingleParagraphRule(unittest.TestCase):
+    """Verifies that GSM8K requires exactly 1 continuous paragraph with >= 5 sentences and no headers/bullets."""
+
+    def setUp(self):
+        self.scorer = ExplanationScorer()
+
+    def test_gsm8k_single_deep_paragraph_rewarded(self):
+        text = (
+            "<think> Let's think through this word problem carefully. "
+            "We calculate the total step by step. Everything is consistent. </think> "
+            "To solve this problem, we first determine the number of items sold in the first month which is given as 48. "
+            "Next, we calculate the items sold in the second month by dividing 48 by 2 to get 24. "
+            "Then, we add the two quantities together to find the total items sold across both months. "
+            "Adding 48 and 24 yields exactly 72 items altogether. "
+            "Therefore, the final total of items sold across both April and May is 72."
+        )
+        res = self.scorer.score("Problem", "72", text, effort_tier="high", dataset_name="gsm8k")
+        self.assertIn("gsm8k_single_deep_paragraph_rewarded", res["audit_log"])
+        self.assertGreater(res["column_scores"]["explanation_structure"], 0.0)
+
+    def test_gsm8k_multiple_paragraphs_penalized(self):
+        text = (
+            "<think> Paragraph one. Sentence two. Sentence three. </think> "
+            "First paragraph of explanation with sentence one. Sentence two is here. Sentence three follows.\n\n"
+            "Second paragraph with sentence four. Sentence five concludes the answer."
+        )
+        res = self.scorer.score("Problem", "72", text, effort_tier="high", dataset_name="gsm8k")
+        self.assertIn("gsm8k_paragraph_rule_violation", res["audit_log"])
+        self.assertLess(res["column_scores"]["explanation_structure"], 0.0)
+
+    def test_gsm8k_headers_penalized(self):
+        text = (
+            "<think> Paragraph one. Sentence two. Sentence three. </think> "
+            "## Detailed Explanation for Word Problem\n"
+            "Sentence one here. Sentence two follows. Sentence three comes next. Sentence four is here. Sentence five concludes."
+        )
+        res = self.scorer.score("Problem", "72", text, effort_tier="high", dataset_name="gsm8k")
+        self.assertIn("gsm8k_paragraph_rule_violation", res["audit_log"])
+
+    def test_gsm8k_bullets_penalized(self):
+        text = (
+            "<think> Paragraph one. Sentence two. Sentence three. </think> "
+            "* Step 1: We compute the first quantity.\n"
+            "* Step 2: We compute the second quantity."
+        )
+        res = self.scorer.score("Problem", "72", text, effort_tier="high", dataset_name="gsm8k")
+        self.assertIn("gsm8k_paragraph_rule_violation", res["audit_log"])
+
+    def test_gsm8k_shallow_sentences_penalized(self):
+        text = (
+            "<think> Paragraph one. Sentence two. Sentence three. </think> "
+            "We simply multiply 4 by 15. The answer is 60."
+        )
+        res = self.scorer.score("Problem", "60", text, effort_tier="high", dataset_name="gsm8k")
+        self.assertIn("gsm8k_paragraph_rule_violation", res["audit_log"])
+
+
+class TestExplanationThinkingDiscipline(unittest.TestCase):
+    """Verifies that ExplanationScorer enforces reasoning content rules in <think>."""
+
+    def setUp(self):
+        self.scorer = ExplanationScorer()
+
+    def test_natural_paragraphs_rewarded_in_trace(self):
+        text = (
+            "<think> We first consider the underlying equations. "
+            "Next we evaluate all constraints systematically. "
+            "Finally we deduce the consistent result. </think> "
+            "To solve this problem, we observe the given setup. Next we calculate the required expression. "
+            "Then we substitute the values to simplify. This produces the result. Hence the answer is 42."
+        )
+        res = self.scorer.score("Problem", "42", text, effort_tier="high", dataset_name="gsm8k")
+        self.assertIn("natural_paragraph_thinking_rewarded", res["audit_log"])
+        self.assertIn("deep_paragraph_sentences_rewarded", res["audit_log"])
+
+    def test_bullets_in_trace_penalized(self):
+        text = (
+            "<think> * Step 1: calculate x\n* Step 2: calculate y </think> "
+            "To solve this problem, we observe the given setup. Next we calculate the required expression. "
+            "Then we substitute the values to simplify. This produces the result. Hence the answer is 42."
+        )
+        res = self.scorer.score("Problem", "42", text, effort_tier="high", dataset_name="gsm8k")
+        self.assertIn("bullet_or_list_in_thinking", res["audit_log"])
+
+    def test_repetitive_loop_in_trace_penalized(self):
+        text = (
+            "<think> We substitute the known value into equation. "
+            "We substitute the known value into equation. "
+            "And now we solve it. </think> "
+            "Sentence one here. Sentence two follows. Sentence three comes next. Sentence four is here. Sentence five concludes with 42."
+        )
+        res = self.scorer.score("Problem", "42", text, effort_tier="high", dataset_name="gsm8k")
+        self.assertIn("repetitive_loop_detected", res["audit_log"])
+
+    def test_prohibited_bold_in_trace_penalized(self):
+        text = (
+            "<think> **Step 1** is to formulate the equation. Then we solve it. Everything is fine. </think> "
+            "Sentence one here. Sentence two follows. Sentence three comes next. Sentence four is here. Sentence five concludes with 42."
+        )
+        res = self.scorer.score("Problem", "42", text, effort_tier="high", dataset_name="gsm8k")
+        self.assertIn("prohibited_bold_found", res["audit_log"])
+
+
+class TestExplanationGDPOAdvantages(unittest.TestCase):
+    """Verifies decoupled advantage calculation for explanation rollouts."""
+
+    def setUp(self):
+        self.scorer = ExplanationScorer()
+
+    def test_compute_explanation_advantages(self):
+        r1 = self.scorer.score("p", "10", "<think> Deep reasoning sentence one. Sentence two. Sentence three. </think> Sentence 1. Sentence 2. Sentence 3. Sentence 4. Sentence 5 with 10.", dataset_name="gsm8k", token_count=150)
+        r2 = self.scorer.score("p", "10", "<think> Deep reasoning sentence one. Sentence two. Sentence three. </think> Sentence 1. Sentence 2. Sentence 3. Sentence 4. Sentence 5 with 10.", dataset_name="gsm8k", token_count=300)
+        r3 = self.scorer.score("p", "10", "<think> * bullet thinking </think> Short answer with 999.", dataset_name="gsm8k", token_count=100)
+        r4 = self.scorer.score("p", "10", "<think> Deep reasoning sentence one. Sentence two. Sentence three. </think> Short answer with 888.", dataset_name="gsm8k", token_count=120)
+
+        advs, norm_advs = compute_explanation_gdpo_advantages([r1, r2, r3, r4])
+        self.assertEqual(len(advs), 4)
+        # Verify r1 has higher advantage than r3 (which has bullet penalty and wrong answer)
+        self.assertGreater(advs[0], advs[2])
+
+    def test_compute_gdpo_advantages_auto_dispatch(self):
+        r1 = self.scorer.score("p", "10", "<think> Deep reasoning sentence one. Sentence two. Sentence three. </think> Sentence 1. Sentence 2. Sentence 3. Sentence 4. Sentence 5 with 10.", dataset_name="gsm8k")
+        r2 = self.scorer.score("p", "10", "<think> * bullet </think> Bad answer.", dataset_name="gsm8k")
+
+        advs, norm_advs = compute_gdpo_advantages([r1, r2])
+        self.assertEqual(len(advs), 2)
+        self.assertIn("pedagogical_accuracy", norm_advs)
+        self.assertIn("explanation_structure", norm_advs)
+
+
+class TestMultiTurnPromptFormatting(unittest.TestCase):
+    """Verifies format_explanation_turn_prompt creates proper 2-turn dialog."""
+
+    def test_explanation_prompt_structure(self):
+        prompt = format_explanation_turn_prompt(
+            problem="Find x if 2x + 6 = 14.",
+            direct_answer="4",
+            followup_query="Can you guide me solve it?",
+            effort_tier="high",
+            dataset_name="BigMath2",
+        )
+        self.assertIn("<|im_start|>system", prompt)
+        self.assertIn("Find x if 2x + 6 = 14.", prompt)
+        self.assertIn("\\boxed{4}", prompt)
+        self.assertIn("Can you guide me solve it?", prompt)
+        self.assertIn("<|im_start|>assistant", prompt)
+
+
+class TestCuratedStudyDataset(unittest.TestCase):
+    """Verifies download_curated_study_dataset outputs exactly 100 problems with 35 GSM8K, 30 AoPS, 35 BigMath2."""
+
+    def test_curated_dataset_content_and_split(self):
+        temp_dir = tempfile.mkdtemp()
+        try:
+            cache_file = os.path.join(temp_dir, "test_curated_100.jsonl")
+            result_file = download_curated_study_dataset(cache_file=cache_file, offline=True)
+            self.assertTrue(os.path.exists(result_file))
+
+            with open(result_file, "r", encoding="utf-8") as f:
+                records = [json.loads(line) for line in f if line.strip()]
+
+            self.assertEqual(len(records), 100)
+            gsm_count = sum(1 for r in records if r["dataset"] == "gsm8k")
+            aops_count = sum(1 for r in records if r["dataset"] == "aops_c4_high_school_math")
+            bm_count = sum(1 for r in records if r["dataset"] == "BigMath2")
+
+            self.assertEqual(gsm_count, 35)
+            self.assertEqual(aops_count, 30)
+            self.assertEqual(bm_count, 35)
+
+            # Check effort tiers are populated
+            tiers = set(r["effort_tier"] for r in records)
+            self.assertTrue(len(tiers) >= 4)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+class TestCheckpointSavingAndUpload(unittest.TestCase):
+    """Verifies save_checkpoint and upload_checkpoint_to_hf functionality."""
+
+    def test_save_checkpoint_locally(self):
+        temp_dir = tempfile.mkdtemp()
+        try:
+            model = MockLightweightModel()
+            ckpt_dir = os.path.join(temp_dir, "checkpoint-100")
+            saved_path = save_checkpoint(model, tokenizer=None, checkpoint_dir=ckpt_dir, step=100)
+            self.assertTrue(os.path.exists(saved_path))
+            meta_file = os.path.join(saved_path, "checkpoint_metadata.json")
+            self.assertTrue(os.path.exists(meta_file))
+            with open(meta_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                self.assertEqual(data["step"], 100)
+
+            # upload without token should cleanly return None without crashing
+            res = upload_checkpoint_to_hf(checkpoint_dir=saved_path, repo_id="test/repo", hf_token=None)
+            self.assertIsNone(res)
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 

@@ -333,7 +333,17 @@ class ExternalVerifier:
                     results[q.id] = {"answer": "no", "citation": None}
 
             elif q.id == "scope_violation":
-                results[q.id] = {"answer": "no", "citation": None}
+                # Check declared files in trace vs touched files in diff
+                touched_files = re.findall(r"(?:---|\+\+\+)\s+[ab]/([a-zA-Z0-9_\./\-]+)", full)
+                stated_files = re.findall(r"[a-zA-Z0-9_\./\-]+\.(?:py|js|ts|cpp|rs|html|css)", trace)
+                if touched_files and stated_files:
+                    undeclared = [f for f in touched_files if not any(f in sf or sf in f for sf in stated_files)]
+                    if undeclared:
+                        results[q.id] = {"answer": "yes", "citation": f"undeclared files in diff: {', '.join(undeclared)}"}
+                    else:
+                        results[q.id] = {"answer": "no", "citation": "all touched files declared in scope"}
+                else:
+                    results[q.id] = {"answer": "no", "citation": None}
 
             elif q.id == "assumption_stated":
                 if "assume" in trace or "assuming" in trace:

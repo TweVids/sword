@@ -248,8 +248,9 @@ class FastServer:
         auto_clear: bool = True,
         use_speculative: Optional[bool] = None,
         speculative_k: int = 3,
+        return_logprobs: bool = False,
         **kwargs,
-    ) -> List[List[str]]:
+    ) -> Any:
         """
         High-throughput multi-trajectory parallel rollout generation for RL (GRPO / PPO).
         Generates G rollouts per prompt with automatic KV cache clearing, prefix sharing,
@@ -270,13 +271,25 @@ class FastServer:
             top_k=top_k,
             use_speculative=use_speculative,
             speculative_k=speculative_k,
+            return_logprobs=return_logprobs,
         )
 
-        all_res = results["responses"]
+        all_res = results.get("generated_texts", results["responses"])
         grouped = []
         for i in range(len(prompts)):
             start_i = i * num_rollouts_per_prompt
             grouped.append(all_res[start_i : start_i + num_rollouts_per_prompt])
+
+        if return_logprobs:
+            all_lps = results.get("logprobs", None)
+            grouped_lps = []
+            for i in range(len(prompts)):
+                start_i = i * num_rollouts_per_prompt
+                if all_lps is not None:
+                    grouped_lps.append([all_lps[start_i + j] for j in range(num_rollouts_per_prompt)])
+                else:
+                    grouped_lps.append([None] * num_rollouts_per_prompt)
+            return grouped, grouped_lps
 
         return grouped
 
@@ -343,6 +356,11 @@ class FastServer:
         self.static_cache.set_pos(curr_pos)
         eos_id = getattr(self.tokenizer, "eos_token_id", None)
 
+        # Pre-allocate static input buffers for single speculative decode
+        spec_decode_in = torch.empty((1, 1), dtype=torch.long, device=self.device)
+        spec_decode_pos = torch.empty((1, 1), dtype=torch.long, device=self.device)
+        spec_decode_mask = torch.ones((1, self.max_seq_len), dtype=torch.long, device=self.device)
+
         while len(generated_tokens) < max_new_tokens:
             if eos_id is not None and generated_tokens[-1] == eos_id:
                 break
@@ -352,14 +370,14 @@ class FastServer:
             candidates = find_prompt_lookup_candidates(token_history, max_ngram_size=3, num_pred_tokens=draft_k)
 
             if not candidates:
-                decode_in = torch.tensor([[generated_tokens[-1]]], dtype=torch.long, device=self.device)
-                decode_pos = torch.tensor([[curr_pos]], dtype=torch.long, device=self.device)
-                decode_mask = torch.ones((1, curr_pos + 1), dtype=torch.long, device=self.device)
+                spec_decode_in[0, 0] = generated_tokens[-1]
+                spec_decode_pos[0, 0] = curr_pos
+                decode_mask = spec_decode_mask[:, :curr_pos + 1]
                 self.static_cache.set_pos(curr_pos)
                 out = self.model(
-                    input_ids=decode_in,
+                    input_ids=spec_decode_in,
                     attention_mask=decode_mask,
-                    position_ids=decode_pos,
+                    position_ids=spec_decode_pos,
                     past_key_values=self.static_cache,
                     sword_static_cache=self.static_cache,
                     start_pos=curr_pos,
@@ -379,7 +397,7 @@ class FastServer:
                 eval_tokens = [generated_tokens[-1]] + candidates[:-1]
                 eval_in = torch.tensor([eval_tokens], dtype=torch.long, device=self.device)
                 eval_pos = torch.arange(curr_pos, curr_pos + K, dtype=torch.long, device=self.device).unsqueeze(0)
-                eval_mask = torch.ones((1, curr_pos + K), dtype=torch.long, device=self.device)
+                eval_mask = spec_decode_mask[:, :curr_pos + K]
 
                 self.static_cache.set_pos(curr_pos)
                 out = self.model(
@@ -420,13 +438,26 @@ class FastServer:
                 curr_pos += accepted
                 self.static_cache.set_pos(curr_pos)
 
+        # Decode generated text only
+        gen_tokens_tensor = torch.tensor([generated_tokens], dtype=torch.long, device=self.device)
+        if hasattr(self.tokenizer, "batch_decode"):
+            try:
+                gen_text = self.tokenizer.batch_decode(gen_tokens_tensor, skip_special_tokens=True)[0]
+            except Exception:
+                gen_text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+        elif hasattr(self.tokenizer, "decode"):
+            gen_text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+        else:
+            gen_text = str(generated_tokens)
+
+        # Full prompt + response text
         all_ids = input_ids[0].tolist() + generated_tokens
         all_ids_tensor = torch.tensor([all_ids], dtype=torch.long, device=self.device)
         if hasattr(self.tokenizer, "batch_decode"):
             try:
                 resp_text = self.tokenizer.batch_decode(all_ids_tensor, skip_special_tokens=True)[0]
             except Exception:
-                resp_text = self.tokenizer.batch_decode([all_ids], skip_special_tokens=True)[0]
+                resp_text = self.tokenizer.decode(all_ids, skip_special_tokens=True)
         elif hasattr(self.tokenizer, "decode"):
             resp_text = self.tokenizer.decode(all_ids, skip_special_tokens=True)
         else:
@@ -434,7 +465,8 @@ class FastServer:
 
         return {
             "tokens": generated_tokens,
-            "text": resp_text,
+            "text": gen_text,
+            "full_text": resp_text,
             "num_tokens": len(generated_tokens),
         }
 
@@ -447,6 +479,7 @@ class FastServer:
         top_k: int = 50,
         use_speculative: Optional[bool] = None,
         speculative_k: int = 3,
+        return_logprobs: bool = False,
     ) -> Dict[str, Any]:
         """
         Serves concurrent prompt requests with async pipeline and zero sync stalls.
@@ -604,6 +637,11 @@ class FastServer:
             next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
 
         generated = [next_token]
+        generated_logprobs = []
+        if return_logprobs:
+            logp = F.log_softmax(next_token_logits.float(), dim=-1).gather(-1, next_token)
+            generated_logprobs.append(logp)
+
         curr_pos = prompt_len
         self.static_cache.set_pos(curr_pos)
         eos_id = getattr(self.tokenizer, "eos_token_id", None)
@@ -690,32 +728,44 @@ class FastServer:
                 next_token = torch.argmax(step_logits, dim=-1, keepdim=True)
 
             generated.append(next_token.clone())
+            if return_logprobs:
+                step_logp = F.log_softmax(step_logits.float(), dim=-1).gather(-1, next_token)
+                generated_logprobs.append(step_logp)
+
             curr_pos += 1
 
             if eos_id is not None:
                 active_mask = active_mask & (next_token != eos_id)
-                # Check every 16 steps to eliminate GPU→CPU sync cost
-                if step % 16 == 0 and not active_mask.any():
+                # Check every 4 steps (instead of 16) to eliminate dead decode passes early
+                if step % 4 == 0 and not active_mask.any():
                     break
 
         if self.device.type == "cuda":
             torch.cuda.synchronize()
         total_time = time.perf_counter() - start_time
 
+        gen_tokens = torch.cat(generated, dim=1)
+        gen_responses = self.tokenizer.batch_decode(gen_tokens, skip_special_tokens=True)
         all_tokens = torch.cat([input_ids] + generated, dim=1)
-        responses = self.tokenizer.batch_decode(all_tokens, skip_special_tokens=True)
+        full_responses = self.tokenizer.batch_decode(all_tokens, skip_special_tokens=True)
         total_generated_tokens = (len(generated)) * bsz
         tps = total_generated_tokens / total_time if total_time > 0 else 0.0
         stream_speed = tps / bsz
 
-        return {
-            "responses": responses,
+        result = {
+            "responses": gen_responses,
+            "generated_texts": gen_responses,
+            "full_responses": full_responses,
+            "generated_tokens": gen_tokens,
             "latency_s": total_time,
             "total_tokens": total_generated_tokens,
             "tokens_per_stream": [len(generated)] * bsz,
             "stream_tps": [stream_speed] * bsz,
             "total_tps": tps,
         }
+        if return_logprobs and generated_logprobs:
+            result["logprobs"] = torch.cat(generated_logprobs, dim=1)
+        return result
 
     def get_vram_breakdown(self, target_seq_len: Optional[int] = None) -> Dict[str, Any]:
         """

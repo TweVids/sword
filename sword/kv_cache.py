@@ -252,8 +252,8 @@ class StaticKVCache(Cache):
             for layer_idx in range(self.num_layers):
                 src_k = self.k_cache[layer_idx][src_slot : src_slot + 1, :, :p_len, :]
                 src_v = self.v_cache[layer_idx][src_slot : src_slot + 1, :, :p_len, :]
-                self.k_cache[layer_idx][dst_start:dst_end, :, :p_len, :] = src_k.expand(dst_end - dst_start, -1, -1, -1)
-                self.v_cache[layer_idx][dst_start:dst_end, :, :p_len, :] = src_v.expand(dst_end - dst_start, -1, -1, -1)
+                self.k_cache[layer_idx][dst_start:dst_end, :, :p_len, :].copy_(src_k)
+                self.v_cache[layer_idx][dst_start:dst_end, :, :p_len, :].copy_(src_v)
 
     def get_layer_cache(
         self,

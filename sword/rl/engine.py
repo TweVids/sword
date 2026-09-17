@@ -260,23 +260,25 @@ class GRPOTrainer:
 
         # 2. Multi-Trajectory Rollout Generation Phase (eval mode)
         self.model.eval()
+        flat_old_logprobs = []
         with torch.no_grad():
-            for prob in problems:
-                # Generate G trajectories concurrently
-                prompts = [prob.user_problem]
-                rollouts = self.server.generate_rollouts(
-                    prompts=prompts,
-                    num_rollouts_per_prompt=self.num_rollouts_per_prompt,
-                    max_new_tokens=min(self.max_new_tokens, prob.effort_tier.max_tokens),
-                    temperature=0.8,
-                    auto_clear=True,
-                )[0]
+            prompts = [prob.user_problem for prob in problems]
+            max_tokens_budget = min(self.max_new_tokens, max(prob.effort_tier.max_tokens for prob in problems))
+            rollouts_batch, logprobs_batch = self.server.generate_rollouts(
+                prompts=prompts,
+                num_rollouts_per_prompt=self.num_rollouts_per_prompt,
+                max_new_tokens=max_tokens_budget,
+                temperature=0.8,
+                auto_clear=True,
+                return_logprobs=True,
+            )
 
-                # 3. Dual-System Evaluation Phase
+            for p_idx, prob in enumerate(problems):
+                rollouts = rollouts_batch[p_idx]
+                rollout_lps = logprobs_batch[p_idx] if logprobs_batch is not None else [None] * len(rollouts)
                 group_scored: List[ScoredTrajectory] = []
-                group_rewards: List[float] = []
 
-                for text in rollouts:
+                for r_idx, text in enumerate(rollouts):
                     # Parse reasoning trace vs final answer
                     trace = ""
                     answer = text
@@ -299,12 +301,12 @@ class GRPOTrainer:
                     # System 2: Advisory 9B Verifier (Selective low-frequency / recheck sampling)
                     if self.verifier.should_sample(prob):
                         v_delta, v_answers = self.verifier.evaluate_trajectory(prob, traj)
-                        scored.total_reward += v_delta
                         scored.verifier_answers = v_answers
                         scored.component_scores["verifier_delta"] = v_delta
+                        scored.column_scores["accuracy"] = round(scored.column_scores.get("accuracy", 0.0) + v_delta, 4)
+                        scored.total_reward = round(sum(scored.component_scores.values()), 4)
 
                     group_scored.append(scored)
-                    group_rewards.append(scored.total_reward)
 
                 # 4. Group Advantage Normalization (GDPO - Decoupled Multi-Reward Normalization)
                 advantages, col_advantages = ChunkedGRPOLoss.compute_gdpo_advantages(group_scored)
@@ -316,25 +318,32 @@ class GRPOTrainer:
                 all_scored_trajectories.append(group_scored)
 
                 # 5. Curriculum Feedback to Queue (Bounded Retry & Variation)
-                for scored in group_scored:
-                    success = scored.total_reward > 0 and scored.is_safe
-                    self.queue.handle_feedback(
-                        problem=prob,
-                        success=success,
-                        failure_reason=scored.failure_reason,
-                        audit_note=json.dumps(scored.audit_log),
-                    )
+                # Aggregated once per problem across the group to prevent swamping cluster history
+                group_success = any(s.total_reward > 0 and s.is_safe for s in group_scored)
+                best_scored = max(group_scored, key=lambda s: s.total_reward)
+                self.queue.handle_feedback(
+                    problem=prob,
+                    success=group_success,
+                    failure_reason=None if group_success else best_scored.failure_reason,
+                    audit_note=json.dumps(best_scored.audit_log),
+                )
 
-                # Tokenize inputs + responses for gradient calculation
-                for scored in group_scored:
-                    p_ids = self.tokenizer.encode(prob.user_problem, add_special_tokens=False)
-                    full_ids = self.tokenizer.encode(scored.trajectory.full_text, add_special_tokens=False)
-                    combo = p_ids + full_ids
+                # Tokenize inputs + responses for gradient calculation (combo = prompt + response)
+                p_ids = self.tokenizer.encode(prob.user_problem, add_special_tokens=False)
+                for r_idx, scored in enumerate(group_scored):
+                    r_ids = self.tokenizer.encode(scored.trajectory.full_text, add_special_tokens=False)
+                    combo = p_ids + r_ids
 
                     flat_input_ids.append(torch.tensor(combo, dtype=torch.long))
                     flat_attention_masks.append(torch.ones(len(combo), dtype=torch.long))
                     flat_prompt_lens.append(len(p_ids))
                     flat_advantages.append(scored.advantage)
+
+                    lp = rollout_lps[r_idx]
+                    if lp is not None:
+                        flat_old_logprobs.append((len(p_ids), lp.squeeze(0) if lp.dim() == 2 else lp))
+                    else:
+                        flat_old_logprobs.append(None)
 
         # 6. Policy Gradient Training Phase (train mode)
         self.model.train()
@@ -345,6 +354,18 @@ class GRPOTrainer:
         padded_masks = nn.utils.rnn.pad_sequence(flat_attention_masks, batch_first=True, padding_value=0).to(self.device)
         tensor_advantages = torch.tensor(flat_advantages, dtype=torch.float32, device=self.device)
 
+        # Align rollout old_logprobs if recorded for true PPO clipped surrogate loss
+        tensor_old_logprobs = None
+        if any(lp is not None for lp in flat_old_logprobs):
+            max_seq_len_minus_one = padded_inputs.shape[1] - 1
+            tensor_old_logprobs = torch.zeros((len(flat_old_logprobs), max_seq_len_minus_one), dtype=torch.float32, device=self.device)
+            for i, item in enumerate(flat_old_logprobs):
+                if item is not None:
+                    p_len, lp = item
+                    r_len = min(len(lp), max_seq_len_minus_one - (p_len - 1))
+                    if r_len > 0 and p_len > 0:
+                        tensor_old_logprobs[i, p_len - 1 : p_len - 1 + r_len] = lp[:r_len].to(self.device)
+
         # Compute Chunked GRPO Loss
         loss, loss_metrics = self.loss_fn.forward_chunked(
             model=self.model,
@@ -352,6 +373,7 @@ class GRPOTrainer:
             attention_mask=padded_masks,
             prompt_lengths=flat_prompt_lens,
             advantages=tensor_advantages,
+            old_logprobs=tensor_old_logprobs,
         )
 
         # Add MoE Auxiliary Load-Balancing Loss if MoE model

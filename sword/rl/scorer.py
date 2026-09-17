@@ -437,8 +437,13 @@ class PrimaryScorer:
             audit["prohibited_bold_found"] = True
             audit["bold_matches"] = bold_patterns[:5]
 
-        # Extract words from trace
+        # Extract early text preserving newlines for structural list detection
         words = trace.split()
+        if len(words) <= 200:
+            first_200_text = trace
+        else:
+            match_200 = re.match(r"(?:\s*\S+){1,200}", trace)
+            first_200_text = match_200.group(0) if match_200 else trace[:1200]
         first_200_words = " ".join(words[:200])
 
         # 2. "Step-by-step" / "step to step" prohibition in the first 200 words
@@ -451,7 +456,7 @@ class PrimaryScorer:
         # 3. Rapid short numbered list check in early thinking (e.g. 1. ... \n 2. ...)
         # If consecutive list items appear and any has < 15 words -> -0.2 penalty
         # Substantive items with >= 15 words avoid false positives and receive no penalty
-        list_items = re.findall(r"(?:^|\n)\s*\d+[.:\)]\s*(.*?)(?=(?:\n\s*\d+[.:\)]|\Z))", first_200_words, re.DOTALL)
+        list_items = re.findall(r"(?:^|\n)\s*\d+[.:\)]\s*(.*?)(?=(?:\n\s*\d+[.:\)]|\Z))", first_200_text, re.DOTALL)
         if len(list_items) >= 2:
             short_items = [item.strip() for item in list_items if len(item.split()) < 15]
             if short_items:
@@ -776,6 +781,13 @@ class PrimaryScorer:
             negation = f"I am {c}"
             if negation.lower() in current_text.lower():
                 violations.append(c)
+            elif any(prefix in c.lower() for prefix in ["use", "include", "mention", "have", "add"]):
+                term = re.sub(r"^(?:use|include|mention|have|add)\s+", "", c.strip(), flags=re.IGNORECASE)
+                sub_terms = re.split(r"\s+(?:or|and)\s+", term)
+                for st in sub_terms:
+                    st_clean = re.sub(r"\s+(?:in|on|at|for|with)\s+.*$", "", st.strip().lower())
+                    if st_clean and len(st_clean) >= 3 and st_clean in current_text.lower():
+                        violations.append(st_clean)
 
         if violations:
             return -0.3, {"constraint_violations": violations}

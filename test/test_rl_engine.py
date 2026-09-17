@@ -423,6 +423,63 @@ class TestRLEngine(unittest.TestCase):
         flat_adv = ChunkedGRPOLoss.compute_group_advantages(flat_rewards)
         self.assertEqual(flat_adv, [0.0] * 8)
 
+    # =========================================================
+    # 7. Bug Fix Verifications
+    # =========================================================
+    def test_thinking_rapid_short_list_with_newlines(self):
+        problem = DatasetRow(problem_id="list_test", user_problem="Explain physics", domain=DomainType.SCIENCE)
+        # Rapid short numbered list (<15 words per item) separated by newlines
+        trace_with_short_list = (
+            "Let us break this down:\n"
+            "1. First point here.\n"
+            "2. Second point here.\n"
+            "Now let us continue with our detailed analysis."
+        )
+        traj = Trajectory(
+            prompt="p",
+            full_text=trace_with_short_list,
+            reasoning_trace=trace_with_short_list,
+            final_answer="done",
+        )
+        scored = self.scorer.score_trajectory(problem, traj)
+        self.assertLess(scored.component_scores["thinking_formatting"], 0.0)
+        self.assertTrue(scored.audit_log["thinking_formatting"]["rapid_short_list_penalty"])
+
+    def test_multi_turn_constraint_detection(self):
+        problem = DatasetRow(
+            problem_id="mt1",
+            user_problem="Help me write a summary",
+            domain=DomainType.MULTI_TURN,
+            conversation_history=[
+                {"role": "user", "content": "Never include emojis or emoticons in your answers"},
+                {"role": "assistant", "content": "Understood."},
+            ],
+        )
+        # Trajectory that violates the negative constraint by including emojis
+        traj_violated = Trajectory(prompt="p", full_text="Here is your summary with emojis :)")
+        scored_violated = self.scorer.score_trajectory(problem, traj_violated)
+        self.assertLess(scored_violated.component_scores["multi_turn_coherence"], 0.0)
+
+        # Trajectory that complies
+        traj_clean = Trajectory(prompt="p", full_text="Here is your clean plain summary.")
+        scored_clean = self.scorer.score_trajectory(problem, traj_clean)
+        self.assertGreater(scored_clean.component_scores["multi_turn_coherence"], 0.0)
+
+    def test_verifier_scope_violation_heuristic(self):
+        problem = DatasetRow(problem_id="v_scope", user_problem="Fix bug", domain=DomainType.CODE)
+        # Diff touches undeclared file secret.py
+        traj_violating = Trajectory(
+            prompt="p",
+            full_text="--- a/secret.py\n+++ b/secret.py\n+ hack",
+            reasoning_trace="I will edit main.py to fix the bug.",
+            final_answer="--- a/secret.py\n+++ b/secret.py\n+ hack",
+        )
+        delta, answers = self.verifier.evaluate_trajectory(problem, traj_violating)
+        self.assertIn("scope_violation", answers)
+        self.assertTrue(answers["scope_violation"].answer)
+        self.assertIn("secret.py", answers["scope_violation"].citation)
+        self.assertLess(delta, 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

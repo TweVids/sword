@@ -378,6 +378,90 @@ class ThinkingFormatVerifier:
 
 
 # =====================================================================
+# 📝  TEXT & BULLET STRUCTURE UTILITIES
+# =====================================================================
+def count_sentences(text: str) -> int:
+    """
+    Accurately counts sentences in a text block, masking LaTeX formulas,
+    decimal numbers (e.g. 3.14), abbreviations, and splitting on [.!?] followed by whitespace.
+    """
+    if not text or not text.strip():
+        return 0
+    cleaned = re.sub(
+        r"\$\$.*?\$\$|\$.*?\$|\\\[.*?\\\]|\\\(.*?\\\)|\s*\\begin\{[a-z*]*\}.*?\\end\{[a-z*]*\}",
+        " FORMULA ",
+        text,
+        flags=re.DOTALL,
+    )
+    # Mask decimal numbers like 3.14 so period isn't treated as end of sentence
+    cleaned = re.sub(r"\b\d+\.\d+\b", "NUM", cleaned)
+    # Split on terminal punctuation followed by space or newline
+    sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", cleaned) if len(s.strip()) > 3]
+    return len(sents)
+
+
+def extract_bullet_items(text: str) -> List[str]:
+    """
+    Extracts individual bullet points from markdown text.
+    Handles *, -, +, and • bullets, including multi-line bullet bodies.
+    """
+    lines = text.split("\n")
+    bullets: List[str] = []
+    current_bullet: List[str] = []
+    bullet_marker = re.compile(r"^\s*[-*+•]\s+(.*)$")
+
+    for line in lines:
+        m = bullet_marker.match(line)
+        if m:
+            if current_bullet:
+                bullets.append("\n".join(current_bullet).strip())
+                current_bullet = []
+            current_bullet.append(m.group(1).strip())
+        elif current_bullet:
+            stripped = line.strip()
+            # If line is header, end current bullet
+            if re.match(r"^\s*#{1,6}\s+", line):
+                bullets.append("\n".join(current_bullet).strip())
+                current_bullet = []
+            elif stripped:
+                current_bullet.append(stripped)
+            else:
+                current_bullet.append("")
+
+    if current_bullet:
+        bullets.append("\n".join(current_bullet).strip())
+
+    return [b for b in bullets if b.strip()]
+
+
+def is_valid_bullet_archetype(bullet_text: str) -> Tuple[bool, str]:
+    """
+    Validates if a bullet item matches Archetype A or Archetype B:
+    - Archetype A: ** >=5 words title - ** Body paragraph with >= 3 sentences
+      (the ' - ' separator before the closing ** is strictly mandatory)
+    - Archetype B: Continuous paragraph with >= 4 sentences
+    Returns (is_valid, matched_archetype)
+    """
+    # Check Archetype A: ** title - ** body
+    # Strictly requires ' - ' separator before the closing **
+    match_a = re.match(r"^\s*\*\*\s*(.+?)\s+-\s+\*\*\s*(.+)$", bullet_text, re.DOTALL)
+    if match_a:
+        title = match_a.group(1).strip()
+        body = match_a.group(2).strip()
+        title_word_count = len(title.split())
+        body_sentence_count = count_sentences(body)
+        if title_word_count >= 5 and body_sentence_count >= 3:
+            return True, "archetype_a"
+
+    # Check Archetype B: continuous paragraph bullet with >= 4 sentences
+    sent_count = count_sentences(bullet_text)
+    if sent_count >= 4:
+        return True, "archetype_b"
+
+    return False, "invalid"
+
+
+# =====================================================================
 # 🎯  PRIMARY SCORER (GROUND TRUTH MATH + FORMAT + EFFICIENCY)
 # =====================================================================
 class MathScorer:
@@ -468,14 +552,6 @@ class MathScorer:
             if is_bigmath or is_higher_than_medium:
                 paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", trace) if len(p.strip()) > 15]
                 if paragraphs:
-                    def count_sentences(p: str) -> int:
-                        cleaned = re.sub(
-                            r"\$\$.*?\$\$|\$.*?\$|\\\[.*?\\\]|\\\(.*?\\\)|\s*\\begin\{[a-z*]*\}.*?\\end\{[a-z*]*\}",
-                            " FORMULA ",
-                            p,
-                            flags=re.DOTALL,
-                        )
-                        return len([s for s in re.split(r"(?<=[.!?])\s+", cleaned) if len(s.strip()) > 4])
                     counts = [count_sentences(p) for p in paragraphs]
                     avg_sents = sum(counts) / len(counts)
                     if avg_sents >= 3.0 or any(c >= 3 for c in counts):
@@ -605,8 +681,315 @@ class MathScorer:
 
 
 # =====================================================================
+# 🎓  EXPLANATION SCORER (MULTI-TURN PEDAGOGICAL DIALOG)
+# =====================================================================
+class ExplanationScorer:
+    """
+    Dedicated multi-reward scoring system for Turn 2 explanations.
+    Completely decoupled from Turn 1 math solving to prevent reward conflicts:
+    1. Steals reasoning content discipline for <think> traces:
+       - Tag compliance (ThinkingFormatVerifier)
+       - Continuous natural paragraphs (+0.15), strictly no bullets/headers (-0.15)
+       - 3+ sentence paragraph depth (+0.10 / -0.10) for complex problems or effort > medium
+       - Anti-looping / anti-repetition (-0.50)
+       - Prohibited bold markdown in thinking (-0.20)
+       - Token budget compliance & verification bonuses
+    2. Explanation Answer Field Rules:
+       - GSM8K: exactly 1 continuous paragraph with >= 5 sentences (no headers, no bullets) (+0.25 / -0.25)
+       - Complex Datasets (AoPS, BigMath2):
+         * Header rule: '#' and '##' must have > 5 words per header. Short headers (<= 5 words) penalized (-0.15), rich headers (> 5 words) rewarded (+0.15).
+         * Bullet quantity: when bullets are used, must have >= 5 bullets. Fewer than 5 penalized (-0.20).
+         * Bullet structure: every bullet must match Archetype A (strictly mandatory ' - ' separator before **) or Archetype B (>= 4 sentences). All valid (+0.20), any invalid (-0.20).
+       - Pedagogical content & accuracy: ground truth concept present (+0.35 / -0.30), substantive length (+0.10) / shallow (-0.20).
+    3. Grouped into decoupled GDPO columns:
+       - pedagogical_accuracy
+       - explanation_structure
+       - thinking_discipline
+       - efficiency
+       - safety
+    """
+
+    @staticmethod
+    def _normalize_math(ans: str) -> str:
+        return MathScorer._normalize_math(ans)
+
+    def score(
+        self,
+        problem: str,
+        reference_answer: str,
+        full_text: str,
+        effort_tier: str = "high",
+        token_count: int = 0,
+        dataset_name: str = "",
+    ) -> Dict[str, Any]:
+        tag_score, tag_audit, trace, answer = ThinkingFormatVerifier.verify(full_text)
+        audit_flags: Dict[str, Any] = {"thinking_tags": tag_audit}
+
+        # -------------------------------------------------------------
+        # 1. THINKING TRACE RULES ("Stolen from reasoning content")
+        # -------------------------------------------------------------
+        thinking_format_score = 0.0
+
+        trace_text_for_lists = re.sub(
+            r"\$\$.*?\$\$|\\\[.*?\\\]|\\begin\{[a-z*]*\}.*?\\end\{[a-z*]*\}",
+            "",
+            trace,
+            flags=re.DOTALL,
+        )
+        has_bullets_in_trace = bool(re.search(r"^\s*[-*•]\s+(?!\s*[\d\w\\$].*?[=<>])", trace_text_for_lists, re.MULTILINE))
+        has_numbered_in_trace = bool(re.search(r"^\s*\d+[\.)]\s+", trace_text_for_lists, re.MULTILINE))
+        has_headers_in_trace = bool(re.search(r"^\s*#{1,6}\s+", trace_text_for_lists, re.MULTILINE))
+
+        if has_bullets_in_trace or has_numbered_in_trace or has_headers_in_trace:
+            thinking_format_score -= 0.15
+            audit_flags["bullet_or_list_in_thinking"] = True
+        elif len(trace.strip()) >= 20:
+            thinking_format_score += 0.15
+            audit_flags["natural_paragraph_thinking_rewarded"] = True
+
+            # Check 3+ sentence paragraph depth for complex datasets or effort > medium
+            is_complex = any(k in str(dataset_name).lower() for k in ["bigmath", "aops", "openmath"])
+            is_higher_than_medium = str(effort_tier).lower() in ("high", "xhigh", "ultra", "max")
+            if is_complex or is_higher_than_medium:
+                paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", trace) if len(p.strip()) > 15]
+                if paragraphs:
+                    counts = [count_sentences(p) for p in paragraphs]
+                    avg_sents = sum(counts) / len(counts)
+                    if avg_sents >= 3.0 or any(c >= 3 for c in counts):
+                        thinking_format_score += 0.10
+                        audit_flags["deep_paragraph_sentences_rewarded"] = True
+                    else:
+                        thinking_format_score -= 0.10
+                        audit_flags["shallow_paragraphs_penalty"] = -0.10
+
+        # Efficiency & Anti-Looping in thinking trace
+        efficiency_score = 0.0
+        sentences = [s.strip() for s in re.split(r"[.!?\n]+", trace) if len(s.split()) >= 4]
+        counts = defaultdict(int)
+        for s in sentences:
+            norm = s.lower()
+            counts[norm] += 1
+            if counts[norm] >= 2:
+                efficiency_score -= 0.50
+                audit_flags["repetitive_loop_detected"] = True
+                break
+
+        if re.search(r"\*\*[^*\n]+\*\*", trace):
+            efficiency_score -= 0.20
+            audit_flags["prohibited_bold_found"] = True
+
+        # Effort tier token budget
+        effort_score = 0.0
+        max_budget = {"low": 1024, "medium": 4024, "high": 11024, "xhigh": 22024, "ultra": 32024, "max": 65536}.get(effort_tier.lower(), 11024)
+        if token_count <= max_budget:
+            if effort_tier.lower() == "low":
+                if token_count <= 800:
+                    effort_score += 0.10
+                    audit_flags["rapid_low_effort_rewarded"] = True
+                elif token_count > 1500:
+                    effort_score -= 0.20
+                    audit_flags["complexity_cross_match_penalty"] = -0.20
+            elif effort_tier.lower() in ("high", "xhigh", "ultra", "max"):
+                if token_count >= 200:
+                    effort_score += 0.10
+                    audit_flags["deep_effort_rewarded"] = True
+                else:
+                    effort_score -= 0.15
+                    audit_flags["insufficient_effort_penalty"] = -0.15
+        else:
+            overage = (token_count - max_budget) / max_budget
+            if overage > 0.10:
+                pen = min(1.0, 0.5 * ((overage - 0.10) / 0.40))
+                effort_score -= pen
+                audit_flags["budget_overage_penalty"] = -pen
+
+        if effort_tier.lower() in ("high", "xhigh", "ultra", "max"):
+            verification_cues = [r"\bverif", r"\bcheck", r"\bconfirm", r"\bdouble[-\s]check", r"\bsubstitut", r"\bassum"]
+            if any(re.search(pat, trace, re.IGNORECASE) for pat in verification_cues):
+                effort_score += 0.10
+                audit_flags["effort_verification_steps_rewarded"] = True
+
+        conciseness_bonus = max(0.0, (1.0 - min(token_count / max_budget, 1.0))) * 0.05
+        effort_score += conciseness_bonus
+
+        # -------------------------------------------------------------
+        # 2. EXPLANATION ANSWER FIELD RULES (PEDAGOGICAL STRUCTURE)
+        # -------------------------------------------------------------
+        explanation_structure_score = 0.0
+        is_gsm8k = "gsm8k" in str(dataset_name).lower() or "template" in str(dataset_name).lower()
+
+        if is_gsm8k:
+            # GSM8K Single Continuous Paragraph Rule:
+            # Must be exactly 1 continuous paragraph, >= 5 sentences, NO headers, NO bullets
+            has_headers = bool(re.search(r"^\s*#{1,6}\s+", answer, re.MULTILINE))
+            has_bullets = bool(re.search(r"^\s*[-*•]\s+", answer, re.MULTILINE) or re.search(r"^\s*\d+[\.)]\s+", answer, re.MULTILINE))
+            paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", answer) if len(p.strip()) > 10]
+            num_sents = count_sentences(answer)
+
+            if has_headers or has_bullets or len(paragraphs) != 1 or num_sents < 5:
+                explanation_structure_score -= 0.25
+                audit_flags["gsm8k_paragraph_rule_violation"] = {
+                    "has_headers": has_headers,
+                    "has_bullets": has_bullets,
+                    "paragraph_count": len(paragraphs),
+                    "sentence_count": num_sents,
+                }
+            else:
+                explanation_structure_score += 0.25
+                audit_flags["gsm8k_single_deep_paragraph_rewarded"] = True
+        else:
+            # Complex Datasets (AoPS, BigMath2, etc.) Rules:
+            # A. Header Rule: # and ## allowed, but must have > 5 words per header
+            headers = [m.group(1).strip() for m in re.finditer(r"^\s*#{1,6}\s+(.+)$", answer, re.MULTILINE)]
+            if headers:
+                short_headers = [h for h in headers if len(h.split()) <= 5]
+                if short_headers:
+                    explanation_structure_score -= 0.15
+                    audit_flags["short_header_penalty"] = -0.15
+                    audit_flags["short_headers"] = short_headers
+                else:
+                    explanation_structure_score += 0.15
+                    audit_flags["rich_header_rewarded"] = True
+
+            # B. Bullet Quantity Rule & Archetype Structure
+            bullet_items = extract_bullet_items(answer)
+            if bullet_items:
+                if len(bullet_items) < 5:
+                    explanation_structure_score -= 0.20
+                    audit_flags["insufficient_bullets_penalty"] = -0.20
+                    audit_flags["bullet_count"] = len(bullet_items)
+                else:
+                    audit_flags["adequate_bullets"] = True
+
+                # Check Archetypes for each bullet
+                invalid_bullets = []
+                archetype_counts = {"archetype_a": 0, "archetype_b": 0}
+                for b_idx, b_text in enumerate(bullet_items):
+                    is_valid, arch_type = is_valid_bullet_archetype(b_text)
+                    if is_valid:
+                        archetype_counts[arch_type] += 1
+                    else:
+                        invalid_bullets.append({"idx": b_idx, "snippet": b_text[:80]})
+
+                if invalid_bullets:
+                    explanation_structure_score -= 0.20
+                    audit_flags["invalid_bullet_archetype_penalty"] = -0.20
+                    audit_flags["invalid_bullets"] = invalid_bullets
+                elif len(bullet_items) >= 5:
+                    explanation_structure_score += 0.20
+                    audit_flags["valid_bullet_archetypes_rewarded"] = True
+                    audit_flags["archetype_counts"] = archetype_counts
+
+        # -------------------------------------------------------------
+        # 3. PEDAGOGICAL CONTENT & MATHEMATICAL ACCURACY
+        # -------------------------------------------------------------
+        norm_ref = self._normalize_math(reference_answer)
+        norm_ans = self._normalize_math(answer)
+        norm_full = self._normalize_math(full_text)
+
+        is_concept_match = False
+        try:
+            ref_num = float(norm_ref)
+            ans_numbers = [float(x) for x in re.findall(r"[-+]?(?:\d*\.\d+|\d+)", answer)]
+            if any(abs(n - ref_num) < 1e-4 for n in ans_numbers):
+                is_concept_match = True
+        except (ValueError, TypeError):
+            pass
+
+        if not is_concept_match:
+            is_concept_match = (
+                (norm_ref in norm_ans)
+                or (norm_ans == norm_ref)
+                or (norm_ref and norm_ref in norm_full)
+                or (reference_answer.strip().lower() in answer.lower())
+            )
+
+        pedagogical_accuracy = 0.35 if is_concept_match else -0.30
+        audit_flags["pedagogical_accuracy_match"] = is_concept_match
+
+        # Substantive explanation length check
+        ans_word_count = len(answer.split())
+        if ans_word_count >= 80:
+            pedagogical_accuracy += 0.10
+            audit_flags["substantive_explanation_rewarded"] = True
+        elif ans_word_count < 20:
+            pedagogical_accuracy -= 0.20
+            audit_flags["shallow_explanation_penalty"] = -0.20
+
+        # -------------------------------------------------------------
+        # 4. GROUP INTO DECOUPLED GDPO COLUMNS
+        # -------------------------------------------------------------
+        columns = {
+            "pedagogical_accuracy": round(pedagogical_accuracy, 4),
+            "explanation_structure": round(explanation_structure_score, 4),
+            "thinking_discipline": round(tag_score + thinking_format_score, 4),
+            "efficiency": round(efficiency_score + effort_score, 4),
+            "safety": 0.0,
+        }
+
+        total_reward = round(sum(columns.values()), 4)
+
+        return {
+            "total_reward": total_reward,
+            "column_scores": columns,
+            "component_scores": {
+                "thinking_tags": tag_score,
+                "thinking_format": thinking_format_score,
+                "explanation_structure": explanation_structure_score,
+                "pedagogical_accuracy": pedagogical_accuracy,
+                "efficiency": efficiency_score,
+                "effort_budget": round(effort_score, 4),
+                "safety": 0.0,
+            },
+            "is_correct": is_concept_match,
+            "reasoning_trace": trace,
+            "final_answer": answer,
+            "audit_log": audit_flags,
+        }
+
+
+# =====================================================================
 # ⚖️  GDPO (GROUP REWARD-DECOUPLED NORMALIZATION POLICY OPTIMIZATION)
 # =====================================================================
+def compute_explanation_gdpo_advantages(
+    rollout_results: List[Dict[str, Any]],
+    column_weights: Optional[Dict[str, float]] = None,
+    eps: float = 1e-8,
+) -> Tuple[List[float], Dict[str, List[float]]]:
+    """
+    Decoupled advantage normalization across pedagogical explanation columns:
+    pedagogical_accuracy (1.0), explanation_structure (0.4), thinking_discipline (0.3), efficiency (0.2).
+    """
+    weights = column_weights or {
+        "pedagogical_accuracy": 1.0,
+        "explanation_structure": 0.4,
+        "thinking_discipline": 0.3,
+        "efficiency": 0.2,
+    }
+    G = len(rollout_results)
+    if G <= 1:
+        return [0.0] * G, {k: [0.0] * G for k in weights.keys()}
+
+    norm_advs: Dict[str, List[float]] = {}
+    for col in weights.keys():
+        vals = [r["column_scores"].get(col, 0.0) for r in rollout_results]
+        mean_v = sum(vals) / G
+        var_v = sum((v - mean_v) ** 2 for v in vals) / G
+        std_v = math.sqrt(var_v)
+        if std_v < eps:
+            norm_advs[col] = [0.0] * G
+        else:
+            norm_advs[col] = [(v - mean_v) / (std_v + eps) for v in vals]
+
+    combined = [0.0] * G
+    for col, w in weights.items():
+        adv_col = norm_advs[col]
+        for i in range(G):
+            combined[i] += w * adv_col[i]
+
+    return combined, norm_advs
+
+
 def compute_gdpo_advantages(
     rollout_results: List[Dict[str, Any]],
     column_weights: Optional[Dict[str, float]] = None,
@@ -615,7 +998,11 @@ def compute_gdpo_advantages(
     """
     Decoupled normalization across accuracy, formatting, and efficiency columns.
     Prevents penalty spiking and reward collapse (NVIDIA arXiv:2601.05242).
+    Automatically routes to compute_explanation_gdpo_advantages if pedagogical_accuracy is present.
     """
+    if rollout_results and "pedagogical_accuracy" in rollout_results[0].get("column_scores", {}):
+        return compute_explanation_gdpo_advantages(rollout_results, column_weights=column_weights, eps=eps)
+
     weights = column_weights or {"accuracy": 1.0, "formatting": 0.3, "efficiency": 0.2}
     G = len(rollout_results)
 
@@ -857,6 +1244,150 @@ def download_math_dataset(
 
 # Backward compatibility alias
 download_bigmath2 = download_math_dataset
+
+
+def download_curated_study_dataset(
+    cache_file: str = "local_trainer/data/curated_study_100.jsonl",
+    hf_token: Optional[str] = None,
+    force_download: bool = False,
+    offline: bool = False,
+) -> str:
+    """
+    Downloads and caches exactly 100 curated math problems across 3 authoritative sources:
+      1. 35 problems from GSM8K (openai/gsm8k, train split)
+      2. 30 problems from OpenMathReasoning (unsloth/OpenMathReasoning, aops_c4_high_school_math column)
+      3. 35 problems from BigMath2 (Nihilux/BigMath2, train split)
+      Total: exactly 100 problems.
+    Balanced across 6 reasoning effort tiers with built-in offline fallback data.
+    """
+    os.makedirs(os.path.dirname(os.path.abspath(cache_file)), exist_ok=True)
+    if not force_download and os.path.exists(cache_file) and os.path.getsize(cache_file) > 1000:
+        with open(cache_file, "r", encoding="utf-8") as f:
+            lines = [l.strip() for l in f if l.strip()]
+        if len(lines) == 100:
+            print(f"[Data] Found local cached curated study dataset: {cache_file} (100 problems)")
+            return cache_file
+
+    print(f"[Data] Curating 100 study problems (35 GSM8K + 30 AoPS C4 + 35 BigMath2)...")
+    token = hf_token or os.environ.get("HF_TOKEN") or None
+    records: List[Dict[str, Any]] = []
+
+    # 1. 35 GSM8K
+    if not offline:
+        try:
+            from datasets import load_dataset
+            ds_gsm = load_dataset("openai/gsm8k", "main", split="train", streaming=True, token=token)
+            count_gsm = 0
+            for row in ds_gsm:
+                prob = row.get("question", "").strip()
+                ans = row.get("answer", "").strip()
+                if prob and ans:
+                    records.append({
+                        "idx": len(records),
+                        "dataset": "gsm8k",
+                        "problem": prob,
+                        "answer": ans,
+                        "effort_tier": EFFORT_TIERS_LIST[len(records) % len(EFFORT_TIERS_LIST)],
+                    })
+                    count_gsm += 1
+                    if count_gsm >= 35:
+                        break
+            print(f"[Data] Collected {count_gsm} problems from GSM8K")
+        except Exception as e:
+            print(f"[Data] Note: GSM8K streaming returned ({e}). Filling from fallback...")
+
+    # Fill any missing GSM8K from representative problems
+    while sum(1 for r in records if r["dataset"] == "gsm8k") < 35:
+        curr = sum(1 for r in records if r["dataset"] == "gsm8k")
+        records.append({
+            "idx": len(records),
+            "dataset": "gsm8k",
+            "problem": f"A store sells item {curr+1} for $15 each. If a customer buys 4 items and uses a $5 discount coupon, what is the total cost in dollars?",
+            "answer": f"4 * 15 - 5 = 55. Total is <<4*15-5=55>>55\n#### 55",
+            "effort_tier": EFFORT_TIERS_LIST[len(records) % len(EFFORT_TIERS_LIST)],
+        })
+
+    # 2. 30 AoPS C4 High School Math (unsloth/OpenMathReasoning)
+    if not offline:
+        try:
+            from datasets import load_dataset
+            ds_aops = load_dataset("unsloth/OpenMathReasoning", split="cot", streaming=True, token=token)
+            count_aops = 0
+            for row in ds_aops:
+                if row.get("problem_source") == "aops_c4_high_school_math":
+                    prob = row.get("problem", "").strip()
+                    ans = row.get("expected_answer", "").strip()
+                    if prob and ans:
+                        records.append({
+                            "idx": len(records),
+                            "dataset": "aops_c4_high_school_math",
+                            "problem": prob,
+                            "answer": ans,
+                            "effort_tier": EFFORT_TIERS_LIST[len(records) % len(EFFORT_TIERS_LIST)],
+                        })
+                        count_aops += 1
+                        if count_aops >= 30:
+                            break
+            print(f"[Data] Collected {count_aops} problems from AoPS C4 High School Math")
+        except Exception as e:
+            print(f"[Data] Note: AoPS C4 streaming returned ({e}). Filling from fallback...")
+
+    while sum(1 for r in records if r["dataset"] == "aops_c4_high_school_math") < 30:
+        curr = sum(1 for r in records if r["dataset"] == "aops_c4_high_school_math")
+        records.append({
+            "idx": len(records),
+            "dataset": "aops_c4_high_school_math",
+            "problem": f"Find all real solutions x satisfying x^2 - {curr+4}x + 4 = 0.",
+            "answer": f"\\boxed{{{curr+2}}}",
+            "effort_tier": EFFORT_TIERS_LIST[len(records) % len(EFFORT_TIERS_LIST)],
+        })
+
+    # 3. 35 BigMath2 (Nihilux/BigMath2)
+    if not offline:
+        try:
+            from datasets import load_dataset
+            ds_bm = load_dataset("Nihilux/BigMath2", split="train", streaming=True, token=token)
+            count_bm = 0
+            for row in ds_bm:
+                prob = row.get("problem", "").strip()
+                ans = row.get("answer", "").strip()
+                if prob and ans:
+                    records.append({
+                        "idx": len(records),
+                        "dataset": "BigMath2",
+                        "problem": prob,
+                        "answer": ans,
+                        "effort_tier": EFFORT_TIERS_LIST[len(records) % len(EFFORT_TIERS_LIST)],
+                    })
+                    count_bm += 1
+                    if count_bm >= 35:
+                        break
+            print(f"[Data] Collected {count_bm} problems from BigMath2")
+        except Exception as e:
+            print(f"[Data] Note: BigMath2 streaming returned ({e}). Filling from fallback...")
+
+    while sum(1 for r in records if r["dataset"] == "BigMath2") < 35:
+        curr = sum(1 for r in records if r["dataset"] == "BigMath2")
+        records.append({
+            "idx": len(records),
+            "dataset": "BigMath2",
+            "problem": f"Compute the definite integral \\int_0^{curr+1} (3x^2 + 2x) dx.",
+            "answer": f"\\boxed{{{(curr+1)**3 + (curr+1)**2}}}",
+            "effort_tier": EFFORT_TIERS_LIST[len(records) % len(EFFORT_TIERS_LIST)],
+        })
+
+    # Re-index and save exactly 100 records
+    records = records[:100]
+    for i, r in enumerate(records):
+        r["idx"] = i
+        r["effort_tier"] = EFFORT_TIERS_LIST[i % len(EFFORT_TIERS_LIST)]
+
+    with open(cache_file, "w", encoding="utf-8") as f:
+        for r in records:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+    print(f"[Data] Successfully saved {len(records)} curated study problems to {cache_file}")
+    return cache_file
 
 
 def stream_math_data_from_disk(file_path: str) -> Generator[Dict[str, Any], None, None]:
@@ -1167,6 +1698,191 @@ def format_effort_prompt(problem: str, effort_tier: str = "high", tokenizer: Opt
     return f"<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n{problem}<|im_end|>\n<|im_start|>assistant\n"
 
 
+# 2-Turn Pedagogical Explanation Prompt Formatting
+EXPLANATION_FOLLOWUP_PROMPTS: List[str] = [
+    "Explain it!",
+    "Can you guide me solve it?",
+    "Can you explain the detailed steps to solve this?",
+    "Please explain the intuition and step-by-step method.",
+]
+
+
+def format_explanation_turn_prompt(
+    problem: str,
+    direct_answer: str,
+    followup_query: str = "Explain it!",
+    effort_tier: str = "high",
+    dataset_name: str = "",
+    tokenizer: Optional[Any] = None,
+) -> str:
+    """
+    Formats multi-turn prompt for explanation study and training:
+    Turn 1:
+      User: Problem
+      Assistant: \\boxed{direct_answer}
+    Turn 2:
+      User: Follow-up query (e.g. 'Explain it!' or 'Can you guide me solve it?')
+      Assistant: [generation prompt for reasoning trace <think>...</think> + explanation]
+    """
+    tier_key = effort_tier.lower().strip()
+    effort_text = EFFORT_SYSTEM_PROMPTS.get(tier_key, EFFORT_SYSTEM_PROMPTS["high"])
+
+    is_gsm = "gsm8k" in str(dataset_name).lower() or "template" in str(dataset_name).lower()
+    if is_gsm:
+        pedagogical_rule = (
+            "In your final explanation outside <think>, provide exactly 1 continuous paragraph "
+            "of comprehensive explanation with at least 5 sentences. Do not use markdown headers or bullet points."
+        )
+    else:
+        pedagogical_rule = (
+            "In your final explanation outside <think>, provide a thorough, structured pedagogical explanation. "
+            "If using headers (##), each header must be descriptive with more than 5 words. "
+            "If using bullet points, include at least 5 substantive bullets formatted as comprehensive paragraphs."
+        )
+
+    explanation_system = (
+        f"{effort_text}\n"
+        f"{PERSISTENT_PARAGRAPH_PROMPT}\n"
+        f"{pedagogical_rule}"
+    )
+
+    clean_ans = str(direct_answer).strip()
+    if "\\boxed{" not in clean_ans:
+        boxed_ans = f"\\boxed{{{clean_ans}}}"
+    else:
+        boxed_ans = clean_ans
+
+    if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
+        try:
+            messages = [
+                {"role": "system", "content": explanation_system},
+                {"role": "user", "content": problem},
+                {"role": "assistant", "content": boxed_ans},
+                {"role": "user", "content": followup_query},
+            ]
+            return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        except Exception:
+            pass
+
+    return (
+        f"<|im_start|>system\n{explanation_system}<|im_end|>\n"
+        f"<|im_start|>user\n{problem}<|im_end|>\n"
+        f"<|im_start|>assistant\n{boxed_ans}<|im_end|>\n"
+        f"<|im_start|>user\n{followup_query}<|im_end|>\n"
+        f"<|im_start|>assistant\n"
+    )
+
+
+def save_checkpoint(
+    model: Any,
+    tokenizer: Any = None,
+    checkpoint_dir: str = "checkpoints/checkpoint-100",
+    step: int = 100,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> str:
+    """
+    Saves checkpoint (LoRA adapter, tokenizer, and metadata) locally.
+    """
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    if hasattr(model, "save_pretrained"):
+        try:
+            model.save_pretrained(checkpoint_dir)
+            print(f"[Checkpoint] Model weights/adapters saved to {checkpoint_dir}")
+        except Exception as e:
+            print(f"[Checkpoint] Notice: save_pretrained returned ({e}); saving state dict...")
+            torch.save(model.state_dict(), os.path.join(checkpoint_dir, "model_weights.pt"))
+    elif hasattr(model, "state_dict"):
+        torch.save(model.state_dict(), os.path.join(checkpoint_dir, "model_weights.pt"))
+
+    if tokenizer is not None and hasattr(tokenizer, "save_pretrained"):
+        try:
+            tokenizer.save_pretrained(checkpoint_dir)
+        except Exception:
+            pass
+
+    meta = {
+        "step": step,
+        "saved_at": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
+        **(metadata or {}),
+    }
+    with open(os.path.join(checkpoint_dir, "checkpoint_metadata.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+
+    return checkpoint_dir
+
+
+def upload_checkpoint_to_hf(
+    checkpoint_dir: str = "checkpoints/checkpoint-100",
+    repo_id: str = "Nihilux/sword-grpo-200-steps",
+    hf_token: Optional[str] = None,
+    commit_message: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Uploads checkpoint directory (e.g. checkpoint-100) to Hugging Face Hub (via upload_folder or zipped archive).
+    """
+    token = hf_token or os.environ.get("HF_TOKEN")
+    if not token:
+        print(f"[Hub] No HF_TOKEN provided. Checkpoint preserved locally at {checkpoint_dir}.")
+        return None
+
+    if not os.path.exists(checkpoint_dir):
+        print(f"[Hub] Checkpoint dir '{checkpoint_dir}' does not exist. Skipping upload.")
+        return None
+
+    folder_name = os.path.basename(os.path.normpath(checkpoint_dir))
+    msg = commit_message or f"Upload {folder_name} at step 100"
+    print(f"[Hub] Uploading checkpoint folder '{checkpoint_dir}' to {repo_id} ({msg})...")
+
+    try:
+        from huggingface_hub import HfApi
+        api = HfApi(token=token)
+        try:
+            api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True, private=True)
+            repo_type = "model"
+        except Exception:
+            try:
+                api.create_repo(repo_id=repo_id, repo_type="dataset", exist_ok=True, private=True)
+                repo_type = "dataset"
+            except Exception:
+                repo_type = "dataset"
+
+        api.upload_folder(
+            folder_path=checkpoint_dir,
+            path_in_repo=folder_name,
+            repo_id=repo_id,
+            repo_type=repo_type,
+            commit_message=msg,
+        )
+        url = f"https://huggingface.co/{repo_id}/tree/main/{folder_name}"
+        print(f"[Hub] Checkpoint upload complete -> {url}")
+        return url
+    except Exception as e:
+        print(f"[Hub] Direct folder upload encountered: {e}. Falling back to zip packaging...")
+        try:
+            zip_path = f"{os.path.normpath(checkpoint_dir)}.zip"
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                for root, _, files in os.walk(checkpoint_dir):
+                    for file in files:
+                        p = os.path.join(root, file)
+                        zf.write(p, os.path.relpath(p, os.path.dirname(checkpoint_dir)))
+            from huggingface_hub import HfApi
+            api = HfApi(token=token)
+            api.create_repo(repo_id=repo_id, repo_type="dataset", exist_ok=True, private=True)
+            api.upload_file(
+                path_or_fileobj=zip_path,
+                path_in_repo=os.path.basename(zip_path),
+                repo_id=repo_id,
+                repo_type="dataset",
+                commit_message=msg,
+            )
+            url = f"https://huggingface.co/datasets/{repo_id}"
+            print(f"[Hub] Checkpoint archive uploaded -> {url}")
+            return url
+        except Exception as e2:
+            print(f"[Hub] Checkpoint upload failed: {e2}")
+            return None
+
+
 def resolve_checkpoint_lora(
     checkpoint_name: str = "checkpoint-2200",
     hf_repo_id: str = "Nihilux/SpringHunter",
@@ -1234,14 +1950,18 @@ def run_standalone_math_grpo(
     study_mode: bool = False,
     max_samples: Optional[int] = None,
     verbose_study: bool = True,
+    explanation_mode: bool = False,
+    checkpoint_at_100: bool = True,
 ):
     setup_blackwell_environment()
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     mode_str = "🔍 STUDY & AUDIT ONLY (No training/backprop)" if study_mode else "⚡ FULL REINFORCEMENT TRAINING (GDPO)"
+    domain_str = "🎓 MULTI-TURN EXPLANATION (Turn 1: Direct -> Turn 2: Pedagogical)" if explanation_mode else "🎯 DIRECT SOLVING (Turn 1: Problem -> \\boxed{answer})"
     print("=" * 72)
     print(f" 🚀 STANDALONE MATH GRPO ENGINE ({dataset_name})")
     print(f" Operating Mode:  {mode_str}")
+    print(f" Dialogue Domain: {domain_str}")
     print(f" Base Model:      {model_name_or_path}")
     print(f" Dataset:         {dataset_name}")
     print(f" LoRA Checkpoint: {checkpoint_lora} (Store: {checkpoint_repo})")
@@ -1253,17 +1973,23 @@ def run_standalone_math_grpo(
     print(f" Device:          {device}")
     print("=" * 72)
 
-    # 1. Download & Prepare Dataset (download just enough samples for this study run)
-    if max_samples is None:
-        effective_samples = max(steps * 2, 200)
-    else:
-        effective_samples = max_samples
-
-    data_file = download_math_dataset(
-        dataset_name=dataset_name,
-        max_samples=effective_samples,
-        hf_token=hf_token,
+    # 1. Download & Prepare Dataset
+    is_curated = (
+        "curated" in str(dataset_name).lower()
+        or dataset_name in ("curated_study_100", "curated_study", "study_100")
     )
+    if is_curated:
+        data_file = download_curated_study_dataset(hf_token=hf_token)
+    else:
+        if max_samples is None:
+            effective_samples = max(steps * 2, 200)
+        else:
+            effective_samples = max_samples
+        data_file = download_math_dataset(
+            dataset_name=dataset_name,
+            max_samples=effective_samples,
+            hf_token=hf_token,
+        )
     streamer = stream_math_data_from_disk(data_file)
 
     # 2. Resolve LoRA Checkpoint First
@@ -1452,7 +2178,7 @@ def run_standalone_math_grpo(
     )
 
     # 6. Initialize Scorer, Loss, Auditor, Optimizer
-    scorer = MathScorer()
+    scorer = ExplanationScorer() if explanation_mode else MathScorer()
     loss_fn = ChunkedGRPOLoss(chunk_size=512)
     auditor = StepAuditor(dataset_name=dataset_name)
     trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -1473,8 +2199,18 @@ def run_standalone_math_grpo(
         else:
             step_effort = effort_tier.lower()
 
-        # Format user problem with exact effort system prompt
-        formatted_prompt = format_effort_prompt(problem_text, effort_tier=step_effort, tokenizer=tokenizer)
+        # Format user problem with exact effort system prompt (or 2-turn explanation prompt)
+        if explanation_mode:
+            formatted_prompt = format_explanation_turn_prompt(
+                problem=problem_text,
+                direct_answer=ref_answer,
+                followup_query="Explain it!",
+                effort_tier=step_effort,
+                dataset_name=item_dataset,
+                tokenizer=tokenizer,
+            )
+        else:
+            formatted_prompt = format_effort_prompt(problem_text, effort_tier=step_effort, tokenizer=tokenizer)
 
         print(f"[Step {step:03d}/{steps:03d} | {step_effort.upper():<6}] ⏳ Generating {num_rollouts} rollouts...", end="", flush=True)
 
@@ -1506,12 +2242,15 @@ def run_standalone_math_grpo(
             res["token_count"] = token_count
             res["effort_tier"] = step_effort
             res["dataset"] = item_dataset
-            res["acc_reward"] = res.get("column_scores", {}).get("accuracy", 0.0)
-            res["format_reward"] = res.get("column_scores", {}).get("formatting", 0.0)
+            res["acc_reward"] = res.get("column_scores", {}).get("accuracy", res.get("column_scores", {}).get("pedagogical_accuracy", 0.0))
+            res["format_reward"] = res.get("column_scores", {}).get("formatting", res.get("column_scores", {}).get("explanation_structure", 0.0))
             res["effort_reward"] = res.get("column_scores", {}).get("efficiency", 0.0)
             rollout_results.append(res)
 
-        advantages, col_advantages = compute_gdpo_advantages(rollout_results)
+        if explanation_mode:
+            advantages, col_advantages = compute_explanation_gdpo_advantages(rollout_results)
+        else:
+            advantages, col_advantages = compute_gdpo_advantages(rollout_results)
         for idx, adv in enumerate(advantages):
             rollout_results[idx]["advantage"] = adv
 
@@ -1602,10 +2341,23 @@ def run_standalone_math_grpo(
                 print(f"     Answer: {final_ans}")
             print(f"{'─'*72}\n")
 
+        # Checkpoint-100 and Hub archive upload
+        if step == 100 and checkpoint_at_100:
+            ckpt_100_dir = "checkpoints/checkpoint-100"
+            print(f"\n[Step {step:03d}] 🏁 Saving checkpoint-100 & uploading to Hugging Face Hub...")
+            save_checkpoint(model, tokenizer, checkpoint_dir=ckpt_100_dir, step=100)
+            upload_checkpoint_to_hf(checkpoint_dir=ckpt_100_dir, repo_id=repo_id, hf_token=hf_token)
+            zip_and_upload_to_hf(auditor.log_dir, repo_id=repo_id, hf_token=hf_token)
+
         del rollout_results
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    # Final checkpoint save & upload
+    final_ckpt_dir = f"checkpoints/checkpoint-{steps}"
+    save_checkpoint(model, tokenizer, checkpoint_dir=final_ckpt_dir, step=steps)
+    upload_checkpoint_to_hf(checkpoint_dir=final_ckpt_dir, repo_id=repo_id, hf_token=hf_token)
 
     # Summarize and Upload to HF Hub
     auditor.summarize()
@@ -1618,6 +2370,8 @@ def main():
     parser.add_argument("--checkpoint", type=str, default="checkpoint-2200")
     parser.add_argument("--dataset", type=str, default="math-ai/TemplateGSM", help="Dataset name on Hugging Face (default: math-ai/TemplateGSM)")
     parser.add_argument("--study_mode", "--study", action="store_true", help="Study mode: generate and audit model answers without backpropagation training")
+    parser.add_argument("--explanation_mode", "--explain", action="store_true", help="Explanation mode: run multi-turn dialog (Turn 1: direct answer, Turn 2: pedagogical explanation) using ExplanationScorer")
+    parser.add_argument("--curated_dataset", action="store_true", help="Use curated 100-problem study dataset (35 GSM8K, 30 AoPS C4, 35 BigMath2)")
     parser.add_argument("--max_samples", type=int, default=None, help="Maximum dataset samples to download/cache")
     parser.add_argument("--repo_id", type=str, default=os.environ.get("HF_UPLOAD_REPO_ID", "Nihilux/sword-grpo-200-steps"))
     parser.add_argument("--token", type=str, default=os.environ.get("HF_TOKEN", ""))
@@ -1626,24 +2380,31 @@ def main():
     parser.add_argument("--test_stream_only", action="store_true", help="Only stream 1 row of dataset to inspect and exit")
     args = parser.parse_args()
 
+    target_dataset = "curated_study_100" if args.curated_dataset else args.dataset
+
     if args.test_stream_only:
-        data_file = download_math_dataset(dataset_name=args.dataset, hf_token=args.token or None)
+        if "curated" in str(target_dataset).lower():
+            data_file = download_curated_study_dataset(hf_token=args.token or None)
+        else:
+            data_file = download_math_dataset(dataset_name=target_dataset, hf_token=args.token or None)
         streamer = stream_math_data_from_disk(data_file)
         row = next(streamer)
-        print(f"\n[Test Stream] Inspected 1 sample row from {args.dataset}:")
+        print(f"\n[Test Stream] Inspected 1 sample row from {target_dataset}:")
         print(json.dumps(row, indent=2))
         sys.exit(0)
 
     run_standalone_math_grpo(
         model_name_or_path=args.model,
         checkpoint_lora=args.checkpoint,
-        dataset_name=args.dataset,
+        dataset_name=target_dataset,
         repo_id=args.repo_id,
         hf_token=args.token,
         effort_tier=args.effort_tier,
         steps=args.steps,
         study_mode=args.study_mode,
         max_samples=args.max_samples,
+        explanation_mode=args.explanation_mode,
+        checkpoint_at_100=True,
     )
 
 
