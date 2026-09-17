@@ -470,13 +470,16 @@ class MathScorer:
 
     @staticmethod
     def _normalize_math(ans: str) -> str:
-        s = ans.strip().lower()
+        s = str(ans).strip().lower()
+        # Handle GSM8K '####' final answer marker
+        if "####" in s:
+            s = s.split("####")[-1].strip()
         s = s.replace(";", ",")
         # Handle LaTeX commands before stripping backslashes
         s = re.sub(r"\\(?:text|mathrm|mathbf)\{([^}]+)\}", r"\1", s)
         s = re.sub(r"\\frac\{([^}]+)\}\{([^}]+)\}", r"\1/\2", s)
         # Extract \boxed{...} if present
-        boxed = re.findall(r"\\boxed\{([^}]+)\}", ans)
+        boxed = re.findall(r"\\boxed\{([^}]+)\}", s)
         if boxed:
             return MathScorer._normalize_math(boxed[-1])
         s = re.sub(r"[\$\\,\s;]", "", s)
@@ -1283,11 +1286,12 @@ def download_curated_study_dataset(
                 prob = row.get("question", "").strip()
                 ans = row.get("answer", "").strip()
                 if prob and ans:
+                    target_ans = ans.split("####")[-1].strip() if "####" in ans else ans
                     records.append({
                         "idx": len(records),
                         "dataset": "gsm8k",
                         "problem": prob,
-                        "answer": ans,
+                        "answer": target_ans,
                         "effort_tier": EFFORT_TIERS_LIST[len(records) % len(EFFORT_TIERS_LIST)],
                     })
                     count_gsm += 1
@@ -1304,7 +1308,7 @@ def download_curated_study_dataset(
             "idx": len(records),
             "dataset": "gsm8k",
             "problem": f"A store sells item {curr+1} for $15 each. If a customer buys 4 items and uses a $5 discount coupon, what is the total cost in dollars?",
-            "answer": f"4 * 15 - 5 = 55. Total is <<4*15-5=55>>55\n#### 55",
+            "answer": "55",
             "effort_tier": EFFORT_TIERS_LIST[len(records) % len(EFFORT_TIERS_LIST)],
         })
 
@@ -1425,6 +1429,12 @@ def prepare_study_records(
 
     if not records:
         return records
+
+    # Automatically sanitize GSM8K reference answers so they contain the clean target number
+    for r in records:
+        ans_raw = str(r.get("answer", "")).strip()
+        if "####" in ans_raw:
+            r["answer"] = ans_raw.split("####")[-1].strip()
 
     mode_str = str(shuffle_mode).lower().strip()
     if mode_str in ("false", "none", "off", "0", "no"):

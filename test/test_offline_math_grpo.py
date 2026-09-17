@@ -174,6 +174,25 @@ class TestMathScorerAccuracy(unittest.TestCase):
         self.assertTrue(res["is_correct"])
         self.assertEqual(res["column_scores"]["accuracy"], 0.35)
 
+    def test_gsm8k_full_scratchpad_reference_answer(self):
+        # Full multi-line GSM8K reference answer with calculation scratchpad and #### marker
+        gsm8k_ref = (
+            "Natalia sold 48/2 = <<48/2=24>>24 clips in May.\n"
+            "Natalia sold 48+24 = <<48+24=72>>72 clips altogether in April and May.\n"
+            "#### 72"
+        )
+        # Rollout 1: Prose answer
+        ro1 = "<think> Natalia sold 48 clips in April and half as many in May. </think> Natalia sold half as many clips in May as in April, so she sold 48 / 2 = 24 clips in May. Altogether she sold 48 + 24 = 72 clips in April and May."
+        res1 = self.scorer.score("prob", gsm8k_ref, ro1)
+        self.assertTrue(res1["is_correct"])
+        self.assertEqual(res1["column_scores"]["accuracy"], 0.35)
+
+        # Rollout 2: Boxed answer
+        ro2 = "<think> Calculation trace </think> Total $$48 + 24 = \\boxed{72}$$."
+        res2 = self.scorer.score("prob", gsm8k_ref, ro2)
+        self.assertTrue(res2["is_correct"])
+        self.assertEqual(res2["column_scores"]["accuracy"], 0.35)
+
     def test_incorrect_answer(self):
         res = self.scorer.score("prob", "357.0", "<think> Reasoning </think> \boxed{999}")
         self.assertFalse(res["is_correct"])
