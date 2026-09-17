@@ -981,7 +981,8 @@ class TestExplanationThinkingDiscipline(unittest.TestCase):
         text = (
             "<think> We first consider the underlying equations. "
             "Next we evaluate all constraints systematically. "
-            "Finally we deduce the consistent result. </think> "
+            "Finally we deduce the consistent result. "
+            "Hence our derivation remains fully sound and complete. </think> "
             "To solve this problem, we observe the given setup. Next we calculate the required expression. "
             "Then we substitute the values to simplify. This produces the result. Hence the answer is 42."
         )

@@ -612,7 +612,7 @@ class MathScorer:
             format_score += 0.15
             audit_flags["natural_paragraph_thinking_rewarded"] = True
 
-            # Check 3+ sentence paragraph depth for complex datasets or when effort is higher than medium (high, xhigh, ultra, max)
+            # Check >= 4 sentence paragraph depth & diversity for complex datasets or when effort is higher than medium (high, xhigh, ultra, max)
             is_complex = any(k in str(dataset_name).lower() for k in ["bigmath", "aops", "openmath", "openreasoning"])
             is_higher_than_medium = str(effort_tier).lower() in ("high", "xhigh", "ultra", "max")
             if is_complex or is_higher_than_medium:
@@ -620,12 +620,28 @@ class MathScorer:
                 if paragraphs:
                     counts = [count_sentences(p) for p in paragraphs]
                     avg_sents = sum(counts) / len(counts)
-                    if avg_sents >= 3.0 or any(c >= 3 for c in counts):
+
+                    # 1. Depth check: must be >= 4 sentences
+                    is_deep = (avg_sents >= 4.0 and all(c >= 3 for c in counts)) or all(c >= 4 for c in counts)
+
+                    # 2. Diversity check for multi-paragraph traces: no adjacent identical counts (e.g. 4-5-7-4 is allowed, 4-4-4 is penalized)
+                    has_monotony = False
+                    if len(counts) >= 2:
+                        for i in range(len(counts) - 1):
+                            if counts[i] == counts[i + 1]:
+                                has_monotony = True
+                                break
+
+                    if is_deep and not has_monotony:
                         format_score += 0.10
                         audit_flags["deep_paragraph_sentences_rewarded"] = True
-                    else:
+                        audit_flags["diverse_paragraph_lengths_rewarded"] = True
+                    elif not is_deep:
                         format_score -= 0.10
                         audit_flags["shallow_paragraphs_penalty"] = -0.10
+                    elif has_monotony:
+                        format_score -= 0.10
+                        audit_flags["monotonous_paragraphs_penalty"] = -0.10
 
         # B. Paragraph behavior outside <think> (in final answer)
         # 1. Detect reasoning evasion: markdown headers, step markers, bullet lists, bold section headers, or multi-paragraph reasoning dumps in the answer
@@ -894,20 +910,36 @@ class ExplanationScorer:
             thinking_format_score += 0.15
             audit_flags["natural_paragraph_thinking_rewarded"] = True
 
-            # Check 3+ sentence paragraph depth for complex datasets or effort > medium
-            is_complex = any(k in str(dataset_name).lower() for k in ["bigmath", "aops", "openmath"])
+            # Check >= 4 sentence paragraph depth & diversity for complex datasets or effort > medium
+            is_complex = any(k in str(dataset_name).lower() for k in ["bigmath", "aops", "openmath", "openreasoning"])
             is_higher_than_medium = str(effort_tier).lower() in ("high", "xhigh", "ultra", "max")
             if is_complex or is_higher_than_medium:
                 paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", trace) if len(p.strip()) > 15]
                 if paragraphs:
                     counts = [count_sentences(p) for p in paragraphs]
                     avg_sents = sum(counts) / len(counts)
-                    if avg_sents >= 3.0 or any(c >= 3 for c in counts):
+
+                    # 1. Depth check: must be >= 4 sentences
+                    is_deep = (avg_sents >= 4.0 and all(c >= 3 for c in counts)) or all(c >= 4 for c in counts)
+
+                    # 2. Diversity check for multi-paragraph traces: no adjacent identical counts (e.g. 4-5-7-4 is allowed, 4-4-4 is penalized)
+                    has_monotony = False
+                    if len(counts) >= 2:
+                        for i in range(len(counts) - 1):
+                            if counts[i] == counts[i + 1]:
+                                has_monotony = True
+                                break
+
+                    if is_deep and not has_monotony:
                         thinking_format_score += 0.10
                         audit_flags["deep_paragraph_sentences_rewarded"] = True
-                    else:
+                        audit_flags["diverse_paragraph_lengths_rewarded"] = True
+                    elif not is_deep:
                         thinking_format_score -= 0.10
                         audit_flags["shallow_paragraphs_penalty"] = -0.10
+                    elif has_monotony:
+                        thinking_format_score -= 0.10
+                        audit_flags["monotonous_paragraphs_penalty"] = -0.10
 
         # Efficiency & Anti-Looping in thinking trace
         efficiency_score = 0.0
@@ -2719,6 +2751,12 @@ def run_standalone_math_grpo(
                     watchlist.append("⚠️ Bullets in Answer")
                 if audit.get("bare_answer_without_prose"):
                     watchlist.append("⚠️ Bare Answer")
+                if audit.get("monotonous_paragraphs_penalty"):
+                    watchlist.append("⚠️ Monotonous Paragraphs")
+                if audit.get("shallow_paragraphs_penalty"):
+                    watchlist.append("⚠️ Shallow Paragraphs")
+                if audit.get("diverse_paragraph_lengths_rewarded"):
+                    watchlist.append("🎨 Diverse Paragraphs")
                 if audit.get("natural_paragraph_answer_rewarded"):
                     watchlist.append("💬 Prose Answer")
                 badge_str = f" | [{', '.join(watchlist)}]" if watchlist else ""
