@@ -2331,7 +2331,59 @@ def resolve_checkpoint_lora(
     return checkpoint_name
 
 
-# =====================================================================
+def check_hf_repo_exists(repo_id: str, token: Optional[str] = None) -> bool:
+    """Checks whether a Hugging Face model repository exists and is accessible."""
+    if not repo_id or "/" not in repo_id:
+        return False
+    try:
+        from huggingface_hub import HfApi
+        api = HfApi(token=token or os.environ.get("HF_TOKEN") or None)
+        api.model_info(repo_id)
+        return True
+    except Exception:
+        return False
+
+
+def upload_fp8_model_to_hf(
+    model: Any,
+    tokenizer: Any,
+    repo_id: str,
+    token: Optional[str] = None,
+    save_dir: str = "checkpoints/fp8_model_export",
+) -> bool:
+    """Saves the FP8 quantized model locally and uploads it to the target Hugging Face repository."""
+    hf_tok = token or os.environ.get("HF_TOKEN") or None
+    if not hf_tok:
+        print(f"⚠️  No HF_TOKEN provided. Cannot upload FP8 model to {repo_id}. Saved locally only at {save_dir}.")
+        return False
+
+    print(f"\n[FP8 Hub] Exporting quantized FP8 model to '{save_dir}'...")
+    os.makedirs(save_dir, exist_ok=True)
+    try:
+        # Unwrap if PEFT/LoRA model
+        export_m = model
+        if hasattr(export_m, "merge_and_unload"):
+            try:
+                export_m = export_m.merge_and_unload()
+            except Exception:
+                pass
+        while hasattr(export_m, "base_model"):
+            export_m = getattr(export_m.base_model, "model", export_m.base_model)
+
+        export_m.save_pretrained(save_dir, safe_serialization=True, max_shard_size="5GB")
+        if tokenizer is not None:
+            tokenizer.save_pretrained(save_dir)
+
+        print(f"[FP8 Hub] Uploading FP8 checkpoint to https://huggingface.co/{repo_id}...")
+        from huggingface_hub import HfApi
+        api = HfApi(token=hf_tok)
+        api.create_repo(repo_id=repo_id, exist_ok=True)
+        api.upload_folder(folder_path=save_dir, repo_id=repo_id)
+        print(f"✅ Successfully uploaded pre-quantized FP8 model to https://huggingface.co/{repo_id}!")
+        return True
+    except Exception as e:
+        print(f"⚠️  Failed to upload FP8 model to {repo_id}: {e}")
+        return False
 # 🚀  MAIN STANDALONE EXECUTION FUNCTION
 # =====================================================================
 def run_standalone_math_grpo(
@@ -2356,6 +2408,7 @@ def run_standalone_math_grpo(
     shuffle_seed: int = 42,
     pair_problems: bool = True,
     checkpoint_at_100: bool = True,
+    fp8_model: Optional[str] = "Nihilux/MLBase-FP8",
 ):
     setup_blackwell_environment()
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -2388,6 +2441,7 @@ def run_standalone_math_grpo(
     print(f" Effort Mode:      {effort_tier.upper()} (Balanced round-robin across 6 tiers if 'balanced')")
     print(f" Context Window:   {max_seq_len} tokens (32k context, max new: {max_new_tokens})")
     print(f" Rollouts:         {num_rollouts} concurrent streams (G=4)")
+    print(f" FP8 Target Model: {fp8_model or 'None'}")
     print(f" FP8 Engine:       {use_fp8}")
     print(f" Steps:            {steps}")
     print(f" Device:           {device}")
@@ -2418,62 +2472,109 @@ def run_standalone_math_grpo(
     )
     print(f"[*] Prepared {len(study_records)} problems from {data_file} ({order_str})")
 
-    # 2. Resolve LoRA Checkpoint First
-    resolved_lora = resolve_checkpoint_lora(
-        checkpoint_name=checkpoint_lora,
-        hf_repo_id=checkpoint_repo,
-        local_dir="checkpoints",
-        hf_token=hf_token,
-    )
+    # 2. Check if Pre-Quantized FP8 Model Exists on Hugging Face or Locally
+    fp8_model_found = False
+    resolved_fp8 = None
+    if fp8_model:
+        if os.path.isdir(fp8_model) or os.path.isdir(os.path.join("checkpoints", fp8_model)):
+            resolved_fp8 = fp8_model if os.path.isdir(fp8_model) else os.path.join("checkpoints", fp8_model)
+            fp8_model_found = True
+            print(f"🚀 [FP8 Hub] Found local pre-quantized FP8 model: {resolved_fp8}")
+        elif check_hf_repo_exists(fp8_model, token=hf_token):
+            resolved_fp8 = fp8_model
+            fp8_model_found = True
+            print(f"🚀 [FP8 Hub] Found pre-quantized FP8 repository on Hugging Face: https://huggingface.co/{fp8_model}")
 
-    # 3. Load Model & Tokenizer
+    # 3. Resolve LoRA Checkpoint (Only needed if FP8 model does NOT exist yet)
+    resolved_lora = None
+    if not fp8_model_found:
+        resolved_lora = resolve_checkpoint_lora(
+            checkpoint_name=checkpoint_lora,
+            hf_repo_id=checkpoint_repo,
+            local_dir="checkpoints",
+            hf_token=hf_token,
+        )
+
+    # 4. Load Model & Tokenizer
     print(f"\n[*] Loading tokenizer and model...")
     lora_attached = False
     model = None
     tokenizer = None
 
-    if HAS_UNSLOTH:
-        print("[*] Unsloth detected: Loading via FastLanguageModel...")
-        try:
-            if os.path.isdir(resolved_lora) and (
-                os.path.exists(os.path.join(resolved_lora, "adapter_config.json"))
-            ):
-                print(f"[*] Loading base model + LoRA adapter together from {resolved_lora}...")
+    if fp8_model_found:
+        print(f"[*] Loading pre-quantized FP8 model directly from {resolved_fp8} (skipping LoRA merge & base download)...")
+        if HAS_UNSLOTH:
+            try:
                 model, tokenizer = FastLanguageModel.from_pretrained(
-                    model_name=resolved_lora,
+                    model_name=resolved_fp8,
                     max_seq_length=max_seq_len,
-                    dtype=torch.bfloat16,
-                    load_in_4bit=False,
                     token=hf_token,
+                    load_in_4bit=False,
                     device_map="auto" if device == "cuda" else None,
                 )
                 lora_attached = True
-                print(f"✅ Loaded base model + LoRA from {resolved_lora} in a single pass via FastLanguageModel")
-            else:
-                model, tokenizer = FastLanguageModel.from_pretrained(
-                    model_name=model_name_or_path,
-                    max_seq_length=max_seq_len,
-                    dtype=torch.bfloat16,
-                    load_in_4bit=False,
-                    token=hf_token,
-                    device_map="auto" if device == "cuda" else None,
-                )
-        except Exception as e_uns:
-            print(f"⚠️  FastLanguageModel notice: {e_uns}. Falling back to standard loader...")
-            model = None
+                print(f"✅ Loaded pre-quantized FP8 model directly via FastLanguageModel!")
+            except Exception as e_fp8_uns:
+                print(f"⚠️  FastLanguageModel FP8 load note: {e_fp8_uns}. Falling back to standard AutoModel...")
+                model = None
 
-    if model is None:
-        tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, padding_side="left", token=hf_token, trust_remote_code=True)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token or "<|endoftext|>"
+        if model is None:
+            tokenizer = AutoTokenizer.from_pretrained(resolved_fp8, padding_side="left", token=hf_token, trust_remote_code=True)
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token or "<|endoftext|>"
+            model = AutoModelForCausalLM.from_pretrained(
+                resolved_fp8,
+                torch_dtype="auto",
+                device_map="auto" if device == "cuda" else None,
+                token=hf_token,
+                trust_remote_code=True,
+            )
+            lora_attached = True
+            print(f"✅ Loaded pre-quantized FP8 model directly via AutoModelForCausalLM!")
+    else:
+        # Standard load: base model + LoRA
+        if HAS_UNSLOTH:
+            print("[*] Unsloth detected: Loading via FastLanguageModel...")
+            try:
+                if resolved_lora and os.path.isdir(resolved_lora) and (
+                    os.path.exists(os.path.join(resolved_lora, "adapter_config.json"))
+                ):
+                    print(f"[*] Loading base model + LoRA adapter together from {resolved_lora}...")
+                    model, tokenizer = FastLanguageModel.from_pretrained(
+                        model_name=resolved_lora,
+                        max_seq_length=max_seq_len,
+                        dtype=torch.bfloat16,
+                        load_in_4bit=False,
+                        token=hf_token,
+                        device_map="auto" if device == "cuda" else None,
+                    )
+                    lora_attached = True
+                    print(f"✅ Loaded base model + LoRA from {resolved_lora} in a single pass via FastLanguageModel")
+                else:
+                    model, tokenizer = FastLanguageModel.from_pretrained(
+                        model_name=model_name_or_path,
+                        max_seq_length=max_seq_len,
+                        dtype=torch.bfloat16,
+                        load_in_4bit=False,
+                        token=hf_token,
+                        device_map="auto" if device == "cuda" else None,
+                    )
+            except Exception as e_uns:
+                print(f"⚠️  FastLanguageModel notice: {e_uns}. Falling back to standard loader...")
+                model = None
 
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name_or_path,
-            torch_dtype=torch.bfloat16,
-            device_map="auto" if device == "cuda" else None,
-            token=hf_token,
-            trust_remote_code=True,
-        )
+        if model is None:
+            tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, padding_side="left", token=hf_token, trust_remote_code=True)
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token or "<|endoftext|>"
+
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name_or_path,
+                torch_dtype=torch.bfloat16,
+                device_map="auto" if device == "cuda" else None,
+                token=hf_token,
+                trust_remote_code=True,
+            )
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token or "<|endoftext|>"
@@ -2555,9 +2656,13 @@ def run_standalone_math_grpo(
             except Exception as e3:
                 print(f"⚠️  Fresh LoRA init note: {e3}")
 
-    # 5. Apply In-Memory FP8 MoE Quantization
+    # 5. Apply In-Memory FP8 MoE Quantization & Auto-Upload if New
     if use_fp8:
-        convert_to_fp8_moe_weights(model)
+        converted_count = convert_to_fp8_moe_weights(model)
+        # If user specified an fp8_model repo and it wasn't found on the hub, upload it now so subsequent runs skip straight to loading it!
+        if fp8_model and not fp8_model_found:
+            print(f"\n🚀 [FP8 Hub] Auto-uploading newly quantized FP8 model to {fp8_model}...")
+            upload_fp8_model_to_hf(model=model, tokenizer=tokenizer, repo_id=fp8_model, token=hf_token)
 
     vram_after_load = torch.cuda.memory_allocated() / (1024**3) if torch.cuda.is_available() else 0.0
     print(f"[*] Active Model VRAM: {vram_after_load:.2f} GB (Headroom: {95.0 - vram_after_load:.1f} GB)")
@@ -2887,6 +2992,7 @@ def main():
     parser.add_argument("--token", type=str, default=os.environ.get("HF_TOKEN", ""))
     parser.add_argument("--effort_tier", type=str, default="balanced", choices=["balanced", "all", "low", "medium", "high", "xhigh", "ultra", "max"], help="Reasoning effort tier or 'balanced' for round-robin split across all 6 tiers")
     parser.add_argument("--steps", type=int, default=200)
+    parser.add_argument("--fp8_model", type=str, default="Nihilux/MLBase-FP8", help="Target pre-quantized FP8 model repo on HF Hub (auto loads if exists, or auto converts & uploads if missing)")
     parser.add_argument("--test_stream_only", action="store_true", help="Only stream 1 row of dataset to inspect and exit")
     args = parser.parse_args()
 
@@ -2917,6 +3023,7 @@ def main():
         shuffle_dataset=args.shuffle_dataset,
         pair_problems=args.pair_problems,
         checkpoint_at_100=True,
+        fp8_model=args.fp8_model,
     )
 
 
