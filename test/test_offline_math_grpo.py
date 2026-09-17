@@ -311,6 +311,19 @@ class TestMathScorerFormatting(unittest.TestCase):
         self.assertTrue(res["audit_log"].get("step_fragment_in_thinking"))
         self.assertNotIn("natural_paragraph_thinking_rewarded", res["audit_log"])
 
+    def test_step_by_step_cliche_penalized(self):
+        # Formulaic opener 'Let us solve this step by step' is penalized
+        text = (
+            "<think>\n"
+            "Let us solve this step by step. We first compute the total number of items sold in April.\n"
+            "Next we calculate the items sold in May, which brings the final count to 72.\n"
+            "</think>\n"
+            "\\boxed{72}"
+        )
+        res = self.scorer.score("prob", "72", text, effort_tier="low")
+        self.assertTrue(res["audit_log"].get("step_by_step_in_thinking"))
+        self.assertNotIn("natural_paragraph_thinking_rewarded", res["audit_log"])
+
     def test_outside_think_paragraph_rewarded(self):
         text = (
             "<think>\n"

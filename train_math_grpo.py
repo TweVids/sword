@@ -563,8 +563,12 @@ class MathScorer:
                     if is_step:
                         has_step_fragments_in_trace = True
 
-        if has_headers_in_trace or short_fragment_lines:
+        has_step_by_step_in_trace = bool(re.search(r"(?i)\bstep[-\s]by[-\s]step\b", trace))
+
+        if has_headers_in_trace or short_fragment_lines or has_step_by_step_in_trace:
             format_score -= 0.15
+            if has_step_by_step_in_trace:
+                audit_flags["step_by_step_in_thinking"] = True
             if has_headers_in_trace:
                 audit_flags["headers_in_thinking"] = True
                 audit_flags["bullet_or_list_in_thinking"] = True
@@ -795,8 +799,12 @@ class ExplanationScorer:
                     if is_step:
                         has_step_fragments_in_trace = True
 
-        if has_headers_in_trace or short_fragment_lines:
+        has_step_by_step_in_trace = bool(re.search(r"(?i)\bstep[-\s]by[-\s]step\b", trace))
+
+        if has_headers_in_trace or short_fragment_lines or has_step_by_step_in_trace:
             thinking_format_score -= 0.15
+            if has_step_by_step_in_trace:
+                audit_flags["step_by_step_in_thinking"] = True
             if has_headers_in_trace:
                 audit_flags["headers_in_thinking"] = True
                 audit_flags["bullet_or_list_in_thinking"] = True
@@ -1915,6 +1923,7 @@ EFFORT_SYSTEM_PROMPTS: Dict[str, str] = {
 # 1. Persistent reasoning requirement across all effort tiers
 PERSISTENT_PARAGRAPH_PROMPT = (
     "Structure your reasoning trace as continuous, natural paragraphs of internal monologue inside <think>...</think>. "
+    "Begin thinking directly without formulaic phrases like 'Let's solve this step by step'. "
     "Avoid short bullet points, rapid numbered lists, or fragmented step lines under 15 words; elaborate your thoughts in complete, flowing narrative paragraphs."
 )
 
@@ -2624,6 +2633,8 @@ def run_standalone_math_grpo(
                 watchlist = []
                 if audit.get("natural_paragraph_thinking_rewarded"):
                     watchlist.append("🌊 Pure Paragraph Flow")
+                if audit.get("step_by_step_in_thinking"):
+                    watchlist.append("⚠️ 'Step-by-step'")
                 if audit.get("step_fragment_in_thinking"):
                     watchlist.append("⚠️ Short Step Fragment (<15w)")
                 if audit.get("bullet_or_list_in_thinking"):
