@@ -324,6 +324,89 @@ class TestMathScorerFormatting(unittest.TestCase):
         self.assertTrue(res["audit_log"].get("step_by_step_in_thinking"))
         self.assertNotIn("natural_paragraph_thinking_rewarded", res["audit_log"])
 
+    def test_bold_step_headers_penalized(self):
+        # **Step 1:** bold step markers must be penalized and NOT rewarded with paragraph thinking
+        text = (
+            "<think>\n"
+            "**Step 1:** Calculate April clips.\n"
+            "April sales are 48 clips.\n"
+            "**Step 2:** Calculate May clips.\n"
+            "</think>\n"
+            "\\boxed{72}"
+        )
+        res = self.scorer.score("prob", "72", text, effort_tier="low")
+        self.assertTrue(res["audit_log"].get("step_fragment_in_thinking"))
+        self.assertTrue(res["audit_log"].get("prohibited_bold_found"))
+        self.assertNotIn("natural_paragraph_thinking_rewarded", res["audit_log"])
+
+    def test_named_step_markers_penalized(self):
+        # 'First step:', 'Next step:', 'Steps to solve:' must be penalized
+        text = (
+            "<think>\n"
+            "First step: calculate April clips as 48.\n"
+            "Next step: calculate May clips as 24.\n"
+            "</think>\n"
+            "\\boxed{72}"
+        )
+        res = self.scorer.score("prob", "72", text, effort_tier="low")
+        self.assertTrue(res["audit_log"].get("step_fragment_in_thinking"))
+        self.assertNotIn("natural_paragraph_thinking_rewarded", res["audit_log"])
+
+    def test_long_step_lines_penalized(self):
+        # Step lines longer than 15 words must still be penalized as step markers
+        text = (
+            "<think>\n"
+            "Step 1: We first determine the number of clips sold in April by reading the problem text which gives us 48 clips.\n"
+            "Step 2: We next calculate half of that amount for May to obtain 24 clips.\n"
+            "</think>\n"
+            "\\boxed{72}"
+        )
+        res = self.scorer.score("prob", "72", text, effort_tier="low")
+        self.assertTrue(res["audit_log"].get("step_fragment_in_thinking"))
+        self.assertNotIn("natural_paragraph_thinking_rewarded", res["audit_log"])
+
+    def test_long_bullet_lines_penalized(self):
+        # Bullet lines longer than 15 words must still be penalized as bullets
+        text = (
+            "<think>\n"
+            "- In April, Natalia was able to sell clips to 48 of her friends which establishes our baseline number.\n"
+            "- In May, she sold half as many clips as she had sold in April, giving 24 clips.\n"
+            "</think>\n"
+            "\\boxed{72}"
+        )
+        res = self.scorer.score("prob", "72", text, effort_tier="low")
+        self.assertTrue(res["audit_log"].get("bullet_or_list_in_thinking"))
+        self.assertNotIn("natural_paragraph_thinking_rewarded", res["audit_log"])
+
+    def test_stealth_colon_list_penalized(self):
+        # Rollout 3 evasion: isolated Label: value lines separated by newlines
+        text = (
+            "<think>\n"
+            "We need to find the total.\n"
+            "April: 48 clips\n"
+            "May: half as many as April = 24 clips\n"
+            "Total = 48 + 24 = 72 clips\n"
+            "</think>\n"
+            "\\boxed{72}"
+        )
+        res = self.scorer.score("prob", "72", text, effort_tier="low")
+        self.assertTrue(res["audit_log"].get("bullet_or_list_in_thinking"))
+        self.assertNotIn("natural_paragraph_thinking_rewarded", res["audit_log"])
+
+    def test_bullet_with_equals_sign_penalized(self):
+        # Rollout 2 evasion: bullets with words and equal signs
+        text = (
+            "<think>\n"
+            "Let's denote:\n"
+            "- Number of clips sold in April = 48\n"
+            "- Number of clips sold in May = 24\n"
+            "</think>\n"
+            "\\boxed{72}"
+        )
+        res = self.scorer.score("prob", "72", text, effort_tier="low")
+        self.assertTrue(res["audit_log"].get("bullet_or_list_in_thinking"))
+        self.assertNotIn("natural_paragraph_thinking_rewarded", res["audit_log"])
+
     def test_outside_think_paragraph_rewarded(self):
         text = (
             "<think>\n"

@@ -545,55 +545,77 @@ class MathScorer:
             flags=re.DOTALL,
         )
         has_headers_in_trace = bool(re.search(r"^\s*#{1,6}\s+", trace_text_for_lists, re.MULTILINE))
+        has_step_by_step_in_trace = bool(re.search(r"(?i)\bstep[-\s]by[-\s]step\b", trace))
+        has_prohibited_bold = bool(re.search(r"\*\*[^*\n]+\*\*", trace))
 
-        short_fragment_lines = []
+        list_or_step_lines = []
         has_bullets_in_trace = False
         has_numbered_in_trace = False
         has_step_fragments_in_trace = False
+        has_colon_list_lines = False
+        colon_lines_count = 0
 
         for raw_line in trace_text_for_lists.split("\n"):
             line = raw_line.strip()
             if not line:
                 continue
+
+            # 1. Bullet check (*, •, or - followed by a word/letter or not an equation)
             is_bullet = bool(re.match(r"^[*•]\s+", line) or re.match(r"^-\s+(?:[A-Za-z]{2,}|(?!\s*[\d\w\\$].*?[=<>]))", line))
+
+            # 2. Numbered list check (1. or (1) followed by word/letter or not an equation)
             is_numbered = bool(re.match(r"^(?:\d+[\.)]|\(\d+\))\s+(?:[A-Za-z]{2,}|(?!\s*[\d\w\\$].*?[=<>]))", line))
-            is_step = bool(re.match(r"^step\s*\d+[:\.\-]?\s*", line, re.IGNORECASE))
 
-            if is_bullet or is_numbered or is_step:
-                word_count = len(line.split())
-                if word_count < 15:
-                    short_fragment_lines.append(line)
-                    if is_bullet:
-                        has_bullets_in_trace = True
-                    if is_numbered:
-                        has_numbered_in_trace = True
-                    if is_step:
-                        has_step_fragments_in_trace = True
+            # 3. Step marker check: Step 1:, **Step 1:**, First step:, Steps to solve:, etc.
+            is_step = bool(
+                re.match(r"^\s*(?:\*\*|\*|#{1,6}\s*)?step\s*[\d\w]+(?:\*\*|\*)?[:\.\-]?\s*", line, re.IGNORECASE)
+                or re.match(r"^\s*(?:\*\*|\*|#{1,6}\s*)?(?:first|second|third|fourth|fifth|next|final|last)\s+step(?:\*\*|\*)?[:\.\-]?\s*", line, re.IGNORECASE)
+                or re.match(r"^\s*(?:\*\*|\*|#{1,6}\s*)?steps?\s*(?:to\s+solve)?[:\.\-]\s*", line, re.IGNORECASE)
+            )
 
-        has_step_by_step_in_trace = bool(re.search(r"(?i)\bstep[-\s]by[-\s]step\b", trace))
+            # 4. Stealth colon list check (e.g. 'April: 48 clips', 'May: 24 clips')
+            words = line.split()
+            is_colon_item = bool(re.match(r"^[A-Z][a-zA-Z0-9_\s]{1,15}:\s+", line)) and len(words) < 15
 
-        if has_headers_in_trace or short_fragment_lines or has_step_by_step_in_trace:
+            if is_bullet:
+                has_bullets_in_trace = True
+                list_or_step_lines.append(line)
+            elif is_numbered:
+                has_numbered_in_trace = True
+                list_or_step_lines.append(line)
+            elif is_step:
+                has_step_fragments_in_trace = True
+                list_or_step_lines.append(line)
+            elif is_colon_item:
+                colon_lines_count += 1
+                if colon_lines_count >= 2:
+                    has_colon_list_lines = True
+                    list_or_step_lines.append(line)
+
+        if has_headers_in_trace or list_or_step_lines or has_step_by_step_in_trace or has_prohibited_bold or has_colon_list_lines:
             format_score -= 0.15
             if has_step_by_step_in_trace:
                 audit_flags["step_by_step_in_thinking"] = True
             if has_headers_in_trace:
                 audit_flags["headers_in_thinking"] = True
                 audit_flags["bullet_or_list_in_thinking"] = True
-            if short_fragment_lines:
+            if list_or_step_lines:
                 audit_flags["short_fragment_list_in_thinking"] = True
-                if has_bullets_in_trace or has_numbered_in_trace:
-                    audit_flags["bullet_or_list_in_thinking"] = True
-                if has_step_fragments_in_trace:
-                    audit_flags["step_fragment_in_thinking"] = True
+            if has_bullets_in_trace or has_numbered_in_trace or has_colon_list_lines:
+                audit_flags["bullet_or_list_in_thinking"] = True
+            if has_step_fragments_in_trace:
+                audit_flags["step_fragment_in_thinking"] = True
+            if has_prohibited_bold:
+                audit_flags["prohibited_bold_found"] = True
         elif len(trace.strip()) >= 20:
             # Reward fluent continuous paragraph thinking
             format_score += 0.15
             audit_flags["natural_paragraph_thinking_rewarded"] = True
 
-            # Check 3+ sentence paragraph depth for BigMath2 or when effort is higher than medium (high, xhigh, ultra, max)
-            is_bigmath = "bigmath" in str(dataset_name).lower()
+            # Check 3+ sentence paragraph depth for complex datasets or when effort is higher than medium (high, xhigh, ultra, max)
+            is_complex = any(k in str(dataset_name).lower() for k in ["bigmath", "aops", "openmath", "openreasoning"])
             is_higher_than_medium = str(effort_tier).lower() in ("high", "xhigh", "ultra", "max")
-            if is_bigmath or is_higher_than_medium:
+            if is_complex or is_higher_than_medium:
                 paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", trace) if len(p.strip()) > 15]
                 if paragraphs:
                     counts = [count_sentences(p) for p in paragraphs]
@@ -786,46 +808,68 @@ class ExplanationScorer:
             flags=re.DOTALL,
         )
         has_headers_in_trace = bool(re.search(r"^\s*#{1,6}\s+", trace_text_for_lists, re.MULTILINE))
+        has_step_by_step_in_trace = bool(re.search(r"(?i)\bstep[-\s]by[-\s]step\b", trace))
+        has_prohibited_bold = bool(re.search(r"\*\*[^*\n]+\*\*", trace))
 
-        short_fragment_lines = []
+        list_or_step_lines = []
         has_bullets_in_trace = False
         has_numbered_in_trace = False
         has_step_fragments_in_trace = False
+        has_colon_list_lines = False
+        colon_lines_count = 0
 
         for raw_line in trace_text_for_lists.split("\n"):
             line = raw_line.strip()
             if not line:
                 continue
+
+            # 1. Bullet check (*, •, or - followed by a word/letter or not an equation)
             is_bullet = bool(re.match(r"^[*•]\s+", line) or re.match(r"^-\s+(?:[A-Za-z]{2,}|(?!\s*[\d\w\\$].*?[=<>]))", line))
+
+            # 2. Numbered list check (1. or (1) followed by word/letter or not an equation)
             is_numbered = bool(re.match(r"^(?:\d+[\.)]|\(\d+\))\s+(?:[A-Za-z]{2,}|(?!\s*[\d\w\\$].*?[=<>]))", line))
-            is_step = bool(re.match(r"^step\s*\d+[:\.\-]?\s*", line, re.IGNORECASE))
 
-            if is_bullet or is_numbered or is_step:
-                word_count = len(line.split())
-                if word_count < 15:
-                    short_fragment_lines.append(line)
-                    if is_bullet:
-                        has_bullets_in_trace = True
-                    if is_numbered:
-                        has_numbered_in_trace = True
-                    if is_step:
-                        has_step_fragments_in_trace = True
+            # 3. Step marker check: Step 1:, **Step 1:**, First step:, Steps to solve:, etc.
+            is_step = bool(
+                re.match(r"^\s*(?:\*\*|\*|#{1,6}\s*)?step\s*[\d\w]+(?:\*\*|\*)?[:\.\-]?\s*", line, re.IGNORECASE)
+                or re.match(r"^\s*(?:\*\*|\*|#{1,6}\s*)?(?:first|second|third|fourth|fifth|next|final|last)\s+step(?:\*\*|\*)?[:\.\-]?\s*", line, re.IGNORECASE)
+                or re.match(r"^\s*(?:\*\*|\*|#{1,6}\s*)?steps?\s*(?:to\s+solve)?[:\.\-]\s*", line, re.IGNORECASE)
+            )
 
-        has_step_by_step_in_trace = bool(re.search(r"(?i)\bstep[-\s]by[-\s]step\b", trace))
+            # 4. Stealth colon list check (e.g. 'April: 48 clips', 'May: 24 clips')
+            words = line.split()
+            is_colon_item = bool(re.match(r"^[A-Z][a-zA-Z0-9_\s]{1,15}:\s+", line)) and len(words) < 15
 
-        if has_headers_in_trace or short_fragment_lines or has_step_by_step_in_trace:
+            if is_bullet:
+                has_bullets_in_trace = True
+                list_or_step_lines.append(line)
+            elif is_numbered:
+                has_numbered_in_trace = True
+                list_or_step_lines.append(line)
+            elif is_step:
+                has_step_fragments_in_trace = True
+                list_or_step_lines.append(line)
+            elif is_colon_item:
+                colon_lines_count += 1
+                if colon_lines_count >= 2:
+                    has_colon_list_lines = True
+                    list_or_step_lines.append(line)
+
+        if has_headers_in_trace or list_or_step_lines or has_step_by_step_in_trace or has_prohibited_bold or has_colon_list_lines:
             thinking_format_score -= 0.15
             if has_step_by_step_in_trace:
                 audit_flags["step_by_step_in_thinking"] = True
             if has_headers_in_trace:
                 audit_flags["headers_in_thinking"] = True
                 audit_flags["bullet_or_list_in_thinking"] = True
-            if short_fragment_lines:
+            if list_or_step_lines:
                 audit_flags["short_fragment_list_in_thinking"] = True
-                if has_bullets_in_trace or has_numbered_in_trace:
-                    audit_flags["bullet_or_list_in_thinking"] = True
-                if has_step_fragments_in_trace:
-                    audit_flags["step_fragment_in_thinking"] = True
+            if has_bullets_in_trace or has_numbered_in_trace or has_colon_list_lines:
+                audit_flags["bullet_or_list_in_thinking"] = True
+            if has_step_fragments_in_trace:
+                audit_flags["step_fragment_in_thinking"] = True
+            if has_prohibited_bold:
+                audit_flags["prohibited_bold_found"] = True
         elif len(trace.strip()) >= 20:
             thinking_format_score += 0.15
             audit_flags["natural_paragraph_thinking_rewarded"] = True
@@ -1936,7 +1980,7 @@ EFFORT_SYSTEM_PROMPTS: Dict[str, str] = {
 PERSISTENT_PARAGRAPH_PROMPT = (
     "Structure your reasoning trace as continuous, natural paragraphs of internal monologue inside <think>...</think>. "
     "Begin thinking directly without formulaic phrases like 'Let's solve this step by step'. "
-    "Avoid short bullet points, rapid numbered lists, or fragmented step lines under 15 words; elaborate your thoughts in complete, flowing narrative paragraphs."
+    "Do not use bullet points, numbered lists, or step headers (such as 'Step 1:'); elaborate your thoughts in complete, flowing narrative paragraphs."
 )
 
 # 2. Explicit final answer formatting directive

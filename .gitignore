@@ -40,5 +40,6 @@ local_trainer/
 trainer_local/
 local_runs/
 runs/
+scratch/
 *.zip
 *.tar.gz
