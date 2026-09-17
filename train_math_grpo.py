@@ -1931,16 +1931,35 @@ PERSISTENT_PARAGRAPH_PROMPT = (
 BOXED_ANSWER_PROMPT = "State your final answer clearly outside the thinking tags formatted as \\boxed{answer}."
 
 
-def format_effort_prompt(problem: str, effort_tier: str = "high", tokenizer: Optional[Any] = None) -> str:
+def format_effort_prompt(
+    problem: str,
+    effort_tier: str = "high",
+    tokenizer: Optional[Any] = None,
+    step: Optional[int] = None,
+    guide_cutoff_step: int = 24,
+    include_paragraph_guide: Optional[bool] = None,
+) -> str:
     """
-    Formats the system prompt with 3 clean, separated directives:
-    1. Persistent paragraph reasoning rule (all tiers)
-    2. Dynamic effort instruction (tier-specific)
+    Formats the system prompt with 3 clean directives:
+    1. Dynamic effort instruction (tier-specific)
+    2. Persistent paragraph reasoning rule (scaffolded for 4 batches: Solving -> Explain -> Solving -> Explain, then removed)
     3. Boxed final answer directive
     """
     tier_key = effort_tier.lower().strip()
     effort_text = EFFORT_SYSTEM_PROMPTS.get(tier_key, EFFORT_SYSTEM_PROMPTS["high"])
-    system_prompt = f"{effort_text}\n{PERSISTENT_PARAGRAPH_PROMPT}\n{BOXED_ANSWER_PROMPT}"
+
+    # Prompt curriculum: active for first 4 batches (Solving -> Explain -> Solving -> Explain, default steps 1-24), then removed
+    if include_paragraph_guide is not None:
+        use_guide = include_paragraph_guide
+    elif step is not None:
+        use_guide = (step <= guide_cutoff_step)
+    else:
+        use_guide = True
+
+    if use_guide:
+        system_prompt = f"{effort_text}\n{PERSISTENT_PARAGRAPH_PROMPT}\n{BOXED_ANSWER_PROMPT}"
+    else:
+        system_prompt = f"{effort_text}\n{BOXED_ANSWER_PROMPT}"
 
     if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
         try:
@@ -1971,6 +1990,9 @@ def format_explanation_turn_prompt(
     effort_tier: str = "high",
     dataset_name: str = "",
     tokenizer: Optional[Any] = None,
+    step: Optional[int] = None,
+    guide_cutoff_step: int = 24,
+    include_paragraph_guide: Optional[bool] = None,
 ) -> str:
     """
     Formats multi-turn prompt for explanation study and training:
@@ -1997,11 +2019,25 @@ def format_explanation_turn_prompt(
             "If using bullet points, include at least 5 substantive bullets formatted as comprehensive paragraphs."
         )
 
-    explanation_system = (
-        f"{effort_text}\n"
-        f"{PERSISTENT_PARAGRAPH_PROMPT}\n"
-        f"{pedagogical_rule}"
-    )
+    # Prompt curriculum: active for first 4 batches (Solving -> Explain -> Solving -> Explain, default steps 1-24), then removed
+    if include_paragraph_guide is not None:
+        use_guide = include_paragraph_guide
+    elif step is not None:
+        use_guide = (step <= guide_cutoff_step)
+    else:
+        use_guide = True
+
+    if use_guide:
+        explanation_system = (
+            f"{effort_text}\n"
+            f"{PERSISTENT_PARAGRAPH_PROMPT}\n"
+            f"{pedagogical_rule}"
+        )
+    else:
+        explanation_system = (
+            f"{effort_text}\n"
+            f"{pedagogical_rule}"
+        )
 
     clean_ans = str(direct_answer).strip()
     if "\\boxed{" not in clean_ans:
@@ -2467,8 +2503,18 @@ def run_standalone_math_grpo(
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable_params, lr=lr)
 
-    # 7. 200-Step Training Loop
+    # 7. 200-Step Training Loop with 4-Batch Prompt Scaffolding Curriculum
+    # Pass 4 batches: SOLVE -> EXPLAIN -> SOLVE -> EXPLAIN with persistent paragraph prompt as guide, then fade/remove
+    mode_raw = str(explanation_mode).lower().strip()
+    if mode_raw in ("effort_cycle", "cycle", "effort_blocks", "effort_schedule", "repeat"):
+        guide_cutoff_step = len(EFFORT_TIERS_LIST) * 4  # 6 * 4 = 24 steps
+    elif mode_raw in ("interleaved", "paired", "alternate", "toggle"):
+        guide_cutoff_step = 4  # 4 steps: SOLVE -> EXPLAIN -> SOLVE -> EXPLAIN
+    else:
+        guide_cutoff_step = 24
+
     print(f"\n⚡ Starting {steps} training steps (Effort Mode: {effort_tier} | Mode: {explanation_mode})...\n")
+    print(f"[*] Prompt Curriculum: First 4 Batches (Solve -> Explain -> Solve -> Explain, steps 1-{guide_cutoff_step}) Guided -> Steps {guide_cutoff_step+1}+ Autonomous\n")
     for step in range(1, steps + 1):
         t_start = time.perf_counter()
         sched = get_step_schedule(
@@ -2489,6 +2535,11 @@ def run_standalone_math_grpo(
 
         step_scorer = explanation_scorer if is_explain_step else math_scorer
 
+        # Prompt scaffolding curriculum: include paragraph guide for first 4 batches (Solve -> Explain -> Solve -> Explain), then remove
+        prompt_mode = "Guided" if step <= guide_cutoff_step else "Autonomous"
+        if step == guide_cutoff_step + 1:
+            print(f"\n🎓 [Curriculum] Prompt Scaffolding Faded: Completed 4 batches (Solve -> Explain -> Solve -> Explain, steps 1-{guide_cutoff_step}). Persistent paragraph prompt removed! Model reasoning autonomously.\n")
+
         # Format user problem with exact effort system prompt (or 2-turn explanation prompt)
         if is_explain_step:
             formatted_prompt = format_explanation_turn_prompt(
@@ -2498,11 +2549,19 @@ def run_standalone_math_grpo(
                 effort_tier=step_effort,
                 dataset_name=item_dataset,
                 tokenizer=tokenizer,
+                step=step,
+                guide_cutoff_step=guide_cutoff_step,
             )
         else:
-            formatted_prompt = format_effort_prompt(problem_text, effort_tier=step_effort, tokenizer=tokenizer)
+            formatted_prompt = format_effort_prompt(
+                problem=problem_text,
+                effort_tier=step_effort,
+                tokenizer=tokenizer,
+                step=step,
+                guide_cutoff_step=guide_cutoff_step,
+            )
 
-        print(f"[Step {step:03d}/{steps:03d} | {step_effort.upper():<5} | {mode_label}] ⏳ Generating {num_rollouts} rollouts...", end="", flush=True)
+        print(f"[Step {step:03d}/{steps:03d} | {step_effort.upper():<5} | {mode_label} | {prompt_mode}] ⏳ Generating {num_rollouts} rollouts...", end="", flush=True)
 
         # Phase A: Inference / Rollout Generation
         raw_rollouts = engine.generate_rollouts(
@@ -2610,7 +2669,7 @@ def run_standalone_math_grpo(
         loss_str = f"{avg_nll:.4f}" if not study_mode else "N/A (study)"
         grad_str = f"{grad_norm_val:.2f}" if not study_mode else "N/A"
         print(
-            f"[Step {step:03d}/{steps:03d} | {step_effort.upper():<5} | {mode_label}] "
+            f"[Step {step:03d}/{steps:03d} | {step_effort.upper():<5} | {mode_label} | {prompt_mode}] "
             f"Acc: {mean_acc:.2f} | Fmt: {mean_fmt:.2f} | Eff: {mean_eff:+.2f} | "
             f"Total: {mean_total:+.2f} | Loss: {loss_str} | |g|: {grad_str} | "
             f"VRAM: {vram_gb:.1f} GB | Step Time: {elapsed:.2f}s"
@@ -2619,7 +2678,7 @@ def run_standalone_math_grpo(
         # Live Study Preview: inspect model's thinking and answers in real-time
         if study_mode or verbose_study:
             print(f"{'─'*72}")
-            print(f"📖 STUDY SAMPLE [Step {step:03d}/{steps:03d} | {step_effort.upper()} | {mode_label}]")
+            print(f"📖 STUDY SAMPLE [Step {step:03d}/{steps:03d} | {step_effort.upper()} | {mode_label} | {prompt_mode}]")
             print(f"❓ Problem:  {problem_text}")
             print(f"🎯 Expected: {ref_answer}")
             for idx, ro in enumerate(rollout_results):

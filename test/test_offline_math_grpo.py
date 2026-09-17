@@ -443,6 +443,27 @@ class TestSystemPromptsAndOrdering(unittest.TestCase):
         pos_boxed = prompt.find(BOXED_ANSWER_PROMPT)
         self.assertGreater(pos_boxed, pos_para)
 
+    def test_prompt_scaffolding_fading_after_4_batches(self):
+        # Step 24 (within first 4 batches Solve -> Explain -> Solve -> Explain): Guided mode includes persistent paragraph prompt
+        prompt_step24 = format_effort_prompt("Find the value of x.", effort_tier="max", step=24)
+        self.assertIn("Structure your reasoning trace", prompt_step24)
+        self.assertIn(BOXED_ANSWER_PROMPT, prompt_step24)
+
+        # Step 25 (after 4 batches): Autonomous mode removes persistent paragraph prompt
+        prompt_step25 = format_effort_prompt("Find the value of x.", effort_tier="low", step=25)
+        self.assertNotIn("Structure your reasoning trace", prompt_step25)
+        self.assertIn("Reasoning effort is set to low", prompt_step25)
+        self.assertIn(BOXED_ANSWER_PROMPT, prompt_step25)
+
+    def test_explanation_prompt_scaffolding_fading_after_4_batches(self):
+        # Step 24: Guided mode
+        prompt_step24 = format_explanation_turn_prompt("Find x.", direct_answer="42", step=24)
+        self.assertIn("Structure your reasoning trace", prompt_step24)
+
+        # Step 25: Autonomous mode
+        prompt_step25 = format_explanation_turn_prompt("Find x.", direct_answer="42", step=25)
+        self.assertNotIn("Structure your reasoning trace", prompt_step25)
+
 
 class TestGDPOAdvantagesAndVariance(unittest.TestCase):
     """Verifies decoupled advantage calculation and non-zero variance preservation."""
