@@ -555,8 +555,8 @@ class MathScorer:
             line = raw_line.strip()
             if not line:
                 continue
-            is_bullet = bool(re.match(r"^[-*•]\s+(?!\s*[\d\w\\$].*?[=<>])", line))
-            is_numbered = bool(re.match(r"^(?:\d+[\.)]|\(\d+\))\s+(?!\s*[\d\w\\$].*?[=<>])", line))
+            is_bullet = bool(re.match(r"^[*•]\s+", line) or re.match(r"^-\s+(?:[A-Za-z]{2,}|(?!\s*[\d\w\\$].*?[=<>]))", line))
+            is_numbered = bool(re.match(r"^(?:\d+[\.)]|\(\d+\))\s+(?:[A-Za-z]{2,}|(?!\s*[\d\w\\$].*?[=<>]))", line))
             is_step = bool(re.match(r"^step\s*\d+[:\.\-]?\s*", line, re.IGNORECASE))
 
             if is_bullet or is_numbered or is_step:
@@ -609,8 +609,13 @@ class MathScorer:
         # 1. Detect reasoning evasion: markdown headers, step markers, or bullet lists in the answer (-0.20)
         has_headers_in_answer = bool(re.search(r"^\s*#{1,6}\s+", answer, re.MULTILINE))
         has_step_markers_in_answer = bool(re.search(r"(?i)\*\*step\s*\d+[:\.]?|\bstep\s*\d+[:\.]", answer))
-        has_bullets_in_answer = bool(re.search(r"^\s*[-*•]\s+(?!\s*[\d\w\\$].*?[=<>])", answer, re.MULTILINE))
-        has_numbered_in_answer = bool(re.search(r"^\s*\d+[\.)]\s+", answer, re.MULTILINE))
+        has_bullets_in_answer = bool(
+            re.search(r"^\s*[*•]\s+", answer, re.MULTILINE)
+            or re.search(r"^\s*-\s+(?:[A-Za-z]{2,}|(?!\s*[\d\w\\$].*?[=<>]))", answer, re.MULTILINE)
+        )
+        has_numbered_in_answer = bool(
+            re.search(r"^\s*(?:\d+[\.)]|\(\d+\))\s+(?:[A-Za-z]{2,}|(?!\s*[\d\w\\$].*?[=<>]))", answer, re.MULTILINE)
+        )
 
         has_reasoning_dump = has_headers_in_answer or has_step_markers_in_answer or (len(answer.strip()) > 250 and (has_bullets_in_answer or has_numbered_in_answer))
 
@@ -791,8 +796,8 @@ class ExplanationScorer:
             line = raw_line.strip()
             if not line:
                 continue
-            is_bullet = bool(re.match(r"^[-*•]\s+(?!\s*[\d\w\\$].*?[=<>])", line))
-            is_numbered = bool(re.match(r"^(?:\d+[\.)]|\(\d+\))\s+(?!\s*[\d\w\\$].*?[=<>])", line))
+            is_bullet = bool(re.match(r"^[*•]\s+", line) or re.match(r"^-\s+(?:[A-Za-z]{2,}|(?!\s*[\d\w\\$].*?[=<>]))", line))
+            is_numbered = bool(re.match(r"^(?:\d+[\.)]|\(\d+\))\s+(?:[A-Za-z]{2,}|(?!\s*[\d\w\\$].*?[=<>]))", line))
             is_step = bool(re.match(r"^step\s*\d+[:\.\-]?\s*", line, re.IGNORECASE))
 
             if is_bullet or is_numbered or is_step:
