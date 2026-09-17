@@ -2177,15 +2177,16 @@ def run_standalone_math_grpo(
         use_fp8_kv=use_fp8,
     )
 
-    # 6. Initialize Scorer, Loss, Auditor, Optimizer
-    scorer = ExplanationScorer() if explanation_mode else MathScorer()
+    # 6. Initialize Scorers, Loss, Auditor, Optimizer
+    math_scorer = MathScorer()
+    explanation_scorer = ExplanationScorer()
     loss_fn = ChunkedGRPOLoss(chunk_size=512)
     auditor = StepAuditor(dataset_name=dataset_name)
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable_params, lr=lr)
 
     # 7. 200-Step Training Loop
-    print(f"\n⚡ Starting {steps} training steps (Effort Mode: {effort_tier})...\n")
+    print(f"\n⚡ Starting {steps} training steps (Effort Mode: {effort_tier} | Mode: {explanation_mode})...\n")
     for step in range(1, steps + 1):
         t_start = time.perf_counter()
         item = next(streamer)
@@ -2199,8 +2200,18 @@ def run_standalone_math_grpo(
         else:
             step_effort = effort_tier.lower()
 
+        # Determine whether current step is explanation mode or direct solving mode
+        # In 'split' / 'hybrid' mode: Steps 1-100 are SOLVE, Steps 101-200 are EXPLAIN
+        if str(explanation_mode).lower() in ("split", "hybrid", "auto", "both"):
+            is_explain_step = (step > (steps // 2))
+        else:
+            is_explain_step = bool(explanation_mode and str(explanation_mode).lower() not in ("false", "0", "none"))
+
+        step_scorer = explanation_scorer if is_explain_step else math_scorer
+        mode_label = "EXPLAIN" if is_explain_step else "SOLVE"
+
         # Format user problem with exact effort system prompt (or 2-turn explanation prompt)
-        if explanation_mode:
+        if is_explain_step:
             formatted_prompt = format_explanation_turn_prompt(
                 problem=problem_text,
                 direct_answer=ref_answer,
@@ -2212,7 +2223,7 @@ def run_standalone_math_grpo(
         else:
             formatted_prompt = format_effort_prompt(problem_text, effort_tier=step_effort, tokenizer=tokenizer)
 
-        print(f"[Step {step:03d}/{steps:03d} | {step_effort.upper():<6}] ⏳ Generating {num_rollouts} rollouts...", end="", flush=True)
+        print(f"[Step {step:03d}/{steps:03d} | {step_effort.upper():<5} | {mode_label}] ⏳ Generating {num_rollouts} rollouts...", end="", flush=True)
 
         # Phase A: Inference / Rollout Generation
         raw_rollouts = engine.generate_rollouts(
@@ -2230,7 +2241,7 @@ def run_standalone_math_grpo(
         rollout_results = []
         for text in raw_rollouts:
             token_count = len(tokenizer.encode(text, add_special_tokens=False))
-            res = scorer.score(
+            res = step_scorer.score(
                 problem=problem_text,
                 reference_answer=ref_answer,
                 full_text=text,
@@ -2242,12 +2253,13 @@ def run_standalone_math_grpo(
             res["token_count"] = token_count
             res["effort_tier"] = step_effort
             res["dataset"] = item_dataset
+            res["step_mode"] = mode_label
             res["acc_reward"] = res.get("column_scores", {}).get("accuracy", res.get("column_scores", {}).get("pedagogical_accuracy", 0.0))
             res["format_reward"] = res.get("column_scores", {}).get("formatting", res.get("column_scores", {}).get("explanation_structure", 0.0))
             res["effort_reward"] = res.get("column_scores", {}).get("efficiency", 0.0)
             rollout_results.append(res)
 
-        if explanation_mode:
+        if is_explain_step:
             advantages, col_advantages = compute_explanation_gdpo_advantages(rollout_results)
         else:
             advantages, col_advantages = compute_gdpo_advantages(rollout_results)
@@ -2318,7 +2330,7 @@ def run_standalone_math_grpo(
         loss_str = f"{avg_nll:.4f}" if not study_mode else "N/A (study)"
         grad_str = f"{grad_norm_val:.2f}" if not study_mode else "N/A"
         print(
-            f"[Step {step:03d}/{steps:03d} | {step_effort.upper():<6}] "
+            f"[Step {step:03d}/{steps:03d} | {step_effort.upper():<5} | {mode_label}] "
             f"Acc: {mean_acc:.2f} | Fmt: {mean_fmt:.2f} | Eff: {mean_eff:+.2f} | "
             f"Total: {mean_total:+.2f} | Loss: {loss_str} | |g|: {grad_str} | "
             f"VRAM: {vram_gb:.1f} GB | Step Time: {elapsed:.2f}s"
@@ -2327,7 +2339,7 @@ def run_standalone_math_grpo(
         # Live Study Preview: inspect model's thinking and answers in real-time
         if study_mode or verbose_study:
             print(f"{'─'*72}")
-            print(f"📖 STUDY SAMPLE [Step {step:03d}/{steps:03d} | {step_effort.upper()}]")
+            print(f"📖 STUDY SAMPLE [Step {step:03d}/{steps:03d} | {step_effort.upper()} | {mode_label}]")
             print(f"❓ Problem:  {problem_text}")
             print(f"🎯 Expected: {ref_answer}")
             for idx, ro in enumerate(rollout_results):
