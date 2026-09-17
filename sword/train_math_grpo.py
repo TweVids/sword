@@ -238,20 +238,18 @@ class InProcessRolloutEngine:
         self.device = next(model.parameters()).device
         self.static_cache = FastStaticKVCache()
 
-    def generate_rollouts(
+    def generate_single_rollout(
         self,
         prompt: str,
-        num_rollouts: int = 4,
         max_new_tokens: int = 2048,
         temperature: float = 0.8,
-    ) -> List[str]:
-        """Generates G rollouts in eval mode, then immediately flushes KV cache memory."""
+    ) -> str:
+        """Generates a single rollout and immediately cleans temporary KV memory."""
         self.model.eval()
         if hasattr(self.model, "config"):
             self.model.config.use_cache = True
 
-        prompts = [prompt] * num_rollouts
-        inputs = self.tokenizer(prompts, return_tensors="pt", padding=True).to(self.device)
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
         input_ids = inputs.input_ids
         attention_mask = inputs.attention_mask
 
@@ -282,19 +280,28 @@ class InProcessRolloutEngine:
                 eos_token_id=stop_token_ids,
             )
 
-        # Slice generated response tokens (excluding prompt)
         response_ids = outputs[:, prompt_len:]
-        decoded_responses = self.tokenizer.batch_decode(response_ids, skip_special_tokens=True)
+        decoded_response = self.tokenizer.decode(response_ids[0], skip_special_tokens=True)
 
-        # -------------------------------------------------------------
-        # VRAM Memory Reset: Drop back to baseline weight footprint
-        # -------------------------------------------------------------
         del inputs, outputs, response_ids, input_ids, attention_mask
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        return decoded_responses
+        return decoded_response
+
+    def generate_rollouts(
+        self,
+        prompt: str,
+        num_rollouts: int = 4,
+        max_new_tokens: int = 2048,
+        temperature: float = 0.8,
+    ) -> List[str]:
+        """Generates G rollouts sequentially to minimize KV cache VRAM footprint and eliminate padding latency."""
+        return [
+            self.generate_single_rollout(prompt, max_new_tokens=max_new_tokens, temperature=temperature)
+            for _ in range(num_rollouts)
+        ]
 
 
 # =====================================================================
@@ -1915,7 +1922,7 @@ EFFORT_SYSTEM_PROMPTS: Dict[str, str] = {
     "medium": "Reasoning effort is set to medium. Validate non-obvious logic and state transitions, but don't re-check self-evident steps; keep a steady, balanced pace.",
     "high": "Reasoning effort is set to high. Validate non-obvious logic and state transitions, verify intermediate calculations, and check common edge cases before finalizing.",
     "xhigh": "Reasoning effort is set to extra high. Validate non-obvious logic and state transitions, verify intermediate calculations, check common edge cases, test key assumptions against likely counterexamples, and compare alternative solution paths before settling on one.",
-    "ultra": "Reasoning effort is set to ultra. Validate non-obvious logic and state transitions, verify intermediate calculations, check common edge cases, test key assumptions against likely counterexamples, compare alternative solution paths, and break the problem into its component parts, verifying each independently and discarding approaches that fail early checks.",
+    "ultra": "Reasoning effort is set to ultra. Validate non-obvious logic and state transitions, verify intermediate calculations, check common edge cases, test key assumptions against likely counterexamples, compare alternative solution paths, and break the problem into its component parts, verifying each independently and discarding approaches that fail early checks. Stop once the answer is verified consistent—do not continue re-deriving it once no further errors are found.",
     "max": "Reasoning effort is set to maximum. Validate non-obvious logic and state transitions, verify intermediate calculations, check common edge cases, test key assumptions against likely counterexamples, compare alternative solution paths, break the problem into its component parts and verify each independently, and cross-check the final answer against all stated constraints and edge cases. Stop once the answer is verified consistent—do not continue re-deriving it once no further errors are found.",
 }
 
@@ -2561,24 +2568,45 @@ def run_standalone_math_grpo(
                 guide_cutoff_step=guide_cutoff_step,
             )
 
-        print(f"[Step {step:03d}/{steps:03d} | {step_effort.upper():<5} | {mode_label} | {prompt_mode}] ⏳ Generating {num_rollouts} rollouts...", end="", flush=True)
+        # Compute tier-aware max new tokens to prevent runaway decoding loops (e.g. ultra runaway)
+        is_gsm = "gsm8k" in str(item_dataset).lower() or "template" in str(item_dataset).lower()
+        tier_token_cap = {
+            "low": 1024,
+            "medium": 2048,
+            "high": 3072,
+            "xhigh": 4096,
+            "ultra": 4096,
+            "max": 6144,
+        }.get(step_effort.lower(), 4096)
+        if is_gsm:
+            tier_token_cap = min(tier_token_cap, 2048)
+        step_max_tokens = min(max_new_tokens, tier_token_cap)
 
-        # Phase A: Inference / Rollout Generation
-        raw_rollouts = engine.generate_rollouts(
-            prompt=formatted_prompt,
-            num_rollouts=num_rollouts,
-            max_new_tokens=max_new_tokens,
-            temperature=0.8,
-        )
+        # Phase A: Realtime Rollout Generation & Immediate Live Preview
+        if study_mode or verbose_study:
+            print(f"{'─'*72}")
+            print(f"📖 STUDY SAMPLE [Step {step:03d}/{steps:03d} | {step_effort.upper()} | {mode_label} | {prompt_mode}]")
+            print(f"❓ Problem:  {problem_text}")
+            print(f"🎯 Expected: {ref_answer}")
 
-        t_gen = time.perf_counter() - t_start
-        avg_tokens = sum(len(tokenizer.encode(r, add_special_tokens=False)) for r in raw_rollouts) / len(raw_rollouts)
-        print(f" done in {t_gen:.1f}s (avg: {avg_tokens:.0f} tokens)")
-
-        # Phase B: Scoring & GDPO Decoupled Advantages
         rollout_results = []
-        for text in raw_rollouts:
+        raw_rollouts = []
+
+        for r_idx in range(num_rollouts):
+            t_ro_start = time.perf_counter()
+            if verbose_study:
+                print(f"   [Rollout {r_idx+1}/{num_rollouts}] ⏳ Generating...", end="", flush=True)
+
+            text = engine.generate_single_rollout(
+                prompt=formatted_prompt,
+                max_new_tokens=step_max_tokens,
+                temperature=0.8,
+            )
+            raw_rollouts.append(text)
+            t_ro_elapsed = time.perf_counter() - t_ro_start
             token_count = len(tokenizer.encode(text, add_special_tokens=False))
+
+            # Immediate scoring
             res = step_scorer.score(
                 problem=problem_text,
                 reference_answer=ref_answer,
@@ -2597,6 +2625,38 @@ def run_standalone_math_grpo(
             res["effort_reward"] = res.get("column_scores", {}).get("efficiency", 0.0)
             rollout_results.append(res)
 
+            # REALTIME PRINT: Immediately show this rollout the moment it completes!
+            if study_mode or verbose_study:
+                status = "✅ Correct" if res.get("is_correct") else "❌ Incorrect"
+                final_ans = res.get("final_answer", "").strip() or "(no answer found)"
+                trace = res.get("reasoning_trace", "").strip()
+                trace_preview = (trace[:240] + "...") if len(trace) > 240 else trace
+                audit = res.get("audit_log", {})
+
+                watchlist = []
+                if audit.get("natural_paragraph_thinking_rewarded"):
+                    watchlist.append("🌊 Pure Paragraph Flow")
+                if audit.get("step_by_step_in_thinking"):
+                    watchlist.append("⚠️ 'Step-by-step'")
+                if audit.get("step_fragment_in_thinking"):
+                    watchlist.append("⚠️ Short Step Fragment (<15w)")
+                if audit.get("bullet_or_list_in_thinking"):
+                    watchlist.append("⚠️ Short Bullet/List (<15w)")
+                if audit.get("headers_in_thinking"):
+                    watchlist.append("⚠️ Header in Think")
+                if audit.get("natural_paragraph_answer_rewarded"):
+                    watchlist.append("💬 Prose Answer")
+                badge_str = f" | [{', '.join(watchlist)}]" if watchlist else ""
+
+                print(f"\r   [Rollout {r_idx+1}/{num_rollouts} | {status} | Total Reward: {res.get('total_reward', 0.0):+.2f} | Tokens: {token_count} ({t_ro_elapsed:.1f}s){badge_str}]")
+                if trace_preview:
+                    print(f"     <think> {trace_preview} </think>")
+                print(f"     Answer: {final_ans}")
+
+        if study_mode or verbose_study:
+            print(f"{'─'*72}")
+
+        # Phase B: GDPO Decoupled Advantages
         if is_explain_step:
             advantages, col_advantages = compute_explanation_gdpo_advantages(rollout_results)
         else:
@@ -2675,40 +2735,6 @@ def run_standalone_math_grpo(
             f"VRAM: {vram_gb:.1f} GB | Step Time: {elapsed:.2f}s"
         )
 
-        # Live Study Preview: inspect model's thinking and answers in real-time
-        if study_mode or verbose_study:
-            print(f"{'─'*72}")
-            print(f"📖 STUDY SAMPLE [Step {step:03d}/{steps:03d} | {step_effort.upper()} | {mode_label} | {prompt_mode}]")
-            print(f"❓ Problem:  {problem_text}")
-            print(f"🎯 Expected: {ref_answer}")
-            for idx, ro in enumerate(rollout_results):
-                status = "✅ Correct" if ro.get("is_correct") else "❌ Incorrect"
-                final_ans = ro.get("final_answer", "").strip() or "(no answer found)"
-                trace = ro.get("reasoning_trace", "").strip()
-                trace_preview = (trace[:240] + "...") if len(trace) > 240 else trace
-                audit = ro.get("audit_log", {})
-
-                # Paragraph Reasoning Watchlist badges
-                watchlist = []
-                if audit.get("natural_paragraph_thinking_rewarded"):
-                    watchlist.append("🌊 Pure Paragraph Flow")
-                if audit.get("step_by_step_in_thinking"):
-                    watchlist.append("⚠️ 'Step-by-step'")
-                if audit.get("step_fragment_in_thinking"):
-                    watchlist.append("⚠️ Short Step Fragment (<15w)")
-                if audit.get("bullet_or_list_in_thinking"):
-                    watchlist.append("⚠️ Short Bullet/List (<15w)")
-                if audit.get("headers_in_thinking"):
-                    watchlist.append("⚠️ Header in Think")
-                if audit.get("natural_paragraph_answer_rewarded"):
-                    watchlist.append("💬 Prose Answer")
-                badge_str = f" | [{', '.join(watchlist)}]" if watchlist else ""
-
-                print(f"   [Rollout {idx+1}/{num_rollouts} | {status} | Total Reward: {ro.get('total_reward', 0.0):+.2f} | Tokens: {ro.get('token_count', 0)}{badge_str}]")
-                if trace_preview:
-                    print(f"     <think> {trace_preview} </think>")
-                print(f"     Answer: {final_ans}")
-            print(f"{'─'*72}\n")
 
         # Checkpoint-100 and Hub archive upload
         if step == 100 and checkpoint_at_100:
