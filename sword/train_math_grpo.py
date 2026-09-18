@@ -2659,10 +2659,21 @@ def run_standalone_math_grpo(
     # 5. Apply In-Memory FP8 MoE Quantization & Auto-Upload if New
     if use_fp8:
         converted_count = convert_to_fp8_moe_weights(model)
-        # If user specified an fp8_model repo and it wasn't found on the hub, upload it now so subsequent runs skip straight to loading it!
+        # If user specified an fp8_model repo and it wasn't found on the hub, export & upload in a background thread so training starts immediately!
         if fp8_model and not fp8_model_found:
-            print(f"\n🚀 [FP8 Hub] Auto-uploading newly quantized FP8 model to {fp8_model}...")
-            upload_fp8_model_to_hf(model=model, tokenizer=tokenizer, repo_id=fp8_model, token=hf_token)
+            import threading
+            print(f"\n🚀 [FP8 Hub] Starting background export & upload of quantized FP8 model to {fp8_model} (training proceeds immediately)...")
+            bg_thread = threading.Thread(
+                target=upload_fp8_model_to_hf,
+                kwargs={
+                    "model": model,
+                    "tokenizer": tokenizer,
+                    "repo_id": fp8_model,
+                    "token": hf_token,
+                },
+                daemon=True,
+            )
+            bg_thread.start()
 
     vram_after_load = torch.cuda.memory_allocated() / (1024**3) if torch.cuda.is_available() else 0.0
     print(f"[*] Active Model VRAM: {vram_after_load:.2f} GB (Headroom: {95.0 - vram_after_load:.1f} GB)")
