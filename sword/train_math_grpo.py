@@ -129,6 +129,7 @@ _fix_transformers_moe_fp8_compatibility()
 # =====================================================================
 def setup_blackwell_environment():
     """Configures high-performance runtime flags for Blackwell (SM100) / CUDA."""
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
     os.environ["HF_DEACTIVATE_ASYNC_LOAD"] = "1"
     _fix_transformers_moe_fp8_compatibility()
@@ -2581,13 +2582,22 @@ def run_standalone_math_grpo(
     if hasattr(tokenizer, "padding_side"):
         tokenizer.padding_side = "left"
 
-    # 4. Attach LoRA Adapter (if not already attached in single pass)
+    # 4. Apply In-Memory FP8 MoE Quantization BEFORE LoRA Attachment
+    # Quantizing base model MoE weights immediately drops VRAM from ~62 GB down to ~34.6 GB,
+    # leaving ample headroom (>60 GB) so attaching LoRA / PEFT adapters never triggers a CUDA OOM.
+    if use_fp8 and not fp8_model_found:
+        converted_count = convert_to_fp8_moe_weights(model)
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # 5. Attach LoRA Adapter (if not already attached in single pass)
     if not lora_attached:
         print(f"[*] Attaching LoRA adapters (path: {resolved_lora})...")
         try:
             from peft import PeftModel
             if os.path.exists(resolved_lora):
-                model = PeftModel.from_pretrained(model, resolved_lora, is_trainable=True)
+                model = PeftModel.from_pretrained(model, resolved_lora, is_trainable=True, low_cpu_mem_usage=True)
                 print(f"✅ Loaded existing LoRA from {resolved_lora}")
                 lora_attached = True
         except Exception as e:
@@ -2656,24 +2666,21 @@ def run_standalone_math_grpo(
             except Exception as e3:
                 print(f"⚠️  Fresh LoRA init note: {e3}")
 
-    # 5. Apply In-Memory FP8 MoE Quantization & Auto-Upload if New
-    if use_fp8:
-        converted_count = convert_to_fp8_moe_weights(model)
-        # If user specified an fp8_model repo and it wasn't found on the hub, export & upload in a background thread so training starts immediately!
-        if fp8_model and not fp8_model_found:
-            import threading
-            print(f"\n🚀 [FP8 Hub] Starting background export & upload of quantized FP8 model to {fp8_model} (training proceeds immediately)...")
-            bg_thread = threading.Thread(
-                target=upload_fp8_model_to_hf,
-                kwargs={
-                    "model": model,
-                    "tokenizer": tokenizer,
-                    "repo_id": fp8_model,
-                    "token": hf_token,
-                },
-                daemon=True,
-            )
-            bg_thread.start()
+    # If user specified an fp8_model repo and it wasn't found on the hub, export & upload in a background thread so training starts immediately!
+    if use_fp8 and fp8_model and not fp8_model_found:
+        import threading
+        print(f"\n🚀 [FP8 Hub] Starting background export & upload of quantized FP8 model to {fp8_model} (training proceeds immediately)...")
+        bg_thread = threading.Thread(
+            target=upload_fp8_model_to_hf,
+            kwargs={
+                "model": model,
+                "tokenizer": tokenizer,
+                "repo_id": fp8_model,
+                "token": hf_token,
+            },
+            daemon=True,
+        )
+        bg_thread.start()
 
     vram_after_load = torch.cuda.memory_allocated() / (1024**3) if torch.cuda.is_available() else 0.0
     print(f"[*] Active Model VRAM: {vram_after_load:.2f} GB (Headroom: {95.0 - vram_after_load:.1f} GB)")
