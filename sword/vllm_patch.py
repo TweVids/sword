@@ -95,7 +95,23 @@ def bootstrap_environment() -> Dict[str, Any]:
     # Patch Transformers heterogeneity configuration_utils to suppress AmbiguousGlobalPerLayerAttributeError
     t_spec = importlib.util.find_spec("transformers")
     if t_spec and t_spec.origin:
-        het_file = Path(t_spec.origin).parent / "integrations/heterogeneity/configuration_utils.py"
+        t_root = Path(t_spec.origin).parent
+        utils_file = t_root / "utils/__init__.py"
+        if utils_file.exists():
+            u_source = utils_file.read_text()
+            u_marker = "# marimo-download-url-compat"
+            if u_marker not in u_source:
+                compat_snippet = (
+                    f"\n{u_marker}\n"
+                    "try:\n"
+                    "    from urllib.request import urlretrieve as download_url\n"
+                    "except Exception:\n"
+                    "    def download_url(url, **kw): return None\n"
+                )
+                utils_file.write_text(u_source + compat_snippet)
+                results.append({"patch_file": str(utils_file), "patched": True})
+
+        het_file = t_root / "integrations/heterogeneity/configuration_utils.py"
         if het_file.exists():
             h_source = het_file.read_text()
             h_marker = "# marimo-suppress-heterogeneity-error"

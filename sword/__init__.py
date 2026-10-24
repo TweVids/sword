@@ -63,6 +63,23 @@ def _fix_transformers_generation_cache():
 _fix_transformers_generation_cache()
 
 
+def _fix_transformers_utils_download_url():
+    """
+    Prevents 'ImportError: cannot import name download_url from transformers.utils'
+    when image_processing_base.py or other modules attempt to import removed download_url.
+    """
+    try:
+        import transformers.utils as _tu
+        if not hasattr(_tu, "download_url"):
+            from urllib.request import urlretrieve as _urlretrieve
+            _tu.download_url = _urlretrieve
+    except Exception:
+        pass
+
+
+_fix_transformers_utils_download_url()
+
+
 def _fix_transformers_fp8_quantizer_bug():
     """
     Hotfixes upstream Transformers bug in FineGrainedFP8HfQuantizer.update_tp_plan
