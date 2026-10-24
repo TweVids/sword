@@ -32,8 +32,11 @@ class WorkspaceSandbox:
         """Ensures path resides inside workspace root directory."""
         clean_path = path.strip().lstrip("/\\")
         full_path = os.path.abspath(os.path.join(self.root_dir, clean_path))
-        if not full_path.startswith(self.root_dir):
-            raise PermissionError(f"Access denied: path '{path}' escapes workspace boundary.")
+        try:
+            if os.path.commonpath([self.root_dir, full_path]) != self.root_dir:
+                raise PermissionError(f"Access denied: path '{path}' escapes workspace boundary.")
+        except ValueError:
+            raise PermissionError(f"Access denied: path '{path}' escapes workspace boundary across drives.")
         return full_path
 
     def write_file(self, path: str, content: str) -> Tuple[bool, str]:

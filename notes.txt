@@ -71,3 +71,21 @@ step 11: implement real workspace sandbox and thorough systemic fixes:
   * Resume made strictly opt-in: find_latest_checkpoint only resolves when resume_from_checkpoint is non-empty.
   * Token alignment guaranteed by re-tokenizing updated multi-turn response text and synchronizing response_token_ids with rollout_logprobs.
   * All 27 unit tests across test_new_trainer.py, test_train_api.py, and test_grpo_bridge.py passing cleanly in 76.3s.
+- step 12 completed: cloned authentic open harnesses and injected genuine prompts/tools:
+  * Cloned genuine external repositories into third_party/:
+    - OpenCode: https://github.com/anomalyco/opencode.git
+    - Pi: https://github.com/earendil-works/pi.git
+    - Codex: https://github.com/openai/codex.git
+    - Gemini CLI: https://github.com/google-gemini/gemini-cli.git
+  * Implemented sword/harness/prompts.py to load authentic system prompts directly from cloned sources:
+    - OpenCode: packages/core/src/session/runner/prompt/system.txt with tool guidance and action protocols.
+    - Codex CLI: codex-rs/core/gpt_5_codex_prompt.md with gpt-5 prompt and assertions protocol.
+    - Pi: AGENTS.md guidelines and foundational tools protocol (read, write, edit, bash).
+    - Gemini CLI: autonomous swe agent function calling protocol (calculator, python, bash, read_file, write_file).
+  * Added ensure_harness_repo helper to automatically shallow-clone any missing harness repo.
+  * Updated sword/long_trainer.py to inject authentic harness prompt into rollout prompts.
+  * Updated completion tracking in sword/long_trainer.py:
+    - Only mark rows in data_complete.logs that were actually visited and trained.
+    - Only mark entire dataset complete if all rows were visited and steps completed.
+  * Added test_partial_dataset_train_only_marks_visited_rows in test/test_new_trainer.py.
+  * Verified full suite: 28 unit tests passing cleanly in 76.8s.

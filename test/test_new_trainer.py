@@ -453,6 +453,41 @@ class TestNewTrainerArchitecture(unittest.TestCase):
         )
         self.assertEqual(res3.get("status"), "already_trained")
 
+    def test_partial_dataset_train_only_marks_visited_rows(self):
+        from sword.finetune import apply_lora_to_model
+        apply_lora_to_model(self.model, r=4, lora_alpha=8, target_moe=False)
+
+        dataset = [
+            {"problem": "Row 1: 1+1", "solution": "2", "can_be__verify": True, "harness": "opencode"},
+            {"problem": "Row 2: 2+2", "solution": "4", "can_be__verify": True, "harness": "codex"},
+            {"problem": "Row 3: 3+3", "solution": "6", "can_be__verify": True, "harness": "pi"},
+        ]
+        out_dir = os.path.join(self.temp_dir, "partial_ckpt")
+
+        # Train only 1 step on 3-row dataset
+        res = sword.train(
+            long_train=True,
+            test=False,
+            dataset=dataset,
+            model="test_model",
+            is_save_and_upload_checkpoint=False,
+            Argument={"steps": 1, "concurrency_g": 2, "output_dir": out_dir},
+            show_detail_logs=False,
+        )
+        self.assertEqual(res.get("status"), "completed")
+
+        # Entire dataset must NOT be marked completed because 2 rows remain unvisited
+        ckpt_mgr = CheckpointManager(output_dir=out_dir)
+        dataset_sha = res.get("dataset_sha256")
+        self.assertFalse(ckpt_mgr.is_dataset_completed(dataset_sha))
+
+        # But row 1 must be marked completed
+        records, _ = load_dataset_records(dataset)
+        completed_hashes = ckpt_mgr.get_completed_dataset_hashes()
+        self.assertIn(records[0].row_hash, completed_hashes)
+        self.assertNotIn(records[1].row_hash, completed_hashes)
+        self.assertNotIn(records[2].row_hash, completed_hashes)
+
 
 if __name__ == "__main__":
     unittest.main()

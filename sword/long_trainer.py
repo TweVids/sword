@@ -338,6 +338,7 @@ def run_long_train(
     bridge.initialize_vllm()
 
     reward_history_logs: List[Dict[str, Any]] = []
+    visited_row_hashes = set()
     current_step = start_step
     completed_successfully = False
 
@@ -359,8 +360,9 @@ def run_long_train(
                     del reward_history_logs[log_start_len:]
 
                 try:
-                    # Rollout Phase
-                    prompts = [current_row.problem]
+                    # Rollout Phase with authentic harness prompt injection
+                    rollout_prompt = harness.format_prompt(current_row.problem) if harness is not None else current_row.problem
+                    prompts = [rollout_prompt]
                     batch = bridge.generate_rollouts(prompts)
 
                     # Scoring Phase with Model B memory preparation
@@ -487,6 +489,7 @@ def run_long_train(
             if not step_success:
                 break
 
+            visited_row_hashes.add(current_row.row_hash)
             current_step = step_idx
 
             # Logging
@@ -521,12 +524,16 @@ def run_long_train(
     except KeyboardInterrupt:
         print("\n[Sword] Training interrupted by user. Saving current checkpoint...")
     finally:
-        # Mark dataset completed ONLY if training truly completed all planned steps
-        if completed_successfully:
+        # Mark dataset completed ONLY if training truly completed all planned steps and all dataset rows were visited
+        all_rows_visited = len(records) > 0 and all(r.row_hash in visited_row_hashes for r in records)
+        if completed_successfully and all_rows_visited:
             ckpt_mgr.mark_dataset_completed(dataset_sha256, str(dataset)[:50])
-            for r in records:
-                ckpt_mgr.mark_dataset_completed(r.row_hash, f"row_{r.problem_id}")
             print(f"[Sword] Dataset {dataset_sha256} marked completed in data_complete.logs.")
+
+        # Always record completed row hashes for rows that were visited and trained
+        for r in records:
+            if r.row_hash in visited_row_hashes:
+                ckpt_mgr.mark_dataset_completed(r.row_hash, f"row_{r.problem_id}")
 
         final_ckpt = ckpt_mgr.save_checkpoint(
             step=current_step,
@@ -537,7 +544,7 @@ def run_long_train(
             lora_alpha=bridge_config.lora_alpha,
             target_modules=bridge_config.target_modules,
             reward_logs=reward_history_logs,
-            completed_dataset_hash=dataset_sha256 if completed_successfully else None,
+            completed_dataset_hash=dataset_sha256 if (completed_successfully and all_rows_visited) else None,
         )
         print(f"\n[Sword] Training process recorded. Final checkpoint: {final_ckpt}")
 

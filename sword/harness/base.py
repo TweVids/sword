@@ -38,6 +38,18 @@ class BaseHarness:
     """Abstract base class for all CLI tool-calling harnesses."""
     name: str = "base"
 
+    def get_system_prompt(self) -> str:
+        """Returns the authentic harness system prompt loaded from the cloned repository."""
+        from sword.harness.prompts import get_harness_system_prompt
+        return get_harness_system_prompt(self.name)
+
+    def format_prompt(self, problem: str) -> str:
+        """Combines authentic harness system prompt and tool guidelines with user problem."""
+        sys_prompt = self.get_system_prompt()
+        if sys_prompt:
+            return f"{sys_prompt}\n\nTask:\n{problem}"
+        return problem
+
     def run(
         self,
         prompt: str,
