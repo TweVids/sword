@@ -124,12 +124,20 @@ def train(
             try:
                 from vllm import LLM, SamplingParams
                 print(f"[Sword] Running with vLLM engine (vllm==0.23.0 patched)...")
+
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+                # In notebook environments, ensure spawn method and optional V0 fallback
+                os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+                if kwargs.get("use_v1") is False:
+                    os.environ["VLLM_USE_V1"] = "0"
                 
                 # Configure MoE backend if specified
                 moe_backend = kwargs.get("moe_backend", None)
                 if moe_backend:
-                    os.environ["VLLM_MOE_BACKEND"] = str(moe_backend)
-                    os.environ["VLLM_MOE_RUNNER"] = str(moe_backend)
                     print(f"[Sword] Configured vLLM MoE backend: {moe_backend}")
 
                 # Auto-heal heterogeneous architectures (Gemma 4, etc.)
@@ -146,10 +154,12 @@ def train(
                     "model": model,
                     "trust_remote_code": True,
                     "max_model_len": kwargs.get("max_model_len", 2048),
-                    "gpu_memory_utilization": kwargs.get("gpu_memory_utilization", 0.9),
+                    "gpu_memory_utilization": kwargs.get("gpu_memory_utilization", 0.8),
                     "dtype": kwargs.get("dtype", "auto"),
                     "hf_overrides": hf_overrides,
                 }
+                if kwargs.get("enforce_eager", False):
+                    llm_kwargs["enforce_eager"] = True
                 if moe_backend:
                     llm_kwargs["moe_backend"] = moe_backend
 
