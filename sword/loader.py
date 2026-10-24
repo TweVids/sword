@@ -198,6 +198,19 @@ def load_moe_model(
             attn_mode=attn_mode,
         )
 
+    # If LFM (Liquid Foundation Model, e.g. LiquidAI/LFM2.5-24B-A2B) requested, delegate to load_lfm_model
+    if any(k in model_name_or_path.lower() for k in ("lfm", "liquid")):
+        from .lfm import load_lfm_model as _load_lfm_model
+        return _load_lfm_model(
+            model_name_or_path=model_name_or_path,
+            load_in_fp8=load_in_fp8,
+            device_map=device_map,
+            torch_dtype=torch_dtype,
+            max_seq_length=max_seq_length,
+            patch_sword=patch_sword,
+            attn_mode=attn_mode,
+        )
+
     # If Qwen3 MoE model requested, delegate to specialized load_qwen3_moe_model
     if "qwen3" in model_name_or_path.lower() and ("moe" in model_name_or_path.lower() or "a3b" in model_name_or_path.lower()):
         return load_qwen3_moe_model(
@@ -384,5 +397,41 @@ def load_ling_model(
         max_seq_length=max_seq_length,
         patch_sword=patch_sword,
         attn_mode=attn_mode,
+    )
+
+
+def load_lfm_model(
+    model_name_or_path: str = "LiquidAI/LFM2.5-24B-A2B",
+    load_in_4bit: bool = False,
+    load_in_8bit: bool = False,
+    load_in_fp8: bool = False,
+    device_map: str = "auto",
+    torch_dtype: Optional[torch.dtype] = None,
+    max_seq_length: int = 4096,
+    patch_sword: bool = True,
+    attn_mode: str = "flash",
+    use_unsloth: bool = True,
+    trust_remote_code: bool = True,
+    **kwargs,
+) -> Tuple[object, object]:
+    """
+    Loads Liquid AI LFM2 / LFM2.5 MoE models (specifically LiquidAI/LFM2.5-24B-A2B)
+    with native hardware acceleration (NVIDIA 6000 Blackwell / CUDA),
+    Unsloth compatibility, and Sword Pure FlashAttention + Pure Conv1d + Zero-Sync MoE speed engine.
+    """
+    from .lfm import load_lfm_model as _load_lfm_model
+    return _load_lfm_model(
+        model_name_or_path=model_name_or_path,
+        load_in_4bit=load_in_4bit,
+        load_in_8bit=load_in_8bit,
+        load_in_fp8=load_in_fp8,
+        device_map=device_map,
+        torch_dtype=torch_dtype,
+        max_seq_length=max_seq_length,
+        patch_sword=patch_sword,
+        attn_mode=attn_mode,
+        use_unsloth=use_unsloth,
+        trust_remote_code=trust_remote_code,
+        **kwargs,
     )
 

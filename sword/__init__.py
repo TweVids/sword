@@ -252,7 +252,9 @@ def _fix_transformers_bailing_compatibility():
             @classmethod
             def safe_config_from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
                 cfg = orig_config_from_pretrained.__func__(cls, pretrained_model_name_or_path, *args, **kwargs)
-                if getattr(cfg, "rope_scaling", None) is not None:
+                # Only sanitize rope_scaling if it's genuinely a Bailing/Ling model, preserving LFM2 / Qwen3 rope_parameters!
+                is_bailing = any(k in str(pretrained_model_name_or_path).lower() for k in ("bailing", "ling")) or getattr(cfg, "model_type", "") in ("bailing_moe", "bailing")
+                if is_bailing and getattr(cfg, "rope_scaling", None) is not None:
                     if isinstance(cfg.rope_scaling, dict) and cfg.rope_scaling.get("rope_type") == "default":
                         cfg.rope_scaling = None
                     elif isinstance(cfg.rope_scaling, dict) and "factor" not in cfg.rope_scaling:
@@ -278,17 +280,22 @@ from .patcher import (
     patch_qwen,
     patch_qwen3_moe,
     patch_ling,
+    patch_lfm,
+    patch_lfm2_moe,
     unpatch_model,
     unpatch_moe,
     unpatch_qwen,
     unpatch_qwen3_moe,
     unpatch_ling,
+    unpatch_lfm,
+    unpatch_lfm2_moe,
     set_attention_mode,
     convert_to_fp8,
     convert_moe_to_fp8,
 )
-from .loader import load_qwen_model, load_moe_model, load_qwen3_moe_model, load_ling_model
+from .loader import load_qwen_model, load_moe_model, load_qwen3_moe_model, load_ling_model, load_lfm_model
 from .ling import FastLingServer, setup_fla_compatibility
+from .lfm import FastLfmServer, StaticLfmCache, setup_lfm_unsloth_compatibility, FastLfm2MoeModel
 from .server import FastServer, FastMoEServer, FastQwenServer, FastQwen3MoeServer
 from .finetune import benchmark_finetune_8k, apply_lora_to_model
 from .trainer import (
@@ -343,11 +350,15 @@ __all__ = [
     "patch_qwen",
     "patch_qwen3_moe",
     "patch_ling",
+    "patch_lfm",
+    "patch_lfm2_moe",
     "unpatch_model",
     "unpatch_moe",
     "unpatch_qwen",
     "unpatch_qwen3_moe",
     "unpatch_ling",
+    "unpatch_lfm",
+    "unpatch_lfm2_moe",
     "set_attention_mode",
     "convert_to_fp8",
     "convert_moe_to_fp8",
@@ -355,11 +366,16 @@ __all__ = [
     "load_moe_model",
     "load_qwen3_moe_model",
     "load_ling_model",
+    "load_lfm_model",
     "FastServer",
     "FastMoEServer",
     "FastQwenServer",
     "FastQwen3MoeServer",
     "FastLingServer",
+    "FastLfmServer",
+    "StaticLfmCache",
+    "FastLfm2MoeModel",
+    "setup_lfm_unsloth_compatibility",
     "setup_fla_compatibility",
     "benchmark_finetune_8k",
     "apply_lora_to_model",

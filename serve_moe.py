@@ -116,11 +116,14 @@ def main():
 
     is_qwen3_moe = "qwen3" in args.model.lower() and ("moe" in args.model.lower() or "a3b" in args.model.lower())
     is_ling = any(x in args.model.lower() for x in ["ling", "bailing"])
+    is_lfm = any(x in args.model.lower() for x in ["lfm", "liquid"])
 
     if is_qwen3_moe:
         arch_desc = "Qwen3 MoE (30B A3B Sparse MoE with Top-8 Active Experts)"
     elif is_ling:
         arch_desc = "Bailing Hybrid (KDA + MLA + Sparse MoE)"
+    elif is_lfm:
+        arch_desc = "Liquid LFM2.5 MoE (Hybrid Conv1d + GQA + Sparse MoE with Top-4 Active Experts)"
     else:
         arch_desc = "MoE Standard Transformer"
 

@@ -209,6 +209,20 @@ class FastServer:
                 torch_dtype=torch_dtype,
             )
 
+        is_lfm = any(x in model_name_or_path.lower() for x in ["lfm", "liquid"])
+        if is_lfm:
+            from .lfm import FastLfmServer
+            return FastLfmServer.from_pretrained(
+                model_name_or_path=model_name_or_path,
+                max_concurrency=max_concurrency,
+                max_seq_len=max_seq_len,
+                device_map=device_map,
+                torch_dtype=torch_dtype,
+                load_in_4bit=load_in_4bit,
+                load_in_8bit=load_in_8bit,
+                load_in_fp8=load_in_fp8,
+            )
+
         is_moe_or_fp8 = any(x in model_name_or_path.lower() for x in ["fp8", "moe", "hy-", "hy_", "hunyuan", "deepseek"])
         if (is_moe_or_fp8 or load_in_fp8) and not (load_in_4bit or load_in_8bit):
             model, tokenizer = load_moe_model(
@@ -961,6 +975,11 @@ class FastServer:
 FastQwen3MoeServer = FastServer
 FastMoEServer = FastServer
 FastQwenServer = FastServer
+
+
+def get_fast_lfm_server():
+    from .lfm import FastLfmServer
+    return FastLfmServer
 
 
 def get_fast_ling_server():

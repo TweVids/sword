@@ -41,5 +41,6 @@ trainer_local/
 local_runs/
 runs/
 scratch/
+unsloth_compiled_cache/
 *.zip
 *.tar.gz

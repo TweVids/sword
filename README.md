@@ -35,22 +35,31 @@ pip install --no-deps -e .
 pip install -r requirements.txt
 ```
 
-### 2. Run 4-Concurrency Serving & Benchmark
+### 2. Run High-Throughput Serving & 8-Concurrency Benchmark
 ```bash
+# Liquid AI LFM 2.5 24B A2B (Hybrid Conv1d + GQA + Sparse MoE) 8-Concurrency Serving:
+python serve_moe.py --model LiquidAI/LFM2.5-24B-A2B --concurrency 8 --max-new-tokens 128
+
+# Liquid AI LFM 2.5 24B A2B Comprehensive BEFORE vs AFTER Speedup Benchmark:
+python serve_moe.py --model LiquidAI/LFM2.5-24B-A2B --benchmark --concurrency 8
+
 # Qwen3 MoE (Qwen3 30B A3B) High-Throughput Serving & RL Rollout:
-python serve_moe.py --model Qwen/Qwen3-30B-A3B --concurrency 4 --max-new-tokens 128
+python serve_moe.py --model Qwen/Qwen3-30B-A3B --concurrency 8 --max-new-tokens 128
 
 # Qwen3 MoE Multi-Trajectory RL Rollout Generation (PPO / GRPO):
 python serve_moe.py --model Qwen/Qwen3-30B-A3B --rl-rollouts 8 --max-new-tokens 256
-
-# Run Comprehensive BEFORE vs AFTER Speedup Benchmark:
-python serve_moe.py --model Qwen/Qwen3-30B-A3B --benchmark
 ```
 
 ---
 
 ## Supported Architectures
 
+* **Liquid AI Foundation Models (LFM2 / LFM2.5 MoE Family):**
+  * **LFM 2.5 24B A2B (`LiquidAI/LFM2.5-24B-A2B`):** 40 layers total (30 Gated Short Convolution blocks + 10 Grouped-Query Attention layers), 64 experts with top-4 active routing, routed scaling factor = 1.0, expert bias.
+  * **Pure-PyTorch Causal Conv1d from Scratch:** Zero external C++/CUDA extension dependencies (runs on Blackwell without `causal-conv1d` or `xformers`).
+  * **Zero-Sync MoE Dispatch:** Eliminates 1,500+ host-device synchronization stalls (`.nonzero()` / `torch.where()`) per token with pure batched BMM dispatch.
+  * **Static Hybrid Cache (`StaticLfmCache`):** Pre-allocates both static KV cache (for attention layers) and rolling conv buffer (for short convolution layers) for 8 concurrent streams with O(1) metadata reset.
+  * **Unsloth Compatibility Layer:** Full support for Unsloth's `FastLanguageModel.from_pretrained`, `FastModel`, and LoRA adapters.
 * **Dense & MoE Transformer Family:**
   * **Qwen3 MoE (specially Qwen3 30B A3B):** 128 experts, top-8 active routing, 8:1 GQA ratio (32 query heads, 4 KV heads), QK RMSNorm, Zero-Sync MoE dispatch, router logits instrumentation for GRPO aux loss.
   * **Qwen Family:** Qwen2, Qwen2.5, Qwen3, Qwen3.5 (QK-norm, dual-projection gating).

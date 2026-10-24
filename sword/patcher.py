@@ -644,6 +644,15 @@ def patch_model(model, mode: str = "flash", patch_moe: bool = True):
         except Exception as e:
             pass
 
+    # Check for Liquid AI LFM2 / LFM2.5 MoE architecture
+    is_lfm = any("lfm" in m.__class__.__name__.lower() for m in model.modules()) or getattr(getattr(model, "config", None), "model_type", "") in ("lfm2_moe", "lfm2")
+    if is_lfm:
+        try:
+            from .lfm import patch_lfm as _patch_lfm
+            _patch_lfm(model, mode=mode, patch_moe=patch_moe)
+        except Exception as e:
+            pass
+
     return model
 
 
@@ -661,6 +670,20 @@ def patch_ling(model, mode: str = "flash", patch_moe: bool = True):
 def unpatch_ling(model):
     from .ling import unpatch_ling as _unpatch_ling
     return _unpatch_ling(model)
+
+
+def patch_lfm(model, mode: str = "flash", patch_moe: bool = True):
+    from .lfm import patch_lfm as _patch_lfm
+    return _patch_lfm(model, mode=mode, patch_moe=patch_moe)
+
+
+def unpatch_lfm(model):
+    from .lfm import unpatch_lfm as _unpatch_lfm
+    return _unpatch_lfm(model)
+
+
+patch_lfm2_moe = patch_lfm
+unpatch_lfm2_moe = unpatch_lfm
 
 
 def unpatch_model(model):
@@ -683,6 +706,11 @@ def unpatch_model(model):
     try:
         from .ling import unpatch_ling as _unpatch_ling
         _unpatch_ling(model)
+    except Exception:
+        pass
+    try:
+        from .lfm import unpatch_lfm as _unpatch_lfm
+        _unpatch_lfm(model)
     except Exception:
         pass
     print(f"[Sword] Unpatched {unpatched_count} modules to original forward.")
