@@ -1113,6 +1113,69 @@ class FastLfmServer:
             if hasattr(module, "q_proj") and hasattr(module, "k_proj"):
                 module._sword_static_cache = self.static_cache
 
+        self._pending_requests = []
+
+    def add_request(
+        self,
+        prompt: str,
+        max_new_tokens: int = 128,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        top_k: int = 50,
+        enable_thinking: bool = False,
+    ):
+        """
+        Adds a single request to the batch queue for concurrent execution.
+        """
+        self._pending_requests.append({
+            "prompt": prompt,
+            "max_new_tokens": max_new_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "enable_thinking": enable_thinking,
+        })
+
+    def run_all(self) -> List[Dict[str, Any]]:
+        """
+        Processes all queued requests concurrently in a single batched pass.
+        """
+        if not self._pending_requests:
+            return []
+
+        prompts = [req["prompt"] for req in self._pending_requests]
+        max_new_tokens = max(req["max_new_tokens"] for req in self._pending_requests)
+        temperature = self._pending_requests[0]["temperature"]
+        top_p = self._pending_requests[0]["top_p"]
+        top_k = self._pending_requests[0]["top_k"]
+        enable_thinking = self._pending_requests[0]["enable_thinking"]
+
+        res = self.serve(
+            prompts=prompts,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            enable_thinking=enable_thinking,
+        )
+
+        formatted_results = []
+        for i, prompt in enumerate(prompts):
+            resp = res["responses"][i]
+            n_tokens = res["tokens_per_stream"][i]
+            formatted_results.append({
+                "prompt": prompt,
+                "response": resp,
+                "prompt_tokens": [0] * (res["total_tokens"] // len(prompts) if len(prompts) > 0 else 0),
+                "output_tokens": [0] * n_tokens,
+                "tokens_generated": n_tokens,
+                "stream_tps": res["stream_tps"][i],
+            })
+
+        self._pending_requests = []
+        return formatted_results
+
+
     @classmethod
     def from_pretrained(
         cls,
