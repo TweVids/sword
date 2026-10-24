@@ -3,6 +3,67 @@ import torch
 from typing import Optional, Tuple
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from .patcher import patch_qwen
+from .lfm import FastLfm2MoeModel
+
+
+class FastLanguageModel:
+    @classmethod
+    def from_pretrained(
+        cls,
+        model_name: str,
+        max_seq_length: int = 4096,
+        dtype: Optional[torch.dtype] = None,
+        load_in_4bit: bool = False,
+        load_in_8bit: bool = False,
+        device_map: str = "auto",
+        **kwargs,
+    ):
+        model_lower = model_name.lower()
+        if "lfm" in model_lower:
+            return load_lfm_model(
+                model_name_or_path=model_name,
+                load_in_4bit=load_in_4bit,
+                load_in_8bit=load_in_8bit,
+                device_map=device_map,
+                torch_dtype=dtype,
+                max_seq_length=max_seq_length,
+                **kwargs,
+            )
+        if "ling" in model_lower or "bailing" in model_lower:
+            return load_ling_model(
+                model_name_or_path=model_name,
+                device_map=device_map,
+                torch_dtype=dtype,
+                max_seq_length=max_seq_length,
+                **kwargs,
+            )
+        if "qwen3" in model_lower and "moe" in model_lower:
+            return load_qwen3_moe_model(
+                model_name_or_path=model_name,
+                load_in_4bit=load_in_4bit,
+                load_in_8bit=load_in_8bit,
+                device_map=device_map,
+                dtype=dtype,
+                max_seq_length=max_seq_length,
+                **kwargs,
+            )
+        return load_qwen_model(
+            model_name_or_path=model_name,
+            load_in_4bit=load_in_4bit,
+            load_in_8bit=load_in_8bit,
+            device_map=device_map,
+            dtype=dtype,
+            max_seq_length=max_seq_length,
+            **kwargs,
+        )
+
+    @staticmethod
+    def for_inference(model):
+        if hasattr(model, "eval"):
+            model.eval()
+        for param in model.parameters():
+            param.requires_grad = False
+        return model
 
 
 def load_qwen_model(

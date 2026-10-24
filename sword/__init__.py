@@ -293,7 +293,7 @@ from .patcher import (
     convert_to_fp8,
     convert_moe_to_fp8,
 )
-from .loader import load_qwen_model, load_moe_model, load_qwen3_moe_model, load_ling_model, load_lfm_model
+from .loader import load_qwen_model, load_moe_model, load_qwen3_moe_model, load_ling_model, load_lfm_model, FastLanguageModel
 from .ling import FastLingServer, setup_fla_compatibility
 from .lfm import FastLfmServer, StaticLfmCache, setup_lfm_unsloth_compatibility, FastLfm2MoeModel
 from .server import FastServer, FastMoEServer, FastQwenServer, FastQwen3MoeServer
@@ -367,6 +367,7 @@ __all__ = [
     "load_qwen3_moe_model",
     "load_ling_model",
     "load_lfm_model",
+    "FastLanguageModel",
     "FastServer",
     "FastMoEServer",
     "FastQwenServer",
