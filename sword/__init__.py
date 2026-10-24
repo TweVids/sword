@@ -386,6 +386,13 @@ from .gym import (
 )
 from .vllm_patch import bootstrap_environment, vllm_patcher
 from .train_entry import train
+from .grpo_bridge import (
+    GRPOBridge,
+    GRPOBridgeConfig,
+    DualCorrectionGRPOLoss,
+    WeightSynchronizer,
+    VRAMLifecycleManager,
+)
 
 __version__ = "0.9.2"
 print(f"[Sword] Version {__version__} loaded successfully.")
@@ -401,11 +408,25 @@ def run_standalone_math_grpo(*args, **kwargs):
     return _run(*args, **kwargs)
 
 
+def get_grpo_bridge(config=None, **kwargs):
+    """Factory function for creating an Unsloth-vLLM GRPOBridge instance."""
+    from sword.grpo_bridge import GRPOBridge, GRPOBridgeConfig
+    if config is None:
+        config = GRPOBridgeConfig(**kwargs)
+    return GRPOBridge(config=config)
+
+
 __all__ = [
     "bootstrap_environment",
     "vllm_patcher",
     "train",
     "run_standalone_math_grpo",
+    "get_grpo_bridge",
+    "GRPOBridge",
+    "GRPOBridgeConfig",
+    "DualCorrectionGRPOLoss",
+    "WeightSynchronizer",
+    "VRAMLifecycleManager",
     "PureFlashAttention",
     "apply_rotary_pos_emb",
     "StaticKVCache",
