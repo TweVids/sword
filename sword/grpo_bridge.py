@@ -1,11 +1,11 @@
 """
 GRPO Bridge: Robust Training-Inference Bridge between Unsloth and vLLM for Dense Models.
 Systematically addresses all failure modes:
-- A1-A6: Truncated Importance Sampling (TIS) with detached reference policy, temperature scaling, and LoRA request tracking
+- A1-A6: Truncated Importance Sampling (TIS) with detached reference policy, temperature alignment, and LoRA request tracking
 - B1-B5: Standard PEFT adapter serialization, precision partitioning, calibrated clipping, and policy entropy floor
-- C1-C5: Two-phase VRAM lifecycle handover, micro-batched sequence chunking, and no-grad entropy monitoring
+- C1-C5: Two-phase VRAM lifecycle handover (sleep/wake), global token-normalized micro-batching, and adapter pruning
 - D1-D4: Runtime dynamic LoRA request synchronization without restarting vLLM
-- E1-E4: Group-centered advantage estimation, group size verification, and gradient norm clipping
+- E1-E4: Group-centered advantage estimation, group size verification and filtering, and gradient norm clipping
 - F1-F4: Unsloth training mode activation, gradient checkpointing, and target module compatibility
 - G1-G4: Resilient fallback engine if vLLM encounters runtime or memory exceptions
 """
@@ -16,6 +16,7 @@ import sys
 import json
 import math
 import time
+import shutil
 import tempfile
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Tuple, Optional, Callable, Union
@@ -46,6 +47,8 @@ class GRPOBridgeConfig:
     max_new_tokens: int = 512
     temperature: float = 0.7
     top_p: float = 0.9
+    temperature_scale: bool = False
+    logprobs_mode: str = "raw_logprobs"
     clip_eps: float = 0.2
     tis_bound_c: float = 2.0
     use_score_centering: bool = False
@@ -54,6 +57,10 @@ class GRPOBridgeConfig:
     entropy_coeff: float = 0.001
     max_grad_norm: float = 1.0
     micro_batch_size: int = 2
+    max_kept_adapters: int = 2
+    enable_vllm_sleep: bool = True
+    offload_trainer_during_rollout: bool = False
+    drop_incomplete_groups: bool = True
     vllm_gpu_utilization: float = 0.40
     vllm_quantization: Optional[str] = None
     kv_cache_dtype: str = "auto"
@@ -80,6 +87,7 @@ class RolloutItem:
     advantage: float = 0.0
     group_id: int = 0
     policy_version: int = 0
+    is_truncated: bool = False
 
 
 @dataclass
@@ -93,35 +101,89 @@ class RolloutBatch:
 
     def validate_groups(self) -> bool:
         """Verifies that every prompt group has exactly concurrency_g rollouts."""
+        if not self.items:
+            return False
         group_counts: Dict[int, int] = {}
         for item in self.items:
             group_counts[item.group_id] = group_counts.get(item.group_id, 0) + 1
         return all(c == self.concurrency_g for c in group_counts.values())
 
+    def filter_valid_groups(self, required_g: int) -> "RolloutBatch":
+        """Filters batch to keep only complete groups of size required_g."""
+        group_counts: Dict[int, int] = {}
+        for item in self.items:
+            group_counts[item.group_id] = group_counts.get(item.group_id, 0) + 1
+        valid_group_ids = {gid for gid, c in group_counts.items() if c == required_g}
+        self.items = [it for it in self.items if it.group_id in valid_group_ids]
+        return self
+
 
 class VRAMLifecycleManager:
     """
     Manages GPU memory handover between rollout generation and training forward/backward.
-    Prevents co-location OOM on shared GPUs.
+    Supports vLLM sleep mode and trainer offloading to prevent co-location OOM on shared GPUs.
     """
-    def __init__(self, device: str = "cuda"):
+    def __init__(
+        self,
+        device: str = "cuda",
+        enable_sleep: bool = True,
+        offload_trainer: bool = False,
+    ):
         self.device = device
+        self.enable_sleep = enable_sleep
+        self.offload_trainer = offload_trainer
 
-    def enter_rollout_phase(self, trainer_model: Optional[nn.Module] = None):
+    def enter_rollout_phase(
+        self,
+        trainer_model: Optional[nn.Module] = None,
+        vllm_engine: Optional[Any] = None,
+    ):
         """Prepares environment for vLLM rollout generation."""
+        # 1. Wake up vLLM engine if sleeping
+        if vllm_engine is not None and self.enable_sleep and hasattr(vllm_engine, "wake_up"):
+            try:
+                vllm_engine.wake_up()
+            except Exception:
+                pass
+
+        # 2. Put trainer model in dormant eval mode (and optionally offload to CPU)
         if trainer_model is not None:
             trainer_model.eval()
+            if self.offload_trainer and hasattr(trainer_model, "to"):
+                try:
+                    trainer_model.to("cpu")
+                except Exception:
+                    pass
+
         gc.collect()
         if torch.cuda.is_available() and "cuda" in self.device:
             torch.cuda.empty_cache()
 
-    def enter_train_phase(self, trainer_model: Optional[nn.Module] = None):
-        """Cleans memory before training forward and backward pass."""
+    def enter_train_phase(
+        self,
+        trainer_model: Optional[nn.Module] = None,
+        vllm_engine: Optional[Any] = None,
+    ):
+        """Puts vLLM to sleep and prepares trainer for forward and backward passes."""
+        # 1. Sleep vLLM engine to free KV cache blocks and execution memory
+        if vllm_engine is not None and self.enable_sleep and hasattr(vllm_engine, "sleep"):
+            try:
+                vllm_engine.sleep()
+            except Exception:
+                pass
+
+        # 2. Return trainer model to training device
+        if trainer_model is not None:
+            if self.offload_trainer and hasattr(trainer_model, "to"):
+                try:
+                    trainer_model.to(self.device)
+                except Exception:
+                    pass
+            trainer_model.train()
+
         gc.collect()
         if torch.cuda.is_available() and "cuda" in self.device:
             torch.cuda.empty_cache()
-        if trainer_model is not None:
-            trainer_model.train()
 
     def get_memory_info(self) -> Dict[str, float]:
         """Returns allocated, reserved, and available GPU memory in gigabytes."""
@@ -143,6 +205,7 @@ class WeightSynchronizer:
     """
     Synchronizes LoRA weights from the active trainer model into vLLM using standard
     PEFT format (adapter_config.json and adapter_model.safetensors) and vLLM LoRARequest.
+    Includes automated adapter directory pruning to prevent disk leaks.
     """
     def __init__(
         self,
@@ -150,11 +213,13 @@ class WeightSynchronizer:
         lora_r: int = 16,
         lora_alpha: int = 32,
         target_modules: Optional[List[str]] = None,
+        max_kept_adapters: int = 2,
     ):
         self.base_model_name = base_model_name
         self.lora_r = lora_r
         self.lora_alpha = lora_alpha
         self.target_modules = target_modules or ["q_proj", "k_proj", "v_proj", "o_proj"]
+        self.max_kept_adapters = max(1, max_kept_adapters)
         self.policy_version = 0
         self.temp_dir = tempfile.mkdtemp(prefix="sword_lora_sync_")
         self.current_adapter_path: Optional[str] = None
@@ -218,6 +283,25 @@ class WeightSynchronizer:
         self.current_adapter_path = adapter_path
         return self.policy_version
 
+    def prune_old_adapters(self, max_kept: Optional[int] = None):
+        """Deletes older adapter versions to prevent disk leaks."""
+        limit = max_kept or self.max_kept_adapters
+        if not os.path.exists(self.temp_dir):
+            return
+        for item in os.listdir(self.temp_dir):
+            if item.startswith("adapter_v"):
+                try:
+                    ver = int(item[len("adapter_v"):])
+                    if ver <= self.policy_version - limit:
+                        shutil.rmtree(os.path.join(self.temp_dir, item), ignore_errors=True)
+                except ValueError:
+                    pass
+
+    def cleanup(self):
+        """Removes the entire temporary adapter directory on teardown."""
+        if os.path.exists(self.temp_dir):
+            shutil.rmtree(self.temp_dir, ignore_errors=True)
+
     def get_current_lora_request(self) -> Optional[Any]:
         """Creates a vLLM LoRARequest object for the current synchronized version."""
         if self.policy_version <= 0 or self.current_adapter_path is None:
@@ -236,13 +320,14 @@ class WeightSynchronizer:
 class DualCorrectionGRPOLoss(nn.Module):
     """
     Sequence-chunked GRPO loss with detached Truncated Importance Sampling (TIS),
-    temperature-scaled logits, and no-grad entropy monitoring.
+    upper-bound truncation, no-grad entropy monitoring, and exact global token reduction.
     """
     def __init__(
         self,
         clip_eps: float = 0.2,
         tis_bound_c: float = 2.0,
         temperature: float = 0.7,
+        temperature_scale: bool = False,
         use_score_centering: bool = False,
         use_calibrated_clipping: bool = False,
         entropy_floor: float = 0.01,
@@ -253,6 +338,7 @@ class DualCorrectionGRPOLoss(nn.Module):
         self.clip_eps = clip_eps
         self.tis_bound_c = tis_bound_c
         self.temperature = max(temperature, 1e-5)
+        self.temperature_scale = temperature_scale
         self.use_score_centering = use_score_centering
         self.use_calibrated_clipping = use_calibrated_clipping
         self.entropy_floor = entropy_floor
@@ -267,6 +353,7 @@ class DualCorrectionGRPOLoss(nn.Module):
         prompt_lengths: List[int],
         advantages: torch.Tensor,
         rollout_logprobs: Optional[List[List[float]]] = None,
+        global_valid_tokens: Optional[int] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
@@ -296,8 +383,12 @@ class DualCorrectionGRPOLoss(nn.Module):
         # Sequence chunking: computes cross-entropy in 512-token chunks
         for start_idx in range(0, num_tokens, self.chunk_size):
             end_idx = min(start_idx + self.chunk_size, num_tokens)
-            # Temperature scale logits to match rollout sampling temperature
-            chunk_logits = (shift_logits[:, start_idx:end_idx, :].reshape(-1, shift_logits.size(-1)) / self.temperature).float()
+            curr_chunk = shift_logits[:, start_idx:end_idx, :].reshape(-1, shift_logits.size(-1))
+            if self.temperature_scale:
+                chunk_logits = (curr_chunk / self.temperature).float()
+            else:
+                chunk_logits = curr_chunk.float()
+
             chunk_targets = targets[:, start_idx:end_idx].reshape(-1)
 
             token_logprobs = -F.cross_entropy(
@@ -307,7 +398,7 @@ class DualCorrectionGRPOLoss(nn.Module):
             ).reshape(batch_size, end_idx - start_idx)
             policy_logprobs_list.append(token_logprobs)
 
-            # Entropy calculation under no_grad to prevent keeping autograd graphs in VRAM
+            # Entropy calculation under no_grad to avoid retaining autograd graph
             with torch.no_grad():
                 probs = F.softmax(chunk_logits, dim=-1)
                 chunk_entropy = -(probs * torch.log(probs.clamp(min=1e-9))).sum(dim=-1)
@@ -339,11 +430,11 @@ class DualCorrectionGRPOLoss(nn.Module):
         log_ratio_on_policy = policy_logprobs - policy_logprobs_ref
         ratio_on_policy = torch.exp(log_ratio_on_policy)
 
-        # Detached Truncated Importance Sampling (TIS) correction factor for vLLM off-policy divergence
+        # Detached Truncated Importance Sampling (TIS): standard upper-bound truncation only
         with torch.no_grad():
             log_is_weight = policy_logprobs_ref - vllm_old_logprobs
             raw_is_weight = torch.exp(log_is_weight)
-            is_weight = torch.clamp(raw_is_weight, min=1.0 / self.tis_bound_c, max=self.tis_bound_c)
+            is_weight = torch.clamp(raw_is_weight, max=self.tis_bound_c)
             if self.use_score_centering and target_mask.any():
                 valid_mask_float = target_mask.float()
                 mean_is_weight = (is_weight * valid_mask_float).sum() / valid_mask_float.sum().clamp(min=1.0)
@@ -362,8 +453,10 @@ class DualCorrectionGRPOLoss(nn.Module):
         surr2 = torch.clamp(ratio_on_policy, 1.0 - effective_clip_eps, 1.0 + effective_clip_eps) * adv
         token_policy_loss = -torch.min(surr1, surr2) * is_weight
 
+        # Global or local token reduction
         valid_tokens = target_mask.float().sum().clamp(min=1.0)
-        policy_loss = (token_policy_loss * target_mask.float()).sum() / valid_tokens
+        norm_factor = float(global_valid_tokens) if global_valid_tokens is not None else valid_tokens.item()
+        policy_loss = (token_policy_loss * target_mask.float()).sum() / max(1.0, norm_factor)
 
         # Policy entropy regularization
         mean_entropy = (policy_entropy * target_mask.float()).sum() / valid_tokens
@@ -446,6 +539,7 @@ class FallbackRolloutEngine:
                 "response_token_ids": gen_tokens,
                 "response_text": resp_text,
                 "rollout_logprobs": gen_logprobs,
+                "is_truncated": len(gen_tokens) >= max_new_tokens,
             })
         return results
 
@@ -454,22 +548,28 @@ class GRPOBridge:
     """
     Industrial-grade GRPO Bridge between Unsloth trainer and vLLM generator.
     Handles the entire training-rollout lifecycle, weight sync, importance sampling,
-    and memory handover for dense models.
+    group integrity, and memory handover for dense models.
     """
     def __init__(self, config: Optional[GRPOBridgeConfig] = None):
         self.config = config or GRPOBridgeConfig()
         self.device = self.config.device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.vram_mgr = VRAMLifecycleManager(device=self.device)
+        self.vram_mgr = VRAMLifecycleManager(
+            device=self.device,
+            enable_sleep=self.config.enable_vllm_sleep,
+            offload_trainer=self.config.offload_trainer_during_rollout,
+        )
         self.weight_sync = WeightSynchronizer(
             base_model_name=self.config.model_name,
             lora_r=self.config.lora_r,
             lora_alpha=self.config.lora_alpha,
             target_modules=self.config.target_modules,
+            max_kept_adapters=self.config.max_kept_adapters,
         )
         self.loss_fn = DualCorrectionGRPOLoss(
             clip_eps=self.config.clip_eps,
             tis_bound_c=self.config.tis_bound_c,
             temperature=self.config.temperature,
+            temperature_scale=self.config.temperature_scale,
             use_score_centering=self.config.use_score_centering,
             use_calibrated_clipping=self.config.use_calibrated_clipping,
             entropy_floor=self.config.entropy_floor,
@@ -553,7 +653,7 @@ class GRPOBridge:
         self.fallback_engine = FallbackRolloutEngine(self.trainer_model, self.tokenizer)
 
     def initialize_vllm(self) -> bool:
-        """Spins up the vLLM engine with safe headless, multi-processing, and LoRA support."""
+        """Spins up the vLLM engine with safe headless, multi-processing, sleep, and LoRA support."""
         try:
             os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
             os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
@@ -578,8 +678,19 @@ class GRPOBridge:
                 llm_kwargs["quantization"] = self.config.vllm_quantization
             if self.config.kv_cache_dtype != "auto":
                 llm_kwargs["kv_cache_dtype"] = self.config.kv_cache_dtype
+            if self.config.enable_vllm_sleep:
+                llm_kwargs["enable_sleep_mode"] = True
+            if self.config.logprobs_mode:
+                llm_kwargs["logprobs_mode"] = self.config.logprobs_mode
 
-            self.vllm_engine = LLM(**llm_kwargs)
+            try:
+                self.vllm_engine = LLM(**llm_kwargs)
+            except TypeError:
+                # Tolerate versions without sleep_mode or logprobs_mode in top-level constructor
+                llm_kwargs.pop("enable_sleep_mode", None)
+                llm_kwargs.pop("logprobs_mode", None)
+                self.vllm_engine = LLM(**llm_kwargs)
+
             return True
         except Exception as e:
             print(f"[GRPOBridge] Note: vLLM initialization deferred ({e}). Operating with fallback engine.")
@@ -591,7 +702,7 @@ class GRPOBridge:
         Generates concurrency_g rollouts per prompt using vLLM or the fallback engine.
         Extracts token log probabilities and uses versioned LoRARequest.
         """
-        self.vram_mgr.enter_rollout_phase(self.trainer_model)
+        self.vram_mgr.enter_rollout_phase(self.trainer_model, self.vllm_engine)
         batch = RolloutBatch(
             policy_version=self.weight_sync.policy_version,
             concurrency_g=self.config.concurrency_g,
@@ -645,6 +756,7 @@ class GRPOBridge:
                         rollout_logprobs=r_logprobs,
                         group_id=prompt_group_map[idx],
                         policy_version=self.weight_sync.policy_version,
+                        is_truncated=len(r_ids) >= self.config.max_new_tokens,
                     ))
             except Exception as e:
                 print(f"[GRPOBridge] Rollout generation note ({e}). Routing to fallback engine.")
@@ -667,6 +779,7 @@ class GRPOBridge:
                     rollout_logprobs=res["rollout_logprobs"],
                     group_id=prompt_group_map[idx],
                     policy_version=self.weight_sync.policy_version,
+                    is_truncated=res.get("is_truncated", False),
                 ))
 
         return batch
@@ -677,9 +790,13 @@ class GRPOBridge:
         reward_fn: Callable[[str, str], float],
     ):
         """
-        Evaluates rewards for all rollouts and computes group-centered advantages.
+        Evaluates rewards for all rollouts, validates and filters complete groups,
+        and computes group-centered advantages.
         Eliminates group sampling degeneracy (E4).
         """
+        if self.config.drop_incomplete_groups and not batch.validate_groups():
+            batch.filter_valid_groups(self.config.concurrency_g)
+
         for item in batch.items:
             item.reward = float(reward_fn(item.prompt_text, item.response_text))
 
@@ -688,6 +805,9 @@ class GRPOBridge:
             groups.setdefault(item.group_id, []).append(item)
 
         for g_id, group_items in groups.items():
+            if len(group_items) != self.config.concurrency_g and self.config.drop_incomplete_groups:
+                continue
+
             rewards = [it.reward for it in group_items]
             mean_r = sum(rewards) / len(rewards)
             var_r = sum((r - mean_r) ** 2 for r in rewards) / max(len(rewards), 1)
@@ -705,10 +825,10 @@ class GRPOBridge:
         optimizer: torch.optim.Optimizer,
     ) -> Dict[str, Any]:
         """
-        Executes micro-batched GRPO training step with detached TIS, gradient accumulation,
-        gradient norm clipping, and runtime LoRA weight synchronization.
+        Executes micro-batched GRPO training step with detached TIS, global token normalization,
+        gradient accumulation, gradient norm clipping, and automated adapter directory pruning.
         """
-        self.vram_mgr.enter_train_phase(self.trainer_model)
+        self.vram_mgr.enter_train_phase(self.trainer_model, self.vllm_engine)
 
         if len(batch.items) == 0:
             return {"loss": 0.0, "step": self.global_step}
@@ -718,11 +838,17 @@ class GRPOBridge:
         num_items = len(batch.items)
         num_micro_batches = math.ceil(num_items / micro_bs)
 
+        # Global response token count for exact token-level loss reduction
+        global_valid_tokens = max(1, sum(len(it.response_token_ids) for it in batch.items))
+
         optimizer.zero_grad()
         accumulated_metrics: Dict[str, float] = {}
 
         for mb_idx in range(num_micro_batches):
             mb_items = batch.items[mb_idx * micro_bs : (mb_idx + 1) * micro_bs]
+            if not mb_items:
+                continue
+
             padded_inputs = []
             prompt_lens = []
             advantages = []
@@ -752,11 +878,11 @@ class GRPOBridge:
                 prompt_lengths=prompt_lens,
                 advantages=adv_tensor,
                 rollout_logprobs=rollout_lps,
+                global_valid_tokens=global_valid_tokens,
             )
 
-            # Gradient accumulation across micro-batches
-            scaled_loss = mb_loss / num_micro_batches
-            scaled_loss.backward()
+            # mb_loss is already scaled by global_valid_tokens
+            mb_loss.backward()
 
             for k, v in mb_metrics.items():
                 accumulated_metrics[k] = accumulated_metrics.get(k, 0.0) + (v / num_micro_batches)
@@ -771,8 +897,9 @@ class GRPOBridge:
         optimizer.step()
         self.global_step += 1
 
-        # Synchronize updated LoRA weights into standard PEFT layout
+        # Synchronize updated LoRA weights into standard PEFT layout and prune old directories
         new_version = self.weight_sync.sync_to_vllm(self.trainer_model, self.vllm_engine)
+        self.weight_sync.prune_old_adapters(max_kept=self.config.max_kept_adapters)
 
         accumulated_metrics["step"] = self.global_step
         accumulated_metrics["policy_version"] = new_version
@@ -788,9 +915,9 @@ class GRPOBridge:
         """
         Complete end-to-end iteration of the GRPO bridge:
         1. Generates rollouts with token logprobs and versioned LoRA request
-        2. Scores rollouts and normalizes advantages across groups
+        2. Scores rollouts and normalizes advantages across verified groups
         3. Executes micro-batched training step with detached TIS and gradient clipping
-        4. Synchronizes LoRA weights for next rollout iteration
+        4. Synchronizes LoRA weights and prunes old adapters
         """
         batch = self.generate_rollouts(prompts)
         self.score_rollouts(batch, reward_fn)

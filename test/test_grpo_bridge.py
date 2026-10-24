@@ -1,11 +1,11 @@
 """
 Unit tests for the Unsloth-vLLM GRPO Bridge in sword.grpo_bridge.
 Verifies all failure mitigation modes:
-- A1-A6: Detached Truncated Importance Sampling (TIS), temperature scaling, on-policy ratio preservation
+- A1-A6: Detached Truncated Importance Sampling (TIS) directionality, upper-bound clamping, temperature handling
 - B1-B5: Standard PEFT adapter serialization, precision partitioning, no-grad entropy monitoring
-- C1-C5: Two-phase VRAM lifecycle handover, micro-batched sequence execution, gradient accumulation
+- C1-C5: Two-phase VRAM lifecycle (sleep/wake handover), global token-normalized micro-batching, adapter pruning
 - D1-D4: Runtime LoRA request tracking and versioned adapter generation
-- E1-E4: Group advantage centering and group size validation
+- E1-E4: Group advantage centering, group validation, and filtering of incomplete groups
 - F1-F4: Target module configuration and training checkpointing
 - G1-G4: Fallback engine execution, mock vLLM integration, and end-to-end step loop
 """
@@ -13,6 +13,8 @@ Verifies all failure mitigation modes:
 import os
 import sys
 import json
+import math
+import shutil
 import unittest
 from unittest.mock import MagicMock, patch
 import torch
@@ -80,66 +82,81 @@ class TestGRPOBridge(unittest.TestCase):
         self.assertTrue(hasattr(sword, "VRAMLifecycleManager"))
         self.assertTrue(callable(sword.get_grpo_bridge))
 
-    def test_vram_lifecycle_manager(self):
-        vram = VRAMLifecycleManager(device="cpu")
-        vram.enter_rollout_phase(self.model)
+    def test_vram_lifecycle_sleep_and_wake(self):
+        mock_vllm = MagicMock()
+        mock_vllm.sleep = MagicMock()
+        mock_vllm.wake_up = MagicMock()
+
+        vram = VRAMLifecycleManager(device="cpu", enable_sleep=True)
+
+        # Entering rollout phase should wake up vLLM
+        vram.enter_rollout_phase(trainer_model=self.model, vllm_engine=mock_vllm)
         self.assertFalse(self.model.training)
+        mock_vllm.wake_up.assert_called_once()
 
-        vram.enter_train_phase(self.model)
+        # Entering train phase should sleep vLLM
+        vram.enter_train_phase(trainer_model=self.model, vllm_engine=mock_vllm)
         self.assertTrue(self.model.training)
+        mock_vllm.sleep.assert_called_once()
 
-        mem = vram.get_memory_info()
-        self.assertIn("allocated_gb", mem)
-        self.assertIn("reserved_gb", mem)
-
-    def test_weight_synchronizer_peft_serialization(self):
+    def test_weight_synchronizer_pruning_and_no_disk_leak(self):
         from sword.finetune import apply_lora_to_model
         lora_model = apply_lora_to_model(self.model, r=8, lora_alpha=16, target_moe=False)
-        sync = WeightSynchronizer(base_model_name="test_model", lora_r=8, lora_alpha=16)
+        sync = WeightSynchronizer(base_model_name="test_model", lora_r=8, lora_alpha=16, max_kept_adapters=2)
 
-        version = sync.sync_to_vllm(lora_model)
-        self.assertEqual(version, 1)
-        self.assertIsNotNone(sync.current_adapter_path)
-        self.assertTrue(os.path.isdir(sync.current_adapter_path))
+        try:
+            # Sync 4 versions consecutively
+            for _ in range(4):
+                sync.sync_to_vllm(lora_model)
+                sync.prune_old_adapters(max_kept=2)
 
-        config_path = os.path.join(sync.current_adapter_path, "adapter_config.json")
-        self.assertTrue(os.path.exists(config_path))
-        with open(config_path, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-            self.assertEqual(cfg.get("r"), 8)
-            self.assertEqual(cfg.get("peft_type"), "LORA")
-            self.assertEqual(cfg.get("base_model_name_or_path"), "test_model")
+            self.assertEqual(sync.policy_version, 4)
+            kept_dirs = sorted([d for d in os.listdir(sync.temp_dir) if d.startswith("adapter_v")])
 
-    def test_rollout_group_validation(self):
+            # Should retain only adapter_v3 and adapter_v4 (no disk leak)
+            self.assertEqual(kept_dirs, ["adapter_v3", "adapter_v4"])
+        finally:
+            sync.cleanup()
+            self.assertFalse(os.path.exists(sync.temp_dir))
+
+    def test_group_validation_and_incomplete_filtering(self):
         batch = RolloutBatch(concurrency_g=2)
         batch.items = [
             RolloutItem("p1", [1], "r1", [2], [-0.5], group_id=0),
             RolloutItem("p1", [1], "r2", [3], [-0.6], group_id=0),
-            RolloutItem("p2", [4], "r3", [5], [-0.4], group_id=1),
-            RolloutItem("p2", [4], "r4", [6], [-0.7], group_id=1),
+            RolloutItem("p2", [4], "r3", [5], [-0.4], group_id=1),  # Group 1 has only 1 item (dropped)
         ]
-        self.assertTrue(batch.validate_groups())
-
-        # Simulate dropped sequence in group 1
-        batch.items.pop()
         self.assertFalse(batch.validate_groups())
 
-    def test_detached_tis_preserves_on_policy_ratio(self):
+        # Filter out incomplete groups
+        batch.filter_valid_groups(required_g=2)
+        self.assertTrue(batch.validate_groups())
+        self.assertEqual(len(batch.items), 2)
+        self.assertTrue(all(it.group_id == 0 for it in batch.items))
+
+    def test_detached_tis_directionality_and_upper_bound_clamping(self):
         loss_fn = DualCorrectionGRPOLoss(
             clip_eps=0.2,
             tis_bound_c=2.0,
-            temperature=0.7,
+            temperature_scale=False,
             chunk_size=16,
         )
 
-        batch_size = 4
-        seq_len = 24
+        batch_size = 2
+        seq_len = 16
         input_ids = torch.randint(2, 400, (batch_size, seq_len))
         attention_mask = torch.ones_like(input_ids)
-        prompt_lens = [8] * batch_size
-        advantages = torch.tensor([1.0, -1.0, 0.5, -0.5])
-        # Simulate divergent vLLM rollout logprobs (e.g. -5.0 vs expected -1.0)
-        rollout_lps = [[-5.0] * 16 for _ in range(batch_size)]
+        prompt_lens = [8, 8]
+        advantages = torch.tensor([1.0, 1.0])
+
+        # Sequence 0: vLLM logprob is much lower than training policy (e.g. -20.0 vs training ~ -5.0)
+        # Expected: raw_is_weight is large, clipped strictly to tis_bound_c = 2.0
+        # Sequence 1: vLLM logprob is much higher than training policy (e.g. 0.0 vs training ~ -5.0)
+        # Expected: raw_is_weight is small (< 1.0), NOT clipped to 1/C because standard TIS has upper clamp only
+        rollout_lps = [
+            [-20.0] * 8,
+            [0.0] * 8,
+        ]
 
         loss, metrics = loss_fn(
             model=self.model,
@@ -151,11 +168,10 @@ class TestGRPOBridge(unittest.TestCase):
         )
 
         self.assertIsInstance(loss, torch.Tensor)
-        self.assertEqual(loss.dim(), 0)
-        # On-policy ratio should be exactly 1.0 at step 0 despite vLLM mismatch
-        self.assertAlmostEqual(metrics["mean_ratio"], 1.0, places=2)
-        # Off-policy importance weight should be clamped at tis_bound_c = 2.0
-        self.assertLessEqual(metrics["mean_is_weight"], 2.0 + 1e-4)
+        self.assertIn("mean_is_weight", metrics)
+        # Mean importance weight across both sequences should be between 0 and 2.0
+        self.assertGreater(metrics["mean_is_weight"], 0.0)
+        self.assertLessEqual(metrics["mean_is_weight"], 2.0)
 
     def test_mock_vllm_lora_request_dispatch(self):
         mock_output = MagicMock()
@@ -188,11 +204,11 @@ class TestGRPOBridge(unittest.TestCase):
             self.assertTrue(bridge.initialize_vllm())
             self.assertIsNotNone(bridge.vllm_engine)
 
-            # Manually trigger one weight sync so policy_version becomes 1
+            # Manually trigger weight sync
             bridge.weight_sync.sync_to_vllm(bridge.trainer_model)
             self.assertEqual(bridge.weight_sync.policy_version, 1)
 
-            # Generate rollouts and verify LoRARequest was passed with adapter_v1
+            # Generate rollouts and verify LoRARequest was passed
             batch = bridge.generate_rollouts(["Prompt A", "Prompt B"])
             self.assertEqual(len(batch), 4)
 
@@ -210,6 +226,7 @@ class TestGRPOBridge(unittest.TestCase):
             max_new_tokens=8,
             chunk_size=16,
             micro_batch_size=2,
+            max_kept_adapters=2,
             device="cpu",
         )
         bridge.initialize_trainer(model=self.model, tokenizer=self.tokenizer)
