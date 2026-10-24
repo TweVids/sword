@@ -219,6 +219,27 @@ class TestLfm2MoeArchitecture(unittest.TestCase):
         self.assertTrue(hasattr(moe_block, "last_router_logits"))
         self.assertEqual(moe_block.last_router_logits.shape, (3 * 6, cfg.num_experts))
 
+        # Test router module with expert_bias parameter requirement
+        class MockRouterWithBiasParam(torch.nn.Module):
+            def __init__(self, weight):
+                super().__init__()
+                self.weight = weight
+            def forward(self, h, expert_bias=None):
+                if expert_bias is None:
+                    raise TypeError("unsupported operand type(s) for +: 'Tensor' and 'NoneType'")
+                logits = F.linear(h, self.weight)
+                scores = logits.sigmoid() + expert_bias
+                _, topk = torch.topk(scores, 2, dim=-1)
+                weights = torch.gather(scores, 1, topk)
+                return logits, topk, weights
+
+        orig_gate = moe_block.gate
+        moe_block.gate = MockRouterWithBiasParam(orig_gate.weight)
+        with torch.no_grad():
+            out_with_router_bias = moe_block(x)
+        self.assertEqual(out_with_router_bias.shape, (3, 6, cfg.hidden_size))
+        moe_block.gate = orig_gate
+
     # =========================================================
     # 4. StaticLfmCache Hybrid Buffer (KV + Conv) & Fast Reset
     # =========================================================

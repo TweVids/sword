@@ -721,9 +721,61 @@ def make_fast_lfm_moe_block_forward(original_forward):
         hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
 
         # 1. Gate routing
-        router_logits = self.gate(hidden_states_reshaped)
-        self.last_router_logits = router_logits
-        selected_experts, routing_weights = self.route_tokens_to_experts(router_logits)
+        exp_b = getattr(self, "expert_bias", getattr(getattr(self, "gate", None), "expert_bias", None))
+        selected_experts = None
+        routing_weights = None
+
+        if hasattr(self.gate, "weight") and isinstance(self.gate.weight, torch.Tensor):
+            bias = getattr(self.gate, "bias", None)
+            router_logits = F.linear(hidden_states_reshaped, self.gate.weight, bias)
+        else:
+            try:
+                gate_out = self.gate(hidden_states_reshaped, expert_bias=exp_b)
+            except TypeError:
+                try:
+                    gate_out = self.gate(hidden_states_reshaped, exp_b)
+                except TypeError:
+                    gate_out = self.gate(hidden_states_reshaped)
+
+            if isinstance(gate_out, tuple):
+                if len(gate_out) == 3:
+                    router_logits, selected_experts, routing_weights = gate_out
+                elif len(gate_out) == 2:
+                    selected_experts, routing_weights = gate_out
+                    router_logits = getattr(self, "last_router_logits", None)
+            else:
+                router_logits = gate_out
+
+        if router_logits is not None:
+            self.last_router_logits = router_logits
+
+        if selected_experts is None or routing_weights is None:
+            if hasattr(self, "route_tokens_to_experts"):
+                try:
+                    selected_experts, routing_weights = self.route_tokens_to_experts(router_logits)
+                except TypeError:
+                    try:
+                        selected_experts, routing_weights = self.route_tokens_to_experts(router_logits, expert_bias=exp_b)
+                    except TypeError:
+                        selected_experts, routing_weights = self.route_tokens_to_experts(router_logits, exp_b)
+            else:
+                # Built-in pure PyTorch top-k routing with expert bias
+                top_k = getattr(self, "top_k", 4)
+                use_expert_bias = getattr(self, "use_expert_bias", True)
+                norm_topk_prob = getattr(self, "norm_topk_prob", True)
+                routed_scaling_factor = getattr(self, "routed_scaling_factor", 1.0)
+
+                routing_weights = router_logits.sigmoid()
+                if use_expert_bias and exp_b is not None:
+                    scores_for_routing = routing_weights + exp_b
+                    _, selected_experts = torch.topk(scores_for_routing, k=top_k, dim=-1)
+                    routing_weights = torch.gather(routing_weights, dim=1, index=selected_experts).type_as(router_logits)
+                else:
+                    routing_weights, selected_experts = torch.topk(routing_weights, k=top_k, dim=-1)
+
+                if norm_topk_prob:
+                    routing_weights = routing_weights / (routing_weights.sum(dim=-1, keepdim=True) + 1e-6)
+                routing_weights = routing_weights * routed_scaling_factor
 
         experts_module = getattr(self, "experts", None)
         if experts_module is None or not hasattr(experts_module, "gate_up_proj"):
