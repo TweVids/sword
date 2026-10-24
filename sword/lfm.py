@@ -167,7 +167,7 @@ class StaticLfmCache(Cache):
 
     @property
     def is_sliding(self) -> List[bool]:
-        return [False] * self.num_layers
+        return [self.layer_types[idx] != "full_attention" for idx in range(self.num_layers)]
 
     def __len__(self) -> int:
         return self.num_layers
@@ -187,7 +187,8 @@ class StaticLfmCache(Cache):
 
     def get_mask_sizes(self, query_length: int, layer_idx: int = 0) -> Tuple[int, int]:
         """Return (kv_length, kv_offset) required by HF transformers create_causal_mask."""
-        return self.current_pos + query_length, 0
+        q_len = query_length.shape[0] if isinstance(query_length, torch.Tensor) else int(query_length)
+        return self.current_pos + q_len, 0
 
     def has_previous_state(self, layer_idx: Optional[int] = None) -> bool:
         if layer_idx is None:
@@ -345,7 +346,8 @@ def make_fast_lfm_conv_forward(original_forward):
         if (
             isinstance(attention_mask, torch.Tensor)
             and getattr(attention_mask, "ndim", 0) >= 2
-            and attention_mask.shape[1] > 1
+            and attention_mask.shape[1] == seqlen
+            and seqlen > 1
             and attention_mask.shape[0] > 1
         ):
             hidden_states = hidden_states * attention_mask[:, :, None].to(hidden_states.dtype)
@@ -464,6 +466,15 @@ def _fast_sdpa_attention(
     if attention_mask is not None and isinstance(attention_mask, torch.Tensor):
         if attention_mask.dtype not in (torch.bool, torch.float16, torch.bfloat16, torch.float32, torch.float64):
             attention_mask = attention_mask.to(torch.bool)
+        kv_len = key.shape[-2]
+        mask_k = attention_mask.shape[-1]
+        if mask_k < kv_len:
+            pad_val = True if attention_mask.dtype == torch.bool else 0.0
+            attention_mask = F.pad(attention_mask, (0, kv_len - mask_k), value=pad_val)
+        elif mask_k > kv_len:
+            attention_mask = attention_mask[..., :kv_len]
+        if query.shape[-2] == 1 and attention_mask.ndim >= 2 and attention_mask.shape[-2] > 1:
+            attention_mask = attention_mask[..., -1:, :]
 
     if query.is_cuda:
         try:
@@ -579,9 +590,11 @@ def make_fast_lfm_attention_forward(original_forward):
             # Single-token decode with left-padding mask: respect padding mask on cached K/V
             if isinstance(attention_mask, torch.Tensor):
                 if attention_mask.ndim == 4:
-                    attn_mask = attention_mask[:, :, -1:, :kv_len]
+                    attn_mask = attention_mask[:, :, -1:, :]
+                elif attention_mask.ndim == 3:
+                    attn_mask = attention_mask[:, None, -1:, :]
                 elif attention_mask.ndim == 2:
-                    attn_mask = attention_mask[:, None, None, :kv_len]
+                    attn_mask = attention_mask[:, None, None, :]
                 else:
                     attn_mask = attention_mask
             elif hasattr(attention_mask, "to_dense"):
@@ -589,9 +602,11 @@ def make_fast_lfm_attention_forward(original_forward):
                     dense = attention_mask.to_dense()
                     if isinstance(dense, torch.Tensor):
                         if dense.ndim == 4:
-                            attn_mask = dense[:, :, -1:, :kv_len]
+                            attn_mask = dense[:, :, -1:, :]
+                        elif dense.ndim == 3:
+                            attn_mask = dense[:, None, -1:, :]
                         elif dense.ndim == 2:
-                            attn_mask = dense[:, None, None, :kv_len]
+                            attn_mask = dense[:, None, None, :]
                         else:
                             attn_mask = dense
                     else:
@@ -601,8 +616,15 @@ def make_fast_lfm_attention_forward(original_forward):
             else:
                 attn_mask = None
 
-            if isinstance(attn_mask, torch.Tensor) and attn_mask.dtype not in (torch.bool, torch.float16, torch.bfloat16, torch.float32, torch.float64):
-                attn_mask = attn_mask.to(torch.bool)
+            if isinstance(attn_mask, torch.Tensor):
+                if attn_mask.dtype not in (torch.bool, torch.float16, torch.bfloat16, torch.float32, torch.float64):
+                    attn_mask = attn_mask.to(torch.bool)
+                mask_k = attn_mask.shape[-1]
+                if mask_k < kv_len:
+                    pad_val = True if attn_mask.dtype == torch.bool else 0.0
+                    attn_mask = F.pad(attn_mask, (0, kv_len - mask_k), value=pad_val)
+                elif mask_k > kv_len:
+                    attn_mask = attn_mask[..., :kv_len]
 
             if num_groups > 1 and attn_mask is not None and getattr(attn_mask, "ndim", 0) == 4 and attn_mask.shape[1] == 1:
                 # Zero-copy GQA view reshape with broadcast mask: [bsz * num_kv_heads, 1, 1, kv_len]
@@ -610,6 +632,19 @@ def make_fast_lfm_attention_forward(original_forward):
                 k_b = key_states.view(bsz * num_kv_heads, 1, -1, head_dim)
                 v_b = value_states.view(bsz * num_kv_heads, 1, -1, head_dim)
                 mask_b = attn_mask.expand(bsz, num_kv_heads, 1, kv_len).reshape(bsz * num_kv_heads, 1, 1, kv_len)
+                attn_out_b = _fast_sdpa_attention(
+                    q_b, k_b, v_b,
+                    attention_mask=mask_b,
+                    dropout_p=0.0,
+                    is_causal=False,
+                    scale=scaling,
+                )
+                attn_output = attn_out_b.view(bsz, num_heads, 1, head_dim)
+            elif num_groups > 1 and attn_mask is not None and getattr(attn_mask, "ndim", 0) == 4 and attn_mask.shape[1] == num_kv_heads:
+                q_b = query_states.view(bsz * num_kv_heads, 1, num_groups, head_dim)
+                k_b = key_states.view(bsz * num_kv_heads, 1, -1, head_dim)
+                v_b = value_states.view(bsz * num_kv_heads, 1, -1, head_dim)
+                mask_b = attn_mask.reshape(bsz * num_kv_heads, 1, 1, kv_len)
                 attn_out_b = _fast_sdpa_attention(
                     q_b, k_b, v_b,
                     attention_mask=mask_b,
@@ -656,14 +691,22 @@ def make_fast_lfm_attention_forward(original_forward):
 
             attn_mask = attention_mask
             if isinstance(attn_mask, torch.Tensor):
-                if attn_mask.ndim == 4 and attn_mask.shape[-1] > kv_len:
-                    attn_mask = attn_mask[:, :, :, :kv_len]
+                mask_k = attn_mask.shape[-1]
+                if mask_k > kv_len:
+                    attn_mask = attn_mask[..., :kv_len]
+                elif mask_k < kv_len:
+                    pad_val = True if attn_mask.dtype == torch.bool else 0.0
+                    attn_mask = F.pad(attn_mask, (0, kv_len - mask_k), value=pad_val)
             elif hasattr(attn_mask, "to_dense"):
                 try:
                     dense = attn_mask.to_dense()
                     if isinstance(dense, torch.Tensor):
-                        if dense.ndim == 4 and dense.shape[-1] > kv_len:
-                            attn_mask = dense[:, :, :, :kv_len]
+                        mask_k = dense.shape[-1]
+                        if mask_k > kv_len:
+                            attn_mask = dense[..., :kv_len]
+                        elif mask_k < kv_len:
+                            pad_val = True if dense.dtype == torch.bool else 0.0
+                            attn_mask = F.pad(dense, (0, kv_len - mask_k), value=pad_val)
                         else:
                             attn_mask = dense
                     else:
