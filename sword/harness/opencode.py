@@ -4,7 +4,9 @@ capturing tool execution results, success rates, and reasoning traces.
 """
 
 import re
+import ast
 import json
+import shlex
 import subprocess
 from typing import Dict, Any, List, Optional, Callable, Tuple
 
@@ -58,29 +60,55 @@ class OpenCodeHarness(BaseHarness):
         """Safely runs or validates tool invocation."""
         ctype = call.get("type", "")
         payload = call.get("payload", {})
+        raw = call.get("raw", "")
+
+        # Reject dangerous shell instructions
+        dangerous_patterns = ("rm -rf /", ":(){ :|:& };:", "dd if=/dev/zero", "mkfs.")
+        if any(bad in raw for bad in dangerous_patterns):
+            return False, "Tool execution rejected: dangerous command pattern detected."
 
         if not self.allow_exec:
             # Emulated / safe validation without spawning real host shell
-            raw = call.get("raw", "")
-            if len(raw) > 0 and not any(bad in raw for bad in ("rm -rf /", ":(){ :|:& };:")):
-                return True, "Executed successfully (emulated sandbox)"
-            return False, "Tool execution rejected by policy"
+            if ctype == "python":
+                code = payload.get("code") or raw
+                try:
+                    ast.parse(code)
+                    return True, "Executed successfully (valid Python syntax)"
+                except SyntaxError as e:
+                    return False, f"SyntaxError: {e.msg} at line {e.lineno}"
+            elif ctype in ("bash", "sh"):
+                cmd = payload.get("code") or payload.get("command") or raw
+                try:
+                    shlex.split(cmd)
+                    if len(cmd.strip()) > 0:
+                        return True, "Executed successfully (valid shell syntax)"
+                    return False, "Empty shell command"
+                except Exception as e:
+                    return False, f"Shell parse error: {str(e)}"
+            elif ctype == "tool_call":
+                if isinstance(payload, dict) and ("command" in payload or "action" in payload or "name" in payload):
+                    return True, "Executed successfully (valid tool payload)"
+                return False, "Malformed tool_call payload"
+            return len(raw.strip()) > 0, "Executed successfully (emulated)"
 
+        # Live execution when allow_exec is True
         try:
             if ctype in ("bash", "sh"):
-                cmd = payload.get("code") or payload.get("command", "")
+                cmd = payload.get("code") or payload.get("command") or raw
                 res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=self.timeout_sec)
                 ok = res.returncode == 0
                 out = res.stdout if ok else res.stderr
-                return ok, out[:500]
+                return ok, (out[:500] if out else "Success (exit code 0)")
             elif ctype == "python":
-                code = payload.get("code", "")
+                code = payload.get("code") or raw
                 res = subprocess.run(["python", "-c", code], capture_output=True, text=True, timeout=self.timeout_sec)
                 ok = res.returncode == 0
                 out = res.stdout if ok else res.stderr
-                return ok, out[:500]
+                return ok, (out[:500] if out else "Success (exit code 0)")
             else:
                 return True, "Tool recognized"
+        except subprocess.TimeoutExpired:
+            return False, f"Execution timed out after {self.timeout_sec}s"
         except Exception as e:
             return False, str(e)[:200]
 
@@ -100,7 +128,7 @@ class OpenCodeHarness(BaseHarness):
         final_text = ""
         reasoning_text = ""
 
-        for turn in range(max_turns):
+        for turn in range(max(1, max_turns)):
             response = model_generate_fn(curr_prompt)
             final_text = response
             r_chunk = self.extract_reasoning(response)
@@ -127,11 +155,17 @@ class OpenCodeHarness(BaseHarness):
                     "output": output,
                 })
 
-            # Append tool outputs for next turn
-            tool_feedback = "\n".join([f"[Tool Result]: {h['output']}" for h in history[-len(calls):]])
-            curr_prompt = f"{curr_prompt}\n\nModel:\n{response}\n\nEnvironment:\n{tool_feedback}\n\nProceed:"
+            if turn < max_turns - 1:
+                # Append tool outputs for next turn
+                recent_calls = history[-len(calls):]
+                feedbacks = []
+                for h in recent_calls:
+                    tag = "[Tool Result]" if h["success"] else "[Tool Error]"
+                    feedbacks.append(f"{tag}: {h['output']}")
+                tool_feedback = "\n".join(feedbacks)
+                curr_prompt = f"{curr_prompt}\n\nModel:\n{response}\n\nEnvironment:\n{tool_feedback}\n\nProceed:"
 
-        success_rate = (tools_succeeded / tools_called) if tools_called > 0 else 1.0
+        success_rate = (tools_succeeded / tools_called) if tools_called > 0 else 0.0
 
         return HarnessResult(
             task_id=task_id,

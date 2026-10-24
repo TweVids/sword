@@ -13,18 +13,18 @@ sword grpo training engine: refactoring and architecture notes
   * structured json/yaml evaluation prompt and robust parsing.
 - resilience and memory safety:
   * try/except blocks for graceful degradation.
-  * out-of-memory detection with automatic cache clearing and emergency checkpoint save/upload.
-  * custom checkpoint saver independent of unsloth saving.
+  * out-of-memory detection with automatic cache clearing, retry, and emergency checkpoint save/upload.
+  * custom checkpoint saver independent of unsloth saving with read-back verification.
   * hugging face automatic repo creation and resumable checkpoint tracking.
 - testability:
   * mock/cpu test suite verifying all code paths without requiring live gpus or external servers.
 
 2. planned modules in sword
 - sword/trainer_config.py: configuration dataclasses for training, lora, arguments, and dataset specs.
-- sword/b_model.py: ollama model b client, prompt generator, and structured score parser.
-- sword/harness/: vendor / adapter layer for agentic harnesses (opencode, codex, gemini, pi) tracking tool calls and outputs.
+- sword/b_model.py: ollama model b client, prompt generator, structured score parser, and vram lifecycle manager.
+- sword/harness/: vendor / adapter layer for agentic harnesses (opencode, codex, gemini, pi) tracking multi-turn interactions.
 - sword/reward.py: multi-metric reward calculator combining ground truth math verification, formatting, model b rules, and tool metrics.
-- sword/checkpoint.py: custom checkpoint serializer, sha-256 dataset tracking, resume discovery, and hugging face hub synchronizer.
+- sword/checkpoint.py: custom checkpoint serializer, read-back verification, sha-256 dataset tracking, resume discovery, and hugging face hub synchronizer.
 - sword/long_trainer.py: infinite grpo training loop coordinating rollout, model b scoring, chunked training, and memory lifecycle.
 - sword/train_entry.py: updated unified sword.train entry point routing cleanly to test or long_train.
 
@@ -38,6 +38,12 @@ step 6: implement sword/long_trainer.py (infinite grpo engine with oom protectio
 step 7: update sword/train_entry.py and sword/__init__.py for seamless imports.
 step 8: build comprehensive mock/cpu unit test suite in test/test_new_trainer.py.
 step 9: run tests, review, commit, and verify all constraints.
+step 10: address self-review findings:
+  * enhance harness implementations with authentic multi-turn loops, tool feedback, and syntax/execution validation.
+  * fix checkpoint serialization: preserve peft canonical files, add read-back verification, and restore optimizer state.
+  * compute sha-256 over canonical dataset row content and fail explicitly on missing hub datasets.
+  * upgrade model b judge: 1024 token budget, unload method, and sequential vram coordination.
+  * expand oom handling with single-retry and emergency checkpointing.
 
 4. execution progress and verification log
 - step 1 completed: notes.txt initialized with comprehensive specifications.
@@ -46,10 +52,13 @@ step 9: run tests, review, commit, and verify all constraints.
 - step 4 completed: sword/reward.py implemented with MultiMetricRewardScorer, MathVerifier, and RewardBreakdown supporting truth (0.5 math match), formatting, reasoning_rule, answer_rule, tools_success, and cheating deduction (-0.2).
 - step 5 completed: sword/checkpoint.py implemented with CheckpointManager, sha-256 dataset hashing, data_complete.logs tracking, custom checkpoint saving, resume discovery, and hugging face hub upload.
 - step 6 completed: sword/long_trainer.py implemented with run_long_train supporting infinite grpo loops, sha-256 deduplication, oom interception, emergency checkpoint saving, and detailed logging.
-- step 7 completed: sword/train_entry.py and sword/__init__.py updated to expose sword.train with all requested parameters (long_train, dataset, model, B_model_port, custom_checkpoint_save, is_save_and_upload_checkpoint, num_latest_checkpoint_save, upload_id, HF_TOKEN, resume_from_checkpoint, lora_cfg, Argument, show_detail_logs, score_logs).
-- step 8 completed: test/test_new_trainer.py created with 8 comprehensive unit tests covering b_model, harnesses, reward scoring, checkpointing, sha-256 tracking, and end-to-end long_train.
-- step 9 completed: all test suites verified green:
-  * test/test_new_trainer.py: 8/8 passed in 17.6s.
-  * test/test_train_api.py: 7/7 passed in 0.28s.
-  * test/test_grpo_bridge.py: 7/7 passed in 1.04s.
-
+- step 7 completed: sword/train_entry.py and sword/__init__.py updated to expose sword.train with all requested parameters.
+- step 8 completed: test/test_new_trainer.py created with unit tests covering b_model, harnesses, reward scoring, checkpointing, sha-256 tracking, and end-to-end long_train.
+- step 9 completed: initial test suites verified green.
+- step 10 completed: all review enhancements implemented and verified:
+  * OpenCodeHarness, CodexCliHarness, GeminiCliHarness, and PiHarness upgraded with authentic multi-turn execution loops, ast syntax verification, and environment feedback.
+  * CheckpointManager updated to preserve peft save_pretrained outputs, perform read-back verification on save, restore optimizer state on resume, and match adapter key prefixes.
+  * Dataset sha-256 computed over canonical serialized records content, and mark_dataset_completed moved out of finally so interrupted runs do not mark incomplete data as trained.
+  * ModelBJudge upgraded with 1024 token budget, unload method sending keep_alive=0, and sequential vram coordination helpers.
+  * OOM interception wrapped across generation, scoring, and training with single-retry and emergency checkpointing.
+  * All 25 unit tests across test_new_trainer.py, test_train_api.py, and test_grpo_bridge.py passing cleanly.

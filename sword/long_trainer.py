@@ -46,6 +46,19 @@ class DatasetProblemRow:
     harness: Optional[str] = None
     problem_id: str = ""
 
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "problem": self.problem,
+            "solution": self.solution,
+            "reasoning_rule": self.reasoning_rule,
+            "answer_rule": self.answer_rule,
+            "can_be_verify": self.can_be_verify,
+            "difficulty": self.difficulty,
+            "category": self.category,
+            "harness": self.harness,
+            "problem_id": self.problem_id,
+        }
+
 
 def parse_dataset_row(raw: Dict[str, Any], index: int = 0) -> DatasetProblemRow:
     """Defensively parses any dataset dictionary into a standardized DatasetProblemRow."""
@@ -57,7 +70,6 @@ def parse_dataset_row(raw: Dict[str, Any], index: int = 0) -> DatasetProblemRow:
     # Handle spelling variations in dataset schemas: can_be__verify or can_be_verify
     cbv = raw.get("can_be__verify") if "can_be__verify" in raw else raw.get("can_be_verify")
     if cbv is None:
-        # Default True if solution is numeric or short, else False
         can_be_verify = bool(re.search(r"^\s*[-+]?(?:\d*\.\d+|\d+)\s*$", solution))
     elif isinstance(cbv, str):
         can_be_verify = cbv.strip().lower() in ("true", "1", "yes")
@@ -84,18 +96,18 @@ def parse_dataset_row(raw: Dict[str, Any], index: int = 0) -> DatasetProblemRow:
 def load_dataset_records(dataset_spec: Union[str, List[Any], Dict[str, Any]], hf_token: Optional[str] = None) -> Tuple[List[DatasetProblemRow], str]:
     """
     Loads dataset from Google Drive link, Hugging Face dataset ID, local file, or in-memory list.
+    Computes exact SHA-256 over canonical serialized records content.
     Returns (records, sha256_hash).
     """
     raw_items = []
-    content_bytes = b""
 
     # 1. In-memory list or dictionary
     if isinstance(dataset_spec, list):
         raw_items = dataset_spec
-        content_bytes = json.dumps(dataset_spec, sort_keys=True).encode("utf-8")
     elif isinstance(dataset_spec, dict) and "data" in dataset_spec:
         raw_items = dataset_spec["data"]
-        content_bytes = json.dumps(dataset_spec, sort_keys=True).encode("utf-8")
+    elif isinstance(dataset_spec, dict):
+        raw_items = [dataset_spec]
 
     # 2. String path, URL, or Hugging Face dataset ID
     elif isinstance(dataset_spec, str):
@@ -125,7 +137,6 @@ def load_dataset_records(dataset_spec: Union[str, List[Any], Dict[str, Any]], hf
                 data = json.loads(content_bytes.decode("utf-8", errors="replace"))
                 raw_items = data if isinstance(data, list) else [data]
             else:
-                # Delimited / CSV fallback
                 for line in content_bytes.decode("utf-8", errors="replace").splitlines():
                     if line.strip():
                         parts = line.split("\t") if "\t" in line else line.split(",")
@@ -134,32 +145,37 @@ def load_dataset_records(dataset_spec: Union[str, List[Any], Dict[str, Any]], hf
 
         # Hugging Face Hub dataset ID
         else:
-            content_bytes = spec.encode("utf-8")
             try:
                 from datasets import load_dataset
                 ds = load_dataset(spec, split="train", token=hf_token)
                 for item in ds:
                     raw_items.append(dict(item))
             except Exception as e:
-                print(f"[DatasetLoader] Hub load note ({e}). Creating synthetic problem records.")
-                raw_items = [
-                    {
-                        "problem": f"Sample problem {i}: Compute 2^{i} + {i * 3}",
-                        "solution": str(2**i + i * 3),
-                        "reasoning_rule": "Derive step by step.",
-                        "answer_rule": "Provide exact integer answer.",
-                        "can_be__verify": True,
-                        "difficult": "easy" if i < 3 else "medium",
-                        "cagetory": "math",
-                        "harness": "none",
-                    }
-                    for i in range(1, 9)
-                ]
-
-    # Compute SHA-256
-    sha256 = hashlib.sha256(content_bytes if content_bytes else b"empty").hexdigest()
+                # If explicit test or mock dataset name
+                if any(k in spec.lower() for k in ("test", "dummy", "synthetic", "mock", "templategsm")):
+                    print(f"[DatasetLoader] Hub load notice ({e}). Using synthetic problem records for testing.")
+                    raw_items = [
+                        {
+                            "problem": f"Sample problem {i}: Compute 2^{i} + {i * 3}",
+                            "solution": str(2**i + i * 3),
+                            "reasoning_rule": "Derive step by step.",
+                            "answer_rule": "Provide exact integer answer.",
+                            "can_be__verify": True,
+                            "difficult": "easy" if i < 3 else "medium",
+                            "cagetory": "math",
+                            "harness": "none",
+                        }
+                        for i in range(1, 9)
+                    ]
+                else:
+                    raise ValueError(f"Failed to load dataset '{spec}' from Hugging Face Hub: {e}")
 
     records = [parse_dataset_row(item, idx) for idx, item in enumerate(raw_items)]
+
+    # Compute exact SHA-256 over parsed records content
+    canonical_str = json.dumps([r.to_dict() for r in records], sort_keys=True)
+    sha256 = hashlib.sha256(canonical_str.encode("utf-8")).hexdigest()
+
     return records, sha256
 
 
@@ -236,6 +252,7 @@ def run_long_train(
         port=B_model_port,
         host=kwargs.get("B_model_host", "127.0.0.1"),
         model_name=kwargs.get("B_model_name", "gpt-oss:120b"),
+        num_predict=int(kwargs.get("B_model_num_predict", 1024)),
     )
     b_judge = ModelBJudge(config=b_judge_config)
     reward_scorer = MultiMetricRewardScorer(b_model_judge=b_judge)
@@ -259,39 +276,31 @@ def run_long_train(
         tokenizer=kwargs.get("tokenizer"),
     )
 
+    trainable_params = [p for p in bridge.trainer_model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable_params, lr=lr)
+
     # 5. Checkpoint Resume Discovery
     start_step = 0
     resolved_ckpt = ckpt_mgr.find_latest_checkpoint(resume_from_checkpoint)
     if resolved_ckpt:
         print(f"[*] Resuming from checkpoint: {resolved_ckpt}")
         try:
-            from safetensors.torch import load_file as load_safetensors
-            weights_file = os.path.join(resolved_ckpt, "adapter_model.safetensors")
-            if not os.path.exists(weights_file):
-                weights_file = os.path.join(resolved_ckpt, "adapter_model.bin")
-
-            if os.path.exists(weights_file):
-                sd = load_safetensors(weights_file) if weights_file.endswith(".safetensors") else torch.load(weights_file, map_location="cpu")
-                bridge.trainer_model.load_state_dict(sd, strict=False)
-                print(f"[*] Restored {len(sd)} LoRA adapter weights.")
-
-            state_file = os.path.join(resolved_ckpt, "training_state.json")
-            if os.path.exists(state_file):
-                with open(state_file, "r", encoding="utf-8") as f:
-                    st = json.load(f)
-                    start_step = int(st.get("step", 0))
-                    print(f"[*] Resumed at step: {start_step}")
+            res_info = ckpt_mgr.load_checkpoint(
+                ckpt_dir=resolved_ckpt,
+                model=bridge.trainer_model,
+                optimizer=optimizer,
+            )
+            start_step = res_info["step"]
+            print(f"[*] Resumed at step {start_step} ({res_info['matched_keys']} adapter keys matched).")
         except Exception as e_res:
-            print(f"[Sword] Resume note: {e_res}. Continuing with current parameters.")
+            print(f"[Sword] Resume notice: {e_res}. Continuing with fresh state.")
 
     # 6. Initialize vLLM / Fallback Engine
     bridge.initialize_vllm()
 
-    trainable_params = [p for p in bridge.trainer_model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(trainable_params, lr=lr)
-
     reward_history_logs: List[Dict[str, Any]] = []
     current_step = start_step
+    completed_successfully = False
 
     print(f"\n[*] Starting training loop from step {start_step + 1} to {start_step + steps}...\n")
 
@@ -300,92 +309,120 @@ def run_long_train(
             step_idx = current_step + 1
             row_idx = (step_idx - 1) % len(records)
             current_row = records[row_idx]
-
-            # Determine whether this task uses an agentic CLI harness
             harness = get_harness(current_row.harness)
 
-            # Generate rollouts
-            prompts = [current_row.problem]
-            batch = bridge.generate_rollouts(prompts)
+            step_success = False
+            for attempt in range(2):
+                try:
+                    # Rollout Phase
+                    prompts = [current_row.problem]
+                    batch = bridge.generate_rollouts(prompts)
 
-            # Score each rollout with multi-metric scorer
-            step_scores = []
-            for item in batch.items:
-                tools_called = 0
-                tools_succeeded = 0
+                    # Scoring Phase with Model B memory preparation
+                    b_judge.prepare_for_eval()
+                    step_scores = []
 
-                # If harness is requested, run harness validation
-                if harness is not None:
-                    h_res = harness.run(
-                        prompt=item.prompt_text,
-                        model_generate_fn=lambda p: item.response_text,
-                        task_id=current_row.problem_id,
-                    )
-                    tools_called = h_res.tools_called
-                    tools_succeeded = h_res.tools_succeeded
+                    for item in batch.items:
+                        tools_called = 0
+                        tools_succeeded = 0
 
-                score_breakdown = reward_scorer.score(
-                    problem=current_row.problem,
-                    solution=current_row.solution,
-                    candidate_response=item.response_text,
-                    reasoning_rule=current_row.reasoning_rule,
-                    answer_rule=current_row.answer_rule,
-                    can_be_verify=current_row.can_be_verify,
-                    difficulty=current_row.difficulty,
-                    category=current_row.category,
-                    harness_name=current_row.harness,
-                    tools_called=tools_called,
-                    tools_succeeded=tools_succeeded,
-                )
-                item.reward = score_breakdown.total_score
-                step_scores.append(score_breakdown)
+                        # Multi-turn harness interaction
+                        if harness is not None:
+                            def multi_turn_generate(turn_p: str) -> str:
+                                if turn_p == item.prompt_text:
+                                    return item.response_text
+                                return bridge.generate_single(turn_p)
 
-                if score_logs:
-                    reward_history_logs.append({
-                        "step": step_idx,
-                        "problem_id": current_row.problem_id,
-                        "scores": score_breakdown.to_dict(),
-                    })
+                            h_res = harness.run(
+                                prompt=item.prompt_text,
+                                model_generate_fn=multi_turn_generate,
+                                task_id=current_row.problem_id,
+                            )
+                            tools_called = h_res.tools_called
+                            tools_succeeded = h_res.tools_succeeded
+                            if h_res.final_text:
+                                item.response_text = h_res.final_text
 
-            # Calculate group-centered advantages
-            groups: Dict[int, List[RolloutItem]] = {}
-            for it in batch.items:
-                groups.setdefault(it.group_id, []).append(it)
+                        score_breakdown = reward_scorer.score(
+                            problem=current_row.problem,
+                            solution=current_row.solution,
+                            candidate_response=item.response_text,
+                            reasoning_rule=current_row.reasoning_rule,
+                            answer_rule=current_row.answer_rule,
+                            can_be_verify=current_row.can_be_verify,
+                            difficulty=current_row.difficulty,
+                            category=current_row.category,
+                            harness_name=current_row.harness,
+                            tools_called=tools_called,
+                            tools_succeeded=tools_succeeded,
+                        )
+                        item.reward = score_breakdown.total_score
+                        step_scores.append(score_breakdown)
 
-            for g_id, g_items in groups.items():
-                r_vals = [it.reward for it in g_items]
-                mean_r = sum(r_vals) / len(r_vals)
-                var_r = sum((r - mean_r) ** 2 for r in r_vals) / max(len(r_vals), 1)
-                std_r = math.sqrt(var_r)
-                for it in g_items:
-                    it.advantage = (it.reward - mean_r) / (std_r + 1e-6) if std_r > 1e-6 else 0.0
+                        if score_logs:
+                            reward_history_logs.append({
+                                "step": step_idx,
+                                "problem_id": current_row.problem_id,
+                                "scores": score_breakdown.to_dict(),
+                            })
 
-            # Execute training step with OOM auto-recovery
-            try:
-                metrics = bridge.train_step(batch, optimizer)
-            except (torch.cuda.OutOfMemoryError, RuntimeError) as e_oom:
-                if "out of memory" in str(e_oom).lower():
-                    print(f"\n[Sword Alert] CUDA Out-of-Memory intercepted at step {step_idx}!")
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                    # Release Model B VRAM before training step
+                    b_judge.release_after_eval()
 
-                    # Save emergency checkpoint of the latest completed state
-                    emergency_ckpt = ckpt_mgr.save_checkpoint(
-                        step=current_step,
-                        model=bridge.trainer_model,
-                        optimizer=optimizer,
-                        base_model_name=model,
-                        reward_logs=reward_history_logs[-50:],
-                        completed_dataset_hash=dataset_sha256,
-                    )
-                    print(f"[Sword] Emergency checkpoint successfully secured at: {emergency_ckpt}")
-                    return {
-                        "status": "oom_aborted",
-                        "last_completed_step": current_step,
-                        "emergency_checkpoint": emergency_ckpt,
-                    }
-                raise e_oom
+                    # Calculate group-centered advantages
+                    groups: Dict[int, List[RolloutItem]] = {}
+                    for it in batch.items:
+                        groups.setdefault(it.group_id, []).append(it)
+
+                    for g_id, g_items in groups.items():
+                        r_vals = [it.reward for it in g_items]
+                        mean_r = sum(r_vals) / len(r_vals)
+                        var_r = sum((r - mean_r) ** 2 for r in r_vals) / max(len(r_vals), 1)
+                        std_r = math.sqrt(var_r)
+                        for it in g_items:
+                            it.advantage = (it.reward - mean_r) / (std_r + 1e-6) if std_r > 1e-6 else 0.0
+
+                    # Execute training forward / backward step
+                    metrics = bridge.train_step(batch, optimizer)
+                    step_success = True
+                    break
+
+                except (torch.cuda.OutOfMemoryError, RuntimeError) as e_oom:
+                    is_oom = "out of memory" in str(e_oom).lower() or isinstance(e_oom, torch.cuda.OutOfMemoryError)
+                    if is_oom and attempt == 0:
+                        print(f"\n[Sword Alert] CUDA Out-of-Memory intercepted at step {step_idx} (attempt 1). Clearing cache and retrying...")
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        b_judge.release_after_eval()
+                        continue
+                    elif is_oom:
+                        print(f"\n[Sword Alert] CUDA Out-of-Memory persisted at step {step_idx}. Securing emergency checkpoint...")
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        b_judge.release_after_eval()
+
+                        emergency_ckpt = ckpt_mgr.save_checkpoint(
+                            step=current_step,
+                            model=bridge.trainer_model,
+                            optimizer=optimizer,
+                            base_model_name=model,
+                            reward_logs=reward_history_logs[-50:],
+                            completed_dataset_hash=dataset_sha256,
+                        )
+                        print(f"[Sword] Emergency checkpoint successfully secured at: {emergency_ckpt}")
+                        return {
+                            "status": "oom_aborted",
+                            "last_completed_step": current_step,
+                            "emergency_checkpoint": emergency_ckpt,
+                            "dataset_sha256": dataset_sha256,
+                        }
+                    else:
+                        raise e_oom
+
+            if not step_success:
+                break
 
             current_step = step_idx
 
@@ -416,11 +453,16 @@ def run_long_train(
                 )
                 print(f"[*] Checkpoint saved at: {saved_path}")
 
+        completed_successfully = (current_step >= start_step + steps)
+
     except KeyboardInterrupt:
         print("\n[Sword] Training interrupted by user. Saving current checkpoint...")
     finally:
-        # Mark dataset completed and save final state
-        ckpt_mgr.mark_dataset_completed(dataset_sha256, str(dataset)[:50])
+        # Only mark dataset completed if training finished all steps
+        if completed_successfully:
+            ckpt_mgr.mark_dataset_completed(dataset_sha256, str(dataset)[:50])
+            print(f"[Sword] Dataset {dataset_sha256} marked completed in data_complete.logs.")
+
         final_ckpt = ckpt_mgr.save_checkpoint(
             step=current_step,
             model=bridge.trainer_model,
@@ -430,12 +472,12 @@ def run_long_train(
             lora_alpha=bridge_config.lora_alpha,
             target_modules=bridge_config.target_modules,
             reward_logs=reward_history_logs,
-            completed_dataset_hash=dataset_sha256,
+            completed_dataset_hash=dataset_sha256 if completed_successfully else None,
         )
-        print(f"\n[Sword] Training finished. Final checkpoint: {final_ckpt}")
+        print(f"\n[Sword] Training process recorded. Final checkpoint: {final_ckpt}")
 
     return {
-        "status": "completed",
+        "status": "completed" if completed_successfully else "interrupted",
         "final_step": current_step,
         "dataset_sha256": dataset_sha256,
         "checkpoint_dir": final_ckpt,

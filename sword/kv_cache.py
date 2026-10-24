@@ -100,6 +100,9 @@ class StaticAttentionLayer(CacheLayerMixin):
     def get_seq_length(self) -> int:
         return self.parent.current_pos
 
+    def get_max_length(self) -> Optional[int]:
+        return self.parent.max_seq_len
+
     def get_max_cache_shape(self) -> int:
         return self.parent.max_seq_len
 

@@ -811,6 +811,21 @@ class GRPOBridge:
 
         return batch
 
+    def generate_single(self, prompt: str) -> str:
+        """
+        Generates a single model completion for prompt.
+        Used for multi-turn harness interaction and conversational rollouts.
+        """
+        saved_g = self.config.concurrency_g
+        self.config.concurrency_g = 1
+        try:
+            batch = self.generate_rollouts([prompt])
+            if batch.items:
+                return batch.items[0].response_text
+            return ""
+        finally:
+            self.config.concurrency_g = saved_g
+
     def score_rollouts(
         self,
         batch: RolloutBatch,

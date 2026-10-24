@@ -1,10 +1,11 @@
 """
 Model B Judge: Ollama-based evaluation judge for GRPO multi-metric scoring.
 Connects via HTTP to an Ollama instance to evaluate reasoning rules, answer rules,
-formatting, and cheating detection without colliding with the main training process.
+formatting, and cheating detection with sequential VRAM management and memory guards.
 """
 
 import re
+import gc
 import json
 import time
 from dataclasses import dataclass, field
@@ -14,6 +15,11 @@ try:
     import requests
 except ImportError:
     requests = None
+
+try:
+    import torch
+except ImportError:
+    torch = None
 
 
 @dataclass
@@ -47,15 +53,18 @@ class ModelBJudgeConfig:
     timeout: float = 60.0
     temperature: float = 0.1
     num_ctx: int = 8192
+    num_predict: int = 1024
     reasoning: Optional[str] = None
     force_gpu: bool = True
     use_mmap: bool = False
+    auto_unload: bool = False
 
 
 class ModelBJudge:
     """
     Evaluates candidate model outputs against dataset rules and ground truth.
-    Extracts structured scores in JSON format from Model B's output.
+    Extracts structured scores in JSON or array format from Model B's output.
+    Coordinates sequential execution and VRAM unloading to prevent training collisions.
     """
     SYSTEM_PROMPT = (
         "You are an impartial, rigorous evaluation judge for artificial intelligence models.\n"
@@ -94,6 +103,37 @@ class ModelBJudge:
         except Exception:
             return False
 
+    def unload(self) -> bool:
+        """
+        Releases Model B from memory/VRAM by sending keep_alive=0 to Ollama.
+        This frees VRAM back to the training model.
+        """
+        if requests is None or not self.is_available():
+            return False
+        try:
+            payload = {
+                "model": self.config.model_name,
+                "keep_alive": 0,
+            }
+            resp = requests.post(f"{self.url}/api/generate", json=payload, timeout=5.0)
+            return resp.status_code == 200
+        except Exception:
+            return False
+
+    def prepare_for_eval(self):
+        """Clears PyTorch CUDA allocations before running Model B."""
+        gc.collect()
+        if torch is not None and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def release_after_eval(self):
+        """Unloads Model B and clears CUDA allocations before the training step."""
+        if self.config.auto_unload:
+            self.unload()
+        gc.collect()
+        if torch is not None and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     def build_user_prompt(
         self,
         problem: str,
@@ -125,7 +165,7 @@ class ModelBJudge:
         cleaned = re.sub(r"^```(?:json|yaml)?\s*", "", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"\s*```$", "", cleaned)
 
-        # 1. Try direct JSON parsing
+        # 1. Direct JSON object parsing
         try:
             match = re.search(r"\{[^{}]*\}", cleaned, re.DOTALL)
             if match:
@@ -143,7 +183,7 @@ class ModelBJudge:
         except Exception:
             pass
 
-        # 2. Try array format: [truth, formatted, reasoning, answer, tools, cheating]
+        # 2. JSON array format [truth, formatted, reasoning, answer, tools, cheating]
         try:
             match_arr = re.search(r"\[[^\[\]]*\]", cleaned)
             if match_arr:
@@ -227,7 +267,7 @@ class ModelBJudge:
 
         options = {
             "temperature": self.config.temperature,
-            "num_predict": 256,
+            "num_predict": self.config.num_predict,
             "num_ctx": self.config.num_ctx,
             "use_mmap": self.config.use_mmap,
         }
