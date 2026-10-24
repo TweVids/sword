@@ -76,7 +76,20 @@ def resolve_prompts(
 
 def train(
     test: bool = True,
+    long_train: bool = False,
+    dataset: Union[str, List[Any], Dict[str, Any]] = "math-ai/TemplateGSM",
     model: str = "Qwen/Qwen3.5-0.8B",
+    B_model_port: int = 11343,
+    custom_checkpoint_save: bool = True,
+    is_save_and_upload_checkpoint: bool = True,
+    num_latest_checkpoint_save: int = 2,
+    upload_id: Optional[str] = None,
+    HF_TOKEN: Optional[str] = None,
+    resume_from_checkpoint: Optional[str] = None,
+    lora_cfg: Optional[Dict[str, Any]] = None,
+    Argument: Optional[Dict[str, Any]] = None,
+    show_detail_logs: bool = True,
+    score_logs: bool = True,
     concurrent: int = 8,
     prompt: Optional[Union[int, str, List[str]]] = None,
     max_new_tokens: int = 64,
@@ -92,15 +105,48 @@ def train(
     **kwargs,
 ) -> Dict[str, Any]:
     """
-    Unified entry point for Sword training and concurrent inference testing.
-    Usage:
-        import sword
-        # Using Sword Native Speed Engine:
-        results = sword.train(test=True, model="Qwen/Qwen3.5-0.8B", concurrent=8, prompt=8)
+    Unified entry point for Sword training and concurrent serving benchmark.
+    Usage for quick inference testing:
+        sword.train(test=True, model="Qwen/Qwen3.5-0.8B", concurrent=8)
 
-        # Using patched vLLM engine:
-        results = sword.train(test=True, model="Qwen/Qwen3.5-0.8B", concurrent=8, prompt=8, use_vllm=True)
+    Usage for long-running infinite GRPO training:
+        sword.train(
+            long_train=True,
+            test=False,
+            dataset="huggingface_dataset_or_drive_link",
+            model="model_id",
+            B_model_port=11343,
+            custom_checkpoint_save=True,
+            is_save_and_upload_checkpoint=True,
+            num_latest_checkpoint_save=2,
+            upload_id="user/hfmodel",
+            HF_TOKEN="...",
+            resume_from_checkpoint="",
+            lora_cfg=CONF,
+            Argument=ARG,
+            show_detail_logs=True,
+            score_logs=True,
+        )
     """
+    if long_train or not test:
+        from sword.long_trainer import run_long_train
+        return run_long_train(
+            dataset=dataset,
+            model=model,
+            B_model_port=B_model_port,
+            custom_checkpoint_save=custom_checkpoint_save,
+            is_save_and_upload_checkpoint=is_save_and_upload_checkpoint,
+            num_latest_checkpoint_save=num_latest_checkpoint_save,
+            upload_id=upload_id,
+            HF_TOKEN=HF_TOKEN,
+            resume_from_checkpoint=resume_from_checkpoint,
+            lora_cfg=lora_cfg,
+            Argument=Argument,
+            show_detail_logs=show_detail_logs,
+            score_logs=score_logs,
+            **kwargs,
+        )
+
     prompts = resolve_prompts(prompt, concurrent)
 
     if test:

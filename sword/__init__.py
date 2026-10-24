@@ -393,6 +393,19 @@ from .grpo_bridge import (
     WeightSynchronizer,
     VRAMLifecycleManager,
 )
+from .b_model import ModelBJudge, ModelBJudgeConfig, ModelBEvaluationResult
+from .harness import (
+    get_harness,
+    BaseHarness,
+    HarnessResult,
+    OpenCodeHarness,
+    CodexCliHarness,
+    GeminiCliHarness,
+    PiHarness,
+)
+from .reward import MultiMetricRewardScorer, RewardBreakdown, MathVerifier
+from .checkpoint import CheckpointManager
+from .long_trainer import run_long_train
 
 __version__ = "0.9.2"
 print(f"[Sword] Version {__version__} loaded successfully.")
@@ -421,12 +434,27 @@ __all__ = [
     "vllm_patcher",
     "train",
     "run_standalone_math_grpo",
+    "run_long_train",
     "get_grpo_bridge",
     "GRPOBridge",
     "GRPOBridgeConfig",
     "DualCorrectionGRPOLoss",
     "WeightSynchronizer",
     "VRAMLifecycleManager",
+    "ModelBJudge",
+    "ModelBJudgeConfig",
+    "ModelBEvaluationResult",
+    "get_harness",
+    "BaseHarness",
+    "HarnessResult",
+    "OpenCodeHarness",
+    "CodexCliHarness",
+    "GeminiCliHarness",
+    "PiHarness",
+    "MultiMetricRewardScorer",
+    "RewardBreakdown",
+    "MathVerifier",
+    "CheckpointManager",
     "PureFlashAttention",
     "apply_rotary_pos_emb",
     "StaticKVCache",
