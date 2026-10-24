@@ -264,9 +264,9 @@ def make_patched_attention_forward(original_forward):
 
         if num_groups > 1 and q_len == 1 and attention_mask is None and attn_mode != "vanilla":
             # Zero-Copy GQA via View Transformation (9.76x faster, 0 bytes allocated)
-            q_b = query_states.view(bsz * num_kv_heads, 1, num_groups, head_dim)
-            k_b = key_states.view(bsz * num_kv_heads, 1, -1, head_dim)
-            v_b = value_states.view(bsz * num_kv_heads, 1, -1, head_dim)
+            q_b = query_states.reshape(bsz * num_kv_heads, 1, num_groups, head_dim)
+            k_b = key_states.reshape(bsz * num_kv_heads, 1, -1, head_dim)
+            v_b = value_states.reshape(bsz * num_kv_heads, 1, -1, head_dim)
             attn_out_b = _fast_sdpa_attention(
                 q_b,
                 k_b,
@@ -276,7 +276,7 @@ def make_patched_attention_forward(original_forward):
                 is_causal=False,
                 scale=getattr(self, "scaling", None),
             )
-            attn_output = attn_out_b.view(bsz, num_heads, 1, head_dim)
+            attn_output = attn_out_b.reshape(bsz, num_heads, 1, head_dim)
         else:
             if num_groups > 1:
                 key_states = repeat_kv(key_states, num_groups)

@@ -304,7 +304,7 @@ from .moe_quant import (
     apply_moe_qlora,
     get_moe_qlora_parameters,
 )
-from .server import FastServer, FastMoEServer, FastQwenServer, FastQwen3MoeServer
+from .server import FastServer, FastMoEServer, FastQwenServer, FastQwen3MoeServer, FastQwenGraphEngine
 from .finetune import benchmark_finetune_8k, apply_lora_to_model
 from .trainer import (
     setup_blackwell_environment,
@@ -380,6 +380,7 @@ __all__ = [
     "FastMoEServer",
     "FastQwenServer",
     "FastQwen3MoeServer",
+    "FastQwenGraphEngine",
     "FastLingServer",
     "FastLfmServer",
     "FastLfmGraphEngine",
