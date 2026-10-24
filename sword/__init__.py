@@ -332,9 +332,15 @@ from .gym import (
     load_swe_dataset,
     extract_unified_diff,
 )
+from .vllm_patch import bootstrap_environment, vllm_patcher
+from .train_entry import train
 
 __version__ = "0.9.2"
 print(f"[Sword] Version {__version__} loaded successfully.")
+
+# Support hyphenated alias for vllm-patcher and function access
+setattr(sys.modules[__name__], "vllm-patcher", vllm_patcher)
+
 
 
 def run_standalone_math_grpo(*args, **kwargs):
@@ -344,6 +350,9 @@ def run_standalone_math_grpo(*args, **kwargs):
 
 
 __all__ = [
+    "bootstrap_environment",
+    "vllm_patcher",
+    "train",
     "run_standalone_math_grpo",
     "PureFlashAttention",
     "apply_rotary_pos_emb",
