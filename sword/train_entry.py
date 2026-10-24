@@ -124,13 +124,31 @@ def train(
             try:
                 from vllm import LLM, SamplingParams
                 print(f"[Sword] Running with vLLM engine (vllm==0.23.0 patched)...")
-                llm = LLM(
-                    model=model,
-                    trust_remote_code=True,
-                    max_model_len=kwargs.get("max_model_len", 2048),
-                    gpu_memory_utilization=kwargs.get("gpu_memory_utilization", 0.9),
-                    dtype=kwargs.get("dtype", "auto"),
-                )
+                
+                # Configure MoE backend if specified
+                moe_backend = kwargs.get("moe_backend", None)
+                if moe_backend:
+                    os.environ["VLLM_MOE_BACKEND"] = str(moe_backend)
+                    os.environ["VLLM_MOE_RUNNER"] = str(moe_backend)
+                    print(f"[Sword] Configured vLLM MoE backend: {moe_backend}")
+
+                llm_kwargs = {
+                    "model": model,
+                    "trust_remote_code": True,
+                    "max_model_len": kwargs.get("max_model_len", 2048),
+                    "gpu_memory_utilization": kwargs.get("gpu_memory_utilization", 0.9),
+                    "dtype": kwargs.get("dtype", "auto"),
+                }
+                if moe_backend:
+                    llm_kwargs["moe_backend"] = moe_backend
+
+                try:
+                    llm = LLM(**llm_kwargs)
+                except TypeError:
+                    # In case installed vLLM version passes moe_backend only via env/engine args
+                    llm_kwargs.pop("moe_backend", None)
+                    llm = LLM(**llm_kwargs)
+
                 sampling_params = SamplingParams(
                     temperature=temperature,
                     top_k=top_k if top_k > 0 else -1,
