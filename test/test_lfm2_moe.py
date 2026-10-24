@@ -187,6 +187,14 @@ class TestLfm2MoeArchitecture(unittest.TestCase):
             out_block_mask, _ = attn(x, position_embeddings=pos_emb, attention_mask=mock_mask)
         self.assertEqual(out_block_mask.shape, out_hf.shape)
 
+        # Resilience against int64/int32 attention masks in decode (L=1) and prefill (L>1)
+        int_mask_4d = torch.ones(2, 1, 1, 8, dtype=torch.int64)
+        x_single = torch.randn(2, 1, cfg.hidden_size)
+        pos_single = rotary_emb(x_single, pos_ids[:, -1:])
+        with torch.no_grad():
+            out_int_mask, _ = attn(x_single, position_embeddings=pos_single, attention_mask=int_mask_4d)
+        self.assertEqual(out_int_mask.shape, (2, 1, cfg.hidden_size))
+
     # =========================================================
     # 3. Pure-PyTorch Zero-Sync MoE Dispatch
     # =========================================================

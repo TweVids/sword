@@ -461,6 +461,10 @@ def _fast_sdpa_attention(
         else:
             attention_mask = None
 
+    if attention_mask is not None and isinstance(attention_mask, torch.Tensor):
+        if attention_mask.dtype not in (torch.bool, torch.float16, torch.bfloat16, torch.float32, torch.float64):
+            attention_mask = attention_mask.to(torch.bool)
+
     if query.is_cuda:
         try:
             with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]):
@@ -577,7 +581,7 @@ def make_fast_lfm_attention_forward(original_forward):
                 if attention_mask.ndim == 4:
                     attn_mask = attention_mask[:, :, -1:, :kv_len]
                 elif attention_mask.ndim == 2:
-                    attn_mask = attention_mask[:, None, None, :kv_len].to(torch.bool)
+                    attn_mask = attention_mask[:, None, None, :kv_len]
                 else:
                     attn_mask = attention_mask
             elif hasattr(attention_mask, "to_dense"):
@@ -587,7 +591,7 @@ def make_fast_lfm_attention_forward(original_forward):
                         if dense.ndim == 4:
                             attn_mask = dense[:, :, -1:, :kv_len]
                         elif dense.ndim == 2:
-                            attn_mask = dense[:, None, None, :kv_len].to(torch.bool)
+                            attn_mask = dense[:, None, None, :kv_len]
                         else:
                             attn_mask = dense
                     else:
@@ -596,6 +600,9 @@ def make_fast_lfm_attention_forward(original_forward):
                     attn_mask = None
             else:
                 attn_mask = None
+
+            if isinstance(attn_mask, torch.Tensor) and attn_mask.dtype not in (torch.bool, torch.float16, torch.bfloat16, torch.float32, torch.float64):
+                attn_mask = attn_mask.to(torch.bool)
 
             if num_groups > 1 and attn_mask is not None and getattr(attn_mask, "ndim", 0) == 4 and attn_mask.shape[1] == 1:
                 # Zero-copy GQA view reshape with broadcast mask: [bsz * num_kv_heads, 1, 1, kv_len]
@@ -665,6 +672,9 @@ def make_fast_lfm_attention_forward(original_forward):
                     attn_mask = None
             else:
                 attn_mask = None
+
+            if isinstance(attn_mask, torch.Tensor) and attn_mask.dtype not in (torch.bool, torch.float16, torch.bfloat16, torch.float32, torch.float64):
+                attn_mask = attn_mask.to(torch.bool)
 
             attn_output = _fast_sdpa_attention(
                 query_states, key_states, value_states,
