@@ -160,6 +160,7 @@ def train(
                     "model": model,
                     "trust_remote_code": True,
                     "max_model_len": kwargs.get("max_model_len", 2048),
+                    "max_num_seqs": kwargs.get("max_num_seqs", max(concurrent, 16)),
                     "gpu_memory_utilization": kwargs.get("gpu_memory_utilization", 0.8),
                     "dtype": kwargs.get("dtype", "auto"),
                     "hf_overrides": hf_overrides,

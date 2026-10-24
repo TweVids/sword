@@ -8,11 +8,11 @@ from pathlib import Path
 from typing import Dict, Any
 
 
-def bootstrap_environment() -> Dict[str, Any]:
+def bootstrap_environment(version: str = "vllm==0.23.0") -> Dict[str, Any]:
     """
     Bootstraps the local python environment:
     - Runs uv sync if pyproject.toml or uv.lock exists
-    - Installs vllm==0.23.0 via uv pip
+    - Installs vllm via uv pip (defaults to vllm==0.23.0, or custom/latest)
     - Patches vllm rotary embedding common.py with pure-PyTorch fallback
     """
     results = []
@@ -31,9 +31,10 @@ def bootstrap_environment() -> Dict[str, Any]:
             "command": "uv sync --exact --active",
             "skipped": "No pyproject.toml/uv.lock in current directory",
         })
-    run = subprocess.run(["uv", "pip", "install", "vllm==0.23.0"], text=True, capture_output=True)
+    pkg = "vllm" if version in ("latest", "vllm") else version
+    run = subprocess.run(["uv", "pip", "install", pkg], text=True, capture_output=True)
     results.append({
-        "command": "uv pip install vllm==0.23.0",
+        "command": f"uv pip install {pkg}",
         "returncode": run.returncode,
         "tail": (run.stdout + run.stderr)[-4000:],
     })
@@ -139,16 +140,17 @@ def bootstrap_environment() -> Dict[str, Any]:
     return {"ok": True, "restart_kernel_required": True, "steps": results}
 
 
-def vllm_patcher(verbose: bool = True) -> Dict[str, Any]:
+def vllm_patcher(verbose: bool = True, version: str = "vllm==0.23.0") -> Dict[str, Any]:
     """
     Executes bootstrap_environment() and prints detailed step execution logs.
     Can be imported and called via:
         from sword import vllm_patcher
-        vllm_patcher()
+        vllm_patcher()             # Installs and patches vllm==0.23.0
+        vllm_patcher(version="latest")  # Upgrades to latest vLLM release and patches it
     """
     if verbose:
-        print("[Sword] Starting vLLM patcher and environment bootstrap...")
-    outcome = bootstrap_environment()
+        print(f"[Sword] Starting vLLM patcher and environment bootstrap ({version})...")
+    outcome = bootstrap_environment(version=version)
 
     if verbose:
         print(f"[Sword] Bootstrap overall status: ok={outcome.get('ok')}")
