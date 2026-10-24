@@ -130,8 +130,10 @@ def train(
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
-                # In notebook environments, ensure spawn method and optional V0 fallback
+                # In notebook environments, ensure spawn method and disable broken JIT flashinfer sampler
                 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+                os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
+                os.environ.setdefault("VLLM_USE_FLASHINFER", "0")
                 if kwargs.get("use_v1") is False:
                     os.environ["VLLM_USE_V1"] = "0"
                 
