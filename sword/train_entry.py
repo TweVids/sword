@@ -149,6 +149,10 @@ def train(
 
                 hf_overrides = kwargs.get("hf_overrides", {}) or {}
                 hf_overrides.setdefault("allow_global_per_layer_attribute_access", True)
+                if isinstance(hf_overrides.get("text_config"), dict):
+                    hf_overrides["text_config"].setdefault("allow_global_per_layer_attribute_access", True)
+                else:
+                    hf_overrides["text_config"] = {"allow_global_per_layer_attribute_access": True}
 
                 llm_kwargs = {
                     "model": model,

@@ -72,6 +72,54 @@ def bootstrap_environment() -> Dict[str, Any]:
         replacement = "\n".join(indent + line if line else line for line in body)
         common.write_text(source[:match.start()] + replacement + source[match.end():])
     results.append({"patch_file": str(common), "patched": marker in common.read_text()})
+
+    # Patch vLLM model_arch_config_convertor for heterogeneous head_dim access
+    convertor_file = Path(spec.origin).parent / "transformers_utils/model_arch_config_convertor.py"
+    if convertor_file.exists():
+        c_source = convertor_file.read_text()
+        c_marker = "# marimo-safe-heterogeneous-head-dim"
+        if c_marker not in c_source:
+            target_str = 'head_dim = getattr(self.hf_text_config, "head_dim", 0)'
+            if target_str in c_source:
+                replacement_str = (
+                    c_marker + "\n"
+                    "        try:\n"
+                    "            head_dim = getattr(self.hf_text_config, 'head_dim', 0)\n"
+                    "        except Exception:\n"
+                    "            head_dim = getattr(getattr(self.hf_text_config, 'per_layer_config', [{}])[0], 'head_dim', 0) if getattr(self.hf_text_config, 'per_layer_config', None) else 0"
+                )
+                c_source = c_source.replace(target_str, replacement_str, 1)
+                convertor_file.write_text(c_source)
+                results.append({"patch_file": str(convertor_file), "patched": True})
+
+    # Patch Transformers heterogeneity configuration_utils to suppress AmbiguousGlobalPerLayerAttributeError
+    t_spec = importlib.util.find_spec("transformers")
+    if t_spec and t_spec.origin:
+        het_file = Path(t_spec.origin).parent / "integrations/heterogeneity/configuration_utils.py"
+        if het_file.exists():
+            h_source = het_file.read_text()
+            h_marker = "# marimo-suppress-heterogeneity-error"
+            if h_marker not in h_source:
+                # Bypass AmbiguousGlobalPerLayerAttributeError by forcing allow_global_per_layer_attribute_access to True
+                patched_h = re.sub(
+                    r'if\s+not\s+getattr\(self,\s*["\']allow_global_per_layer_attribute_access["\'],\s*False\):',
+                    f"{h_marker}\n        if False:",
+                    h_source,
+                )
+                if patched_h != h_source:
+                    het_file.write_text(patched_h)
+                    results.append({"patch_file": str(het_file), "patched": True})
+                else:
+                    patched_h2 = re.sub(
+                        r"raise\s+AmbiguousGlobalPerLayerAttributeError\(.*?\)",
+                        f"{h_marker}\n        return super().__getattribute__(key)",
+                        h_source,
+                        flags=re.DOTALL,
+                    )
+                    if patched_h2 != h_source:
+                        het_file.write_text(patched_h2)
+                        results.append({"patch_file": str(het_file), "patched": True})
+
     return {"ok": True, "restart_kernel_required": True, "steps": results}
 
 
