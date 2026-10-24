@@ -132,12 +132,23 @@ def train(
                     os.environ["VLLM_MOE_RUNNER"] = str(moe_backend)
                     print(f"[Sword] Configured vLLM MoE backend: {moe_backend}")
 
+                # Auto-heal heterogeneous architectures (Gemma 4, etc.)
+                try:
+                    from transformers.configuration_utils import PretrainedConfig
+                    PretrainedConfig.allow_global_per_layer_attribute_access = True
+                except Exception:
+                    pass
+
+                hf_overrides = kwargs.get("hf_overrides", {}) or {}
+                hf_overrides.setdefault("allow_global_per_layer_attribute_access", True)
+
                 llm_kwargs = {
                     "model": model,
                     "trust_remote_code": True,
                     "max_model_len": kwargs.get("max_model_len", 2048),
                     "gpu_memory_utilization": kwargs.get("gpu_memory_utilization", 0.9),
                     "dtype": kwargs.get("dtype", "auto"),
+                    "hf_overrides": hf_overrides,
                 }
                 if moe_backend:
                     llm_kwargs["moe_backend"] = moe_backend
@@ -145,9 +156,13 @@ def train(
                 try:
                     llm = LLM(**llm_kwargs)
                 except TypeError:
-                    # In case installed vLLM version passes moe_backend only via env/engine args
+                    # In case installed vLLM version does not accept some kwargs in constructor
                     llm_kwargs.pop("moe_backend", None)
-                    llm = LLM(**llm_kwargs)
+                    try:
+                        llm = LLM(**llm_kwargs)
+                    except TypeError:
+                        llm_kwargs.pop("hf_overrides", None)
+                        llm = LLM(**llm_kwargs)
 
                 sampling_params = SamplingParams(
                     temperature=temperature,
