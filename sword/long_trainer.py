@@ -363,7 +363,11 @@ def run_long_train(
                     # Rollout Phase with authentic harness prompt injection and token-budget guard
                     prompt_token_budget = max(128, max_seq_len - max_new_tokens)
                     rollout_prompt = (
-                        harness.format_prompt(current_row.problem, max_tokens=prompt_token_budget)
+                        harness.format_prompt(
+                            current_row.problem,
+                            max_tokens=prompt_token_budget,
+                            tokenizer=getattr(bridge, "tokenizer", None),
+                        )
                         if harness is not None
                         else current_row.problem
                     )

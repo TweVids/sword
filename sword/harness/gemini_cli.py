@@ -107,7 +107,9 @@ class GeminiCliHarness(BaseHarness):
             path = str(args.get("file_path") or args.get("path") or args.get("file") or "").strip()
             if not path:
                 return False, "Missing required 'file_path' parameter."
-            return sandbox.read_file(path)
+            start_line = args.get("start_line")
+            end_line = args.get("end_line")
+            return sandbox.read_file(path, start_line=start_line, end_line=end_line)
 
         elif fname in ("write_file", "write"):
             path = str(args.get("file_path") or args.get("path") or args.get("file") or "").strip()
@@ -120,19 +122,32 @@ class GeminiCliHarness(BaseHarness):
             path = str(args.get("file_path") or args.get("path") or "").strip()
             old_str = str(args.get("old_string") or args.get("old_str") or "")
             new_str = str(args.get("new_string") or args.get("new_str") or "")
+            allow_multiple = bool(args.get("allow_multiple", False))
             if not path:
                 return False, "Missing required 'file_path' parameter."
-            return sandbox.edit_file(path, old_str, new_str)
+            return sandbox.edit_file(path, old_str, new_str, replace_all=allow_multiple)
 
         elif fname in ("list_directory", "ls", "list_dir"):
             dpath = str(args.get("dir_path") or args.get("path") or ".").strip()
-            return sandbox.list_dir(dpath)
+            ok, entries = sandbox.list_dir(dpath)
+            return ok, "\n".join(entries)
 
-        elif fname in ("grep_search", "glob"):
+        elif fname == "glob":
             pattern = str(args.get("pattern") or "").strip()
             if not pattern:
                 return False, "Missing required 'pattern' parameter."
-            return sandbox.list_dir(".")
+            dpath = str(args.get("dir_path") or "").strip()
+            ok, files = sandbox.glob_files(pattern, dir_path=dpath)
+            return ok, "\n".join(files) if files else "No matching files"
+
+        elif fname == "grep_search":
+            pattern = str(args.get("pattern") or "").strip()
+            if not pattern:
+                return False, "Missing required 'pattern' parameter."
+            dpath = str(args.get("dir_path") or "").strip()
+            inc = args.get("include_pattern")
+            max_m = int(args.get("total_max_matches") or 100)
+            return sandbox.grep_search(pattern, dir_path=dpath, include_pattern=inc, max_matches=max_m)
 
         return False, f"Unknown Gemini CLI tool: {fname}"
 

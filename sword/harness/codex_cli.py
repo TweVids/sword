@@ -65,7 +65,7 @@ class CodexCliHarness(BaseHarness):
         return cmds
 
     def apply_codex_patch(self, patch_body: str, sandbox: WorkspaceSandbox) -> Tuple[bool, str]:
-        """Applies a Codex apply_patch hunk block inside the sandbox."""
+        """Applies a Codex apply_patch block (Add File, Delete File, Update File, Move to, and @@ hunks) atomically."""
         lines = patch_body.splitlines()
         i = 0
         applied_files: List[str] = []
@@ -83,15 +83,43 @@ class CodexCliHarness(BaseHarness):
                 if not ok:
                     return False, msg
                 applied_files.append(f"added {fname}")
+
+            elif line.startswith("*** Delete File: "):
+                fname = line[len("*** Delete File: "):].strip()
+                i += 1
+                ok, msg = sandbox.delete_file(fname)
+                if not ok:
+                    return False, msg
+                applied_files.append(f"deleted {fname}")
+
             elif line.startswith("*** Update File: "):
                 fname = line[len("*** Update File: "):].strip()
                 i += 1
+                move_target: Optional[str] = None
+                if i < len(lines) and lines[i].startswith("*** Move to: "):
+                    move_target = lines[i][len("*** Move to: "):].strip()
+                    i += 1
+
+                ok_read, current_content = sandbox.read_file(fname)
+                if not ok_read:
+                    return False, current_content
+
+                hunks: List[Tuple[str, List[str], List[str]]] = []
+                cur_ctx = ""
                 old_chunk: List[str] = []
                 new_chunk: List[str] = []
-                while i < len(lines) and not lines[i].startswith("*** "):
+
+                while i < len(lines) and not (lines[i].startswith("*** ") and not lines[i].startswith("*** End of File")):
                     cur = lines[i]
+                    if cur.startswith("*** End of File"):
+                        i += 1
+                        continue
                     if cur.startswith("@@"):
-                        pass
+                        if old_chunk or new_chunk:
+                            hunks.append((cur_ctx, old_chunk, new_chunk))
+                            old_chunk = []
+                            new_chunk = []
+                        cur_ctx = cur[2:].strip()
                     elif cur.startswith("-"):
                         old_chunk.append(cur[1:])
                     elif cur.startswith("+"):
@@ -100,10 +128,37 @@ class CodexCliHarness(BaseHarness):
                         old_chunk.append(cur[1:])
                         new_chunk.append(cur[1:])
                     i += 1
-                ok, msg = sandbox.edit_file(fname, "\n".join(old_chunk), "\n".join(new_chunk))
-                if not ok:
-                    return False, msg
-                applied_files.append(f"updated {fname}")
+
+                if old_chunk or new_chunk:
+                    hunks.append((cur_ctx, old_chunk, new_chunk))
+
+                updated_content = current_content
+                for ctx_hdr, o_lines, n_lines in hunks:
+                    old_str = "\n".join(o_lines)
+                    new_str = "\n".join(n_lines)
+                    if old_str:
+                        if old_str not in updated_content:
+                            return False, f"Hunk target not found in {fname}"
+                        updated_content = updated_content.replace(old_str, new_str, 1)
+                    elif ctx_hdr and ctx_hdr in updated_content:
+                        updated_content = updated_content.replace(ctx_hdr, f"{ctx_hdr}\n{new_str}", 1)
+                    else:
+                        sep = "\n" if updated_content and not updated_content.endswith("\n") else ""
+                        updated_content = f"{updated_content}{sep}{new_str}"
+
+                if move_target:
+                    ok_mv, msg_mv = sandbox.move_file(fname, move_target)
+                    if not ok_mv:
+                        return False, msg_mv
+                    ok_w, msg_w = sandbox.write_file(move_target, updated_content)
+                    if not ok_w:
+                        return False, msg_w
+                    applied_files.append(f"moved {fname} -> {move_target}")
+                else:
+                    ok_w, msg_w = sandbox.write_file(fname, updated_content)
+                    if not ok_w:
+                        return False, msg_w
+                    applied_files.append(f"updated {fname}")
             else:
                 i += 1
         if not applied_files:

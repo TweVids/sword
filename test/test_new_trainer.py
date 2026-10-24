@@ -507,7 +507,7 @@ class TestNewTrainerArchitecture(unittest.TestCase):
             called_keys = [c.args[0] for c in mock_ensure.call_args_list]
             self.assertEqual(called_keys, ["opencode", "codex", "pi", "gemini_cli"])
 
-        # 2. Verify authentic upstream text extracted from third_party/ files
+        # 2. Verify authentic upstream text extracted from third_party/ files and no empty bullet lines
         self.assertIn("You are an AI agent running in OpenCode", opencode_p)
         self.assertIn("Writes a file to the local filesystem", opencode_p)
         self.assertIn("You are Codex, based on GPT-5", codex_p)
@@ -515,10 +515,25 @@ class TestNewTrainerArchitecture(unittest.TestCase):
         self.assertIn("You are an expert coding assistant operating inside pi, a coding agent harness.", pi_p)
         self.assertIn("Make precise file edits with exact text replacement", pi_p)
         self.assertIn("# Core Mandates", gemini_p)
+        self.assertIn("Handle Ambiguity/Expansion", gemini_p)
+        self.assertIn("Explain Before Acting", gemini_p)
+        self.assertIn("Non-Interactive Environment", gemini_p)
         self.assertIn("# Primary Workflows", gemini_p)
+        self.assertIn("1. **Research:** Systematically map the codebase", gemini_p)
         self.assertIn("run_shell_command", gemini_p)
+        for line in gemini_p.splitlines():
+            self.assertNotEqual(line.strip(), "-")
 
-        # 3. Verify token/character budget guard in BaseHarness.format_prompt
+        # 3. Verify pinned commits and prompt caching
+        from sword.harness.prompts import HARNESS_GIT_COMMITS, get_harness_system_prompt, clear_prompt_cache
+        self.assertEqual(set(HARNESS_GIT_COMMITS.keys()), {"opencode", "pi", "codex", "gemini_cli"})
+        clear_prompt_cache()
+        p_cached_1 = get_harness_system_prompt("opencode", use_cache=True)
+        with patch("sword.harness.prompts.load_opencode_prompt", side_effect=RuntimeError("Should hit cache")):
+            p_cached_2 = get_harness_system_prompt("opencode", use_cache=True)
+        self.assertEqual(p_cached_1, p_cached_2)
+
+        # 4. Verify tokenizer-aware and character-budget guard in BaseHarness.format_prompt
         gemini_h = GeminiCliHarness()
         task_text = "Write a function to compute Fibonacci numbers."
         trimmed = gemini_h.format_prompt(task_text, max_prompt_chars=500)
@@ -526,28 +541,57 @@ class TestNewTrainerArchitecture(unittest.TestCase):
         self.assertTrue(trimmed.endswith(f"Task:\n{task_text}"))
         self.assertIn("...[trimmed]...", trimmed)
 
-        # 4. Verify Codex apply_patch freeform grammar execution in sandbox
+        class WordTokenizer:
+            def encode(self, text, add_special_tokens=False):
+                return text.split()
+
+        tok_trimmed = gemini_h.format_prompt(task_text, max_tokens=80, tokenizer=WordTokenizer())
+        self.assertTrue(tok_trimmed.endswith(f"Task:\n{task_text}"))
+        self.assertIn("# Gemini CLI Tool Declarations:", tok_trimmed)
+        self.assertIn("...[trimmed]...", tok_trimmed)
+
+        # 5. Verify Codex apply_patch freeform grammar: Add File, Update File (multi-hunk + Move to), Delete File
         codex_h = CodexCliHarness()
         patch_turn = (
             "*** Begin Patch\n"
             "*** Add File: calc.py\n"
             "+x = 21\n"
-            "+print(x * 2)\n"
+            "+y = 2\n"
+            "+print(x * y)\n"
+            "*** Add File: temp.txt\n"
+            "+temporary\n"
+            "*** End Patch\n"
+            "*** Begin Patch\n"
+            "*** Update File: calc.py\n"
+            "*** Move to: moved_calc.py\n"
+            "@@\n"
+            "-x = 21\n"
+            "+x = 50\n"
+            "@@\n"
+            "-y = 2\n"
+            "+y = 3\n"
+            "*** Delete File: temp.txt\n"
             "*** End Patch\n"
             "```python\n"
-            "with open('calc.py') as f:\n"
-            "    exec(f.read())\n"
+            "import os\n"
+            "assert not os.path.exists('temp.txt')\n"
+            "assert not os.path.exists('calc.py')\n"
+            "with open('moved_calc.py') as f:\n"
+            "    code = f.read()\n"
+            "assert 'x = 50' in code and 'y = 3' in code\n"
             "```"
         )
-        res_codex = codex_h.run("Create calc.py", lambda p: patch_turn, max_turns=1)
-        self.assertEqual(res_codex.tools_called, 2)
-        self.assertEqual(res_codex.tools_succeeded, 2)
+        res_codex = codex_h.run("Patch and verify", lambda p: patch_turn, max_turns=1)
+        self.assertEqual(res_codex.tools_called, 3)
+        self.assertEqual(res_codex.tools_succeeded, 3)
 
-        # 5. Verify Pi edits[] array schema and Gemini replace / write_file schema
+        # 6. Verify Pi atomic edits[] (both non-overlapping succeed, and failed edit leaves file untouched)
         pi_h = PiHarness()
         pi_turns = [
-            '```json\n{"action": "write", "parameters": {"path": "note.txt", "content": "alpha beta"}}\n```',
-            '```json\n{"action": "edit", "parameters": {"path": "note.txt", "edits": [{"oldText": "alpha", "newText": "omega"}]}}\n```',
+            '```json\n{"action": "write", "parameters": {"path": "note.txt", "content": "alpha beta gamma"}}\n```',
+            '```json\n{"action": "edit", "parameters": {"path": "note.txt", "edits": [{"oldText": "alpha", "newText": "FIRST"}, {"oldText": "gamma", "newText": "LAST"}]}}\n```',
+            '```json\n{"action": "edit", "parameters": {"path": "note.txt", "edits": [{"oldText": "FIRST", "newText": "BROKEN"}, {"oldText": "NONEXISTENT", "newText": "FAIL"}]}}\n```',
+            '```python\nwith open("note.txt") as f:\n    c = f.read()\nassert c == "FIRST beta LAST", f"Unexpected content: {c}"\n```',
         ]
         t_idx = [0]
 
@@ -556,9 +600,29 @@ class TestNewTrainerArchitecture(unittest.TestCase):
             t_idx[0] += 1
             return r
 
-        res_pi = pi_h.run("Edit note.txt", pi_gen, max_turns=2)
-        self.assertEqual(res_pi.tools_called, 2)
-        self.assertEqual(res_pi.tools_succeeded, 2)
+        res_pi = pi_h.run("Edit note.txt atomically", pi_gen, max_turns=4)
+        self.assertEqual(res_pi.tools_called, 4)
+        self.assertEqual(res_pi.tools_succeeded, 3)
+        self.assertEqual(res_pi.tools_failed, 1)
+
+        # 7. Verify real grep_search and glob in GeminiCliHarness
+        gem_turns = [
+            'call:write_file{"file_path": "src/util.py", "content": "def magic_helper():\\n    return 99\\n"}',
+            'call:glob{"pattern": "**/*.py"}',
+            'call:grep_search{"pattern": "magic_helper"}',
+        ]
+        g_idx = [0]
+
+        def gem_gen(p: str) -> str:
+            r = gem_turns[min(g_idx[0], len(gem_turns) - 1)]
+            g_idx[0] += 1
+            return r
+
+        res_gem = gemini_h.run("Search workspace", gem_gen, max_turns=3)
+        self.assertEqual(res_gem.tools_called, 3)
+        self.assertEqual(res_gem.tools_succeeded, 3)
+        self.assertIn("src/util.py", res_gem.tool_history[1]["output"])
+        self.assertIn("src/util.py:1:def magic_helper():", res_gem.tool_history[2]["output"])
 
 
 if __name__ == "__main__":

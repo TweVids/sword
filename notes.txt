@@ -101,3 +101,10 @@ step 11: implement real workspace sandbox and thorough systemic fixes:
   * Updated sword/long_trainer.py to return status="partial" (with visited_rows and total_rows) when steps < dataset row count.
   * Added test_upstream_prompts_and_schemas_and_budget_guard in test/test_new_trainer.py.
   * Verified full suite: 29 unit tests passing cleanly in 79.3s.
+- step 14 completed: addressed second-round self-review items:
+  * Replaced placeholder grep_search and glob in GeminiCliHarness with real WorkspaceSandbox.grep_search (regex + include glob + file:line:match formatting) and WorkspaceSandbox.glob_files (pathlib.Path.rglob).
+  * Completed CodexCliHarness.apply_codex_patch to support *** Delete File:, *** Move to:, multiple @@ hunks per file, and add-only hunks with atomic rollback on hunk mismatch.
+  * Made PiHarness edits[] array atomic and validated against original file content (rejecting overlapping or ambiguous oldText matches without modifying the file).
+  * Resolved dynamic TypeScript template expressions in load_gemini_prompt (mandateConfirm, mandateExplainBeforeActing, mandateContinueWork, workflowStepResearch, workflowStepStrategy) so no empty bullet lines remain; added HARNESS_GIT_COMMITS commit pinning, _PROMPT_CACHE caching, and RuntimeWarning on fallback.
+  * Made BaseHarness.format_prompt tokenizer-aware and section-boundary-aware so tool declarations and the trailing Task block are preserved intact.
+  * Audited callers of status == "partial" across sword/ and test/.

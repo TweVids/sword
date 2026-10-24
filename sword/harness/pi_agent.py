@@ -97,14 +97,34 @@ class PiHarness(BaseHarness):
             path = params.get("path") or ""
             edits = params.get("edits")
             if isinstance(edits, list) and edits:
+                ok_r, orig_content = sandbox.read_file(path)
+                if not ok_r:
+                    return False, orig_content
+                spans: List[Tuple[int, int, str]] = []
                 for entry in edits:
-                    if isinstance(entry, dict):
-                        old_t = str(entry.get("oldText") or entry.get("old_str") or "")
-                        new_t = str(entry.get("newText") or entry.get("new_str") or "")
-                        ok, msg = sandbox.edit_file(path, old_t, new_t)
-                        if not ok:
-                            return False, msg
-                return True, f"Successfully applied {len(edits)} edit(s) to {path}"
+                    if not isinstance(entry, dict):
+                        return False, "Invalid edit entry: expected object"
+                    old_t = str(entry.get("oldText") if "oldText" in entry else entry.get("old_str", ""))
+                    new_t = str(entry.get("newText") if "newText" in entry else entry.get("new_str", ""))
+                    if not old_t:
+                        return False, f"Empty oldText in edit for {path}"
+                    first_idx = orig_content.find(old_t)
+                    if first_idx == -1:
+                        return False, f"Target string not found in {path}"
+                    if orig_content.find(old_t, first_idx + 1) != -1:
+                        return False, f"Ambiguous oldText in {path}: matches multiple locations"
+                    spans.append((first_idx, first_idx + len(old_t), new_t))
+                spans.sort(key=lambda s: s[0])
+                for idx_s in range(len(spans) - 1):
+                    if spans[idx_s][1] > spans[idx_s + 1][0]:
+                        return False, f"Overlapping edits rejected for {path}"
+                updated = orig_content
+                for start_i, end_i, replacement in reversed(spans):
+                    updated = updated[:start_i] + replacement + updated[end_i:]
+                ok_w, msg_w = sandbox.write_file(path, updated)
+                if not ok_w:
+                    return False, msg_w
+                return True, f"Successfully applied {len(spans)} atomic edit(s) to {path}"
             old_str = params.get("oldText") or params.get("old_str") or ""
             new_str = params.get("newText") or params.get("new_str") or ""
             return sandbox.edit_file(path, old_str, new_str)

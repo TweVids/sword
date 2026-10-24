@@ -98,12 +98,16 @@ class OpenCodeHarness(BaseHarness):
                 return sandbox.write_file(path, content)
             elif action in ("read", "read_file"):
                 path = str(params.get("path") or params.get("file") or "")
-                return sandbox.read_file(path)
+                offset = params.get("offset")
+                limit = params.get("limit")
+                end_line = (int(offset) + int(limit) - 1) if (offset is not None and limit is not None) else None
+                return sandbox.read_file(path, start_line=offset, end_line=end_line)
             elif action in ("edit", "edit_file"):
                 path = str(params.get("path") or "")
                 old_str = str(params.get("oldString") or params.get("old_str") or "")
                 new_str = str(params.get("newString") or params.get("new_str") or "")
-                return sandbox.edit_file(path, old_str, new_str)
+                replace_all = bool(params.get("replaceAll", False))
+                return sandbox.edit_file(path, old_str, new_str, replace_all=replace_all)
             else:
                 return False, f"Unknown OpenCode tool action: {action}"
 

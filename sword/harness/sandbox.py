@@ -5,7 +5,10 @@ and execution safety policies for OpenCode, Codex CLI, Gemini CLI, and Pi.
 """
 
 import os
+import re
 import sys
+import glob as _glob
+import fnmatch
 import shutil
 import tempfile
 import subprocess
@@ -50,19 +53,29 @@ class WorkspaceSandbox:
         except Exception as e:
             return False, f"write_file error: {e}"
 
-    def read_file(self, path: str) -> Tuple[bool, str]:
-        """Reads file contents from inside the sandbox."""
+    def read_file(
+        self,
+        path: str,
+        start_line: Optional[int] = None,
+        end_line: Optional[int] = None,
+    ) -> Tuple[bool, str]:
+        """Reads file contents (or 1-indexed line slice) from inside the sandbox."""
         try:
             full_path = self._resolve_safe_path(path)
             if not os.path.exists(full_path):
                 return False, f"File not found: {path}"
             with open(full_path, "r", encoding="utf-8", errors="replace") as f:
                 content = f.read()
+            if start_line is not None or end_line is not None:
+                lines = content.splitlines()
+                s = max(1, int(start_line)) - 1 if start_line is not None else 0
+                e = int(end_line) if end_line is not None else len(lines)
+                content = "\n".join(lines[s:e])
             return True, content
         except Exception as e:
             return False, f"read_file error: {e}"
 
-    def edit_file(self, path: str, old_str: str, new_str: str) -> Tuple[bool, str]:
+    def edit_file(self, path: str, old_str: str, new_str: str, replace_all: bool = False) -> Tuple[bool, str]:
         """Replaces old_str with new_str in a file."""
         try:
             full_path = self._resolve_safe_path(path)
@@ -70,14 +83,41 @@ class WorkspaceSandbox:
                 return False, f"File not found: {path}"
             with open(full_path, "r", encoding="utf-8", errors="replace") as f:
                 content = f.read()
-            if old_str not in content:
-                return False, f"Target string not found in {path}"
-            content = content.replace(old_str, new_str, 1)
+            if old_str == "":
+                content = content + ("\n" if content and not content.endswith("\n") else "") + new_str
+            else:
+                if old_str not in content:
+                    return False, f"Target string not found in {path}"
+                content = content.replace(old_str, new_str) if replace_all else content.replace(old_str, new_str, 1)
             with open(full_path, "w", encoding="utf-8") as f:
                 f.write(content)
             return True, f"Successfully edited {path}"
         except Exception as e:
             return False, f"edit_file error: {e}"
+
+    def delete_file(self, path: str) -> Tuple[bool, str]:
+        """Deletes a file inside the sandbox."""
+        try:
+            full_path = self._resolve_safe_path(path)
+            if not os.path.isfile(full_path):
+                return False, f"File not found: {path}"
+            os.remove(full_path)
+            return True, f"Deleted {path}"
+        except Exception as e:
+            return False, f"delete_file error: {e}"
+
+    def move_file(self, src_path: str, dst_path: str) -> Tuple[bool, str]:
+        """Moves/renames a file inside the sandbox."""
+        try:
+            src_full = self._resolve_safe_path(src_path)
+            dst_full = self._resolve_safe_path(dst_path)
+            if not os.path.exists(src_full):
+                return False, f"Source file not found: {src_path}"
+            os.makedirs(os.path.dirname(dst_full), exist_ok=True)
+            shutil.move(src_full, dst_full)
+            return True, f"Moved {src_path} to {dst_path}"
+        except Exception as e:
+            return False, f"move_file error: {e}"
 
     def list_dir(self, path: str = "") -> Tuple[bool, List[str]]:
         """Lists files and directories in workspace relative to root."""
@@ -89,6 +129,68 @@ class WorkspaceSandbox:
             return True, entries
         except Exception as e:
             return False, [str(e)]
+
+    def glob_files(self, pattern: str, dir_path: str = "") -> Tuple[bool, List[str]]:
+        """Finds files matching a glob pattern inside the sandbox."""
+        if not pattern or not pattern.strip():
+            return False, ["Empty glob pattern"]
+        try:
+            target_dir = self._resolve_safe_path(dir_path) if dir_path else self.root_dir
+            if not os.path.isdir(target_dir):
+                return False, [f"Not a directory: {dir_path}"]
+            raw_matches = _glob.glob(os.path.join(target_dir, pattern), recursive=True)
+            safe_rel: List[str] = []
+            for m in sorted(raw_matches):
+                abs_m = os.path.abspath(m)
+                if os.path.commonpath([self.root_dir, abs_m]) == self.root_dir and os.path.isfile(abs_m):
+                    safe_rel.append(os.path.relpath(abs_m, self.root_dir).replace("\\", "/"))
+            return True, safe_rel
+        except Exception as e:
+            return False, [f"glob_files error: {e}"]
+
+    def grep_search(
+        self,
+        pattern: str,
+        dir_path: str = "",
+        include_pattern: Optional[str] = None,
+        max_matches: int = 100,
+    ) -> Tuple[bool, str]:
+        """Searches files inside the sandbox for a regular expression pattern."""
+        if not pattern:
+            return False, "Empty search pattern"
+        try:
+            rx = re.compile(pattern)
+        except re.error as e:
+            return False, f"Invalid regex pattern: {e}"
+        try:
+            target_dir = self._resolve_safe_path(dir_path) if dir_path else self.root_dir
+            if not os.path.exists(target_dir):
+                return False, f"Directory not found: {dir_path}"
+            matches: List[str] = []
+            files_to_scan: List[str] = []
+            if os.path.isfile(target_dir):
+                files_to_scan.append(target_dir)
+            else:
+                for root, _, filenames in os.walk(target_dir):
+                    for fn in sorted(filenames):
+                        if include_pattern and not fnmatch.fnmatch(fn, include_pattern):
+                            continue
+                        files_to_scan.append(os.path.join(root, fn))
+
+            for fpath in files_to_scan:
+                rel = os.path.relpath(fpath, self.root_dir).replace("\\", "/")
+                try:
+                    with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                        for lineno, line in enumerate(f, start=1):
+                            if rx.search(line):
+                                matches.append(f"{rel}:{lineno}:{line.rstrip()}")
+                                if len(matches) >= max_matches:
+                                    return True, "\n".join(matches)
+                except Exception:
+                    continue
+            return True, "\n".join(matches) if matches else "No matches found"
+        except Exception as e:
+            return False, f"grep_search error: {e}"
 
     def run_bash(self, command: str) -> Tuple[bool, str]:
         """Executes a shell command inside the sandbox."""
