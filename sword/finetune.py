@@ -49,18 +49,31 @@ class LoRALinear(nn.Module):
         return base_out + lora_out.to(orig_dtype)
 
 
-def apply_lora_to_model(model: nn.Module, r: int = 16, lora_alpha: int = 32) -> nn.Module:
+def apply_lora_to_model(
+    model: nn.Module,
+    r: int = 16,
+    lora_alpha: int = 32,
+    lora_dropout: float = 0.05,
+    target_moe: bool = True,
+) -> nn.Module:
     """
-    Applies LoRA adapters to linear attention projection layers (q_proj, v_proj).
-    Uses PEFT if installed, or Sword's native zero-dependency LoRALinear.
+    Applies LoRA adapters to linear attention projection layers (q_proj, v_proj)
+    and native MoE QLoRA adapters to 3D stacked MoE expert blocks.
+    Compatible with Unsloth and PEFT workflows.
     """
+    has_moe = any(hasattr(m, "experts") for m in model.modules())
+    if has_moe and target_moe:
+        from .moe_quant import apply_moe_qlora
+        model, _ = apply_moe_qlora(model, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout)
+        return model
+
     try:
         from peft import LoraConfig, get_peft_model
         config = LoraConfig(
             r=r,
             lora_alpha=lora_alpha,
             target_modules=["q_proj", "v_proj"],
-            lora_dropout=0.05,
+            lora_dropout=lora_dropout,
             bias="none",
             task_type="CAUSAL_LM",
         )
@@ -74,7 +87,7 @@ def apply_lora_to_model(model: nn.Module, r: int = 16, lora_alpha: int = 32) -> 
     for name, module in model.named_modules():
         for child_name, child in list(module.named_children()):
             if child_name in ["q_proj", "v_proj"]:
-                wrapped = LoRALinear(child, r=r, lora_alpha=lora_alpha)
+                wrapped = LoRALinear(child, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout)
                 setattr(module, child_name, wrapped)
                 applied_count += 1
 

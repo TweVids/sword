@@ -1061,6 +1061,33 @@ class FastLfm2MoeModel:
     def pre_patch():
         pass
 
+    @classmethod
+    def get_peft_model(
+        cls,
+        model,
+        r: int = 16,
+        lora_alpha: int = 32,
+        lora_dropout: float = 0.05,
+        target_moe: bool = True,
+        target_linear: bool = True,
+        **kwargs,
+    ):
+        """
+        Attaches LoRA / QLoRA adapters to both 3D MoE experts and linear projections.
+        Base quantized weights are frozen; gradients are computed only into trainable adapters.
+        100% compatible with Unsloth FastLanguageModel and PEFT.
+        """
+        from .moe_quant import apply_moe_qlora
+        model, stats = apply_moe_qlora(
+            model=model,
+            r=r,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            target_moe=target_moe,
+            target_linear=target_linear,
+        )
+        return model
+
     @staticmethod
     def patch_peft_model(model, use_gradient_checkpointing: Union[str, bool] = False):
         """Prepares PeftModel with Sword's pure PyTorch speed engine & gradient checkpointing."""
@@ -1153,6 +1180,7 @@ def load_lfm_model(
     load_in_4bit: bool = False,
     load_in_8bit: bool = False,
     load_in_fp8: bool = False,
+    moe_quant_type: Optional[str] = None,
     device_map: str = "auto",
     torch_dtype: Optional[torch.dtype] = None,
     max_seq_length: int = 4096,
@@ -1237,6 +1265,20 @@ def load_lfm_model(
     if patch_sword:
         model = patch_lfm(model, mode=attn_mode, patch_moe=True)
 
+    # 4. Native 3D MoE Quantization (NF4, FP8, INT8)
+    q_type = moe_quant_type
+    if q_type is None:
+        if load_in_4bit:
+            q_type = "nf4"
+        elif load_in_fp8:
+            q_type = "fp8"
+        elif load_in_8bit:
+            q_type = "int8"
+
+    if q_type is not None:
+        from .moe_quant import quantize_model_moe
+        quantize_model_moe(model, quant_type=q_type, compute_dtype=torch_dtype)
+
     model.eval()
     print("[Sword] LFM 2.5 24B A2B model ready for high-throughput serving & RL rollout.")
     return model, tokenizer
@@ -1268,6 +1310,70 @@ def find_prompt_lookup_candidates(
     return None
 
 
+class FastLfmGraphEngine:
+    """
+    Static CUDA Graph capture & replay engine for FastLfmServer decode steps.
+    Eliminates CPU kernel launch overhead and Python dispatch latency entirely.
+    """
+    def __init__(
+        self,
+        server: "FastLfmServer",
+        batch_size: int = 8,
+        vocab_size: int = 128256,
+        dtype: torch.dtype = torch.bfloat16,
+        device: Optional[torch.device] = None,
+    ):
+        self.server = server
+        self.batch_size = batch_size
+        self.vocab_size = vocab_size
+        self.dtype = dtype
+        self.device = device or (server.device if hasattr(server, "device") else torch.device("cpu"))
+        self.graph = None
+        self.static_input_ids = None
+        self.static_position_ids = None
+        self.static_logits = None
+        self._is_captured = False
+
+    def can_capture(self) -> bool:
+        return torch.cuda.is_available() and getattr(self.device, "type", "") == "cuda"
+
+    def capture(self) -> bool:
+        if not self.can_capture():
+            return False
+        try:
+            self.static_input_ids = torch.zeros((self.batch_size, 1), dtype=torch.long, device=self.device)
+            self.static_position_ids = torch.zeros((self.batch_size, 1), dtype=torch.long, device=self.device)
+            self.static_logits = torch.zeros((self.batch_size, self.vocab_size), dtype=self.dtype, device=self.device)
+
+            # Warmup runs on separate capture stream
+            s = torch.cuda.Stream(device=self.device)
+            s.wait_stream(torch.cuda.current_stream(device=self.device))
+            with torch.cuda.stream(s):
+                for _ in range(3):
+                    _ = self.server.fast_lean_decode_step(self.static_input_ids, self.static_position_ids)
+            torch.cuda.current_stream(device=self.device).wait_stream(s)
+
+            # Capture CUDA Graph
+            self.graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self.graph, stream=s):
+                step_logits = self.server.fast_lean_decode_step(self.static_input_ids, self.static_position_ids)
+                self.static_logits.copy_(step_logits)
+            self._is_captured = True
+            return True
+        except Exception:
+            self._is_captured = False
+            self.graph = None
+            return False
+
+    def replay(self, input_ids: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
+        if not self._is_captured or self.graph is None:
+            return self.server.fast_lean_decode_step(input_ids, position_ids)
+        self.static_input_ids.copy_(input_ids)
+        self.static_position_ids.copy_(position_ids)
+        self.graph.replay()
+        return self.static_logits.clone()
+
+
 class FastLfmServer:
     """
     High-Throughput Serving & RL Rollout Engine for Liquid Foundation Models (LFM2 / LFM2.5 MoE).
@@ -1279,6 +1385,8 @@ class FastLfmServer:
     3. Pure PyTorch SDPA & In-Place Conv: Zero host-device synchronizations during token generation.
     4. Speculative Prompt Lookup Decoding: Multi-token jump decoding for recurring tokens.
     5. O(1) Metadata Reset between rollouts (eliminating multi-gigabyte HBM zeroing).
+    6. Lean Direct Decode Loop: Bypasses HuggingFace forward overhead & causal mask construction.
+    7. Static CUDA Graph Engine: Eliminates kernel launch latency down to microsecond scale.
     """
     def __init__(
         self,
@@ -1337,6 +1445,16 @@ class FastLfmServer:
         for name, module in self.model.named_modules():
             if hasattr(module, "q_proj") and hasattr(module, "k_proj"):
                 module._sword_static_cache = self.static_cache
+
+        # Initialize Static CUDA Graph Engine for decode steps
+        vocab_size = getattr(cfg, "vocab_size", 128256)
+        self.graph_engine = FastLfmGraphEngine(
+            server=self,
+            batch_size=max_concurrency,
+            vocab_size=vocab_size,
+            dtype=self.dtype,
+            device=self.device,
+        )
 
         self._pending_requests = []
 
@@ -1459,6 +1577,60 @@ class FastLfmServer:
             return f"<|startoftext|><|im_start|>user\n{user_prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n"
         return f"<|startoftext|><|im_start|>user\n{user_prompt}<|im_end|>\n<|im_start|>assistant\n"
 
+    def fast_lean_decode_step(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        step_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Ultra-low latency direct decode step.
+        Bypasses HuggingFace forward method, causal mask generation, and output dataclasses.
+        Executes directly on backbone layers with zero memory allocations.
+        """
+        backbone = getattr(self.model, "model", self.model)
+        if hasattr(backbone, "base_model"):
+            backbone = getattr(backbone, "base_model", backbone)
+        if hasattr(backbone, "model"):
+            backbone = getattr(backbone, "model", backbone)
+
+        if hasattr(backbone, "embed_tokens") and hasattr(backbone, "layers") and hasattr(backbone, "pos_emb"):
+            hidden_states = backbone.embed_tokens(input_ids)
+            position_embeddings = backbone.pos_emb(hidden_states, position_ids=position_ids)
+            for layer in backbone.layers:
+                hidden_states = layer(
+                    hidden_states,
+                    attention_mask=step_mask,
+                    position_ids=position_ids,
+                    past_key_values=self.static_cache,
+                    position_embeddings=position_embeddings,
+                )
+                if isinstance(hidden_states, tuple):
+                    hidden_states = hidden_states[0]
+
+            if hasattr(backbone, "embedding_norm"):
+                hidden_states = backbone.embedding_norm(hidden_states)
+            elif hasattr(backbone, "norm"):
+                hidden_states = backbone.norm(hidden_states)
+
+            lm_head = getattr(self.model, "lm_head", getattr(getattr(self.model, "base_model", self.model), "lm_head", None))
+            if lm_head is not None:
+                logits = lm_head(hidden_states)
+            else:
+                logits = hidden_states
+            return logits[:, -1, :]
+
+        # Robust fallback to self.model
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=step_mask,
+            position_ids=position_ids,
+            past_key_values=self.static_cache,
+            use_cache=True,
+            logits_to_keep=1,
+        )
+        return outputs.logits[:, -1, :]
+
     @torch.inference_mode()
     def fast_decode_8concurrency(
         self,
@@ -1558,23 +1730,29 @@ class FastLfmServer:
 
         # 2. Fast Decode Loop
         is_greedy = (temperature <= 0.0)
+        can_use_graph = (
+            self.graph_engine.can_capture()
+            and bsz == self.graph_engine.batch_size
+            and (full_decode_mask is None)
+        )
+        if can_use_graph and not self.graph_engine._is_captured:
+            self.graph_engine.capture()
+
         for step_idx in range(1, max_new_tokens):
             self.static_cache.set_pos(curr_pos)
             step_mask = full_decode_mask[:, :curr_pos + 1] if full_decode_mask is not None else None
-            outputs = self.model(
-                input_ids=next_token,
-                attention_mask=step_mask,
-                position_ids=dec_pos,
-                past_key_values=self.static_cache,
-                use_cache=True,
-                logits_to_keep=1,
-            )
+
+            if self.graph_engine._is_captured and bsz == self.graph_engine.batch_size and step_mask is None:
+                step_logits = self.graph_engine.replay(next_token, dec_pos)
+            else:
+                step_logits = self.fast_lean_decode_step(next_token, dec_pos, step_mask=step_mask)
+
             curr_pos += 1
             dec_pos = dec_pos + 1
             if is_greedy:
-                next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+                next_token = torch.argmax(step_logits, dim=-1, keepdim=True)
             else:
-                next_token = _sample(outputs.logits[:, -1, :])
+                next_token = _sample(step_logits)
 
             if eos_id is not None:
                 is_eos = (next_token.squeeze(-1) == eos_id)

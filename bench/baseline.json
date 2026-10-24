@@ -1,0 +1,17 @@
+{
+  "model_name": "mini",
+  "concurrency": 8,
+  "device": "cpu",
+  "use_fast_engine": true,
+  "quant_moe": null,
+  "profile_steps": 4,
+  "elapsed_seconds": 0.3847276999731548,
+  "step_latency_ms": 96.1819249932887,
+  "total_tokens": 32,
+  "tokens_per_second": 83.1757110346691,
+  "total_op_launches": 11012,
+  "launches_per_step": 2753,
+  "cpu_time_ms": 155.15400000000022,
+  "cuda_time_ms": 0.0,
+  "timestamp": "2026-10-24 13:06:14"
+}

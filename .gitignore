@@ -44,3 +44,6 @@ scratch/
 unsloth_compiled_cache/
 *.zip
 *.tar.gz
+bench/*_trace.json
+bench/decode_trace.json
+

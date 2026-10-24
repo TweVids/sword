@@ -295,7 +295,15 @@ from .patcher import (
 )
 from .loader import load_qwen_model, load_moe_model, load_qwen3_moe_model, load_ling_model, load_lfm_model, FastLanguageModel
 from .ling import FastLingServer, setup_fla_compatibility
-from .lfm import FastLfmServer, StaticLfmCache, setup_lfm_unsloth_compatibility, FastLfm2MoeModel
+from .lfm import FastLfmServer, StaticLfmCache, setup_lfm_unsloth_compatibility, FastLfm2MoeModel, FastLfmGraphEngine
+from .moe_quant import (
+    Quantized3DWeight,
+    QuantizedMoEExperts,
+    MoEQLoRALayer,
+    quantize_model_moe,
+    apply_moe_qlora,
+    get_moe_qlora_parameters,
+)
 from .server import FastServer, FastMoEServer, FastQwenServer, FastQwen3MoeServer
 from .finetune import benchmark_finetune_8k, apply_lora_to_model
 from .trainer import (
@@ -374,8 +382,15 @@ __all__ = [
     "FastQwen3MoeServer",
     "FastLingServer",
     "FastLfmServer",
+    "FastLfmGraphEngine",
     "StaticLfmCache",
     "FastLfm2MoeModel",
+    "Quantized3DWeight",
+    "QuantizedMoEExperts",
+    "MoEQLoRALayer",
+    "quantize_model_moe",
+    "apply_moe_qlora",
+    "get_moe_qlora_parameters",
     "setup_lfm_unsloth_compatibility",
     "setup_fla_compatibility",
     "benchmark_finetune_8k",
