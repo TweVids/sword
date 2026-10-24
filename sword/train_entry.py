@@ -165,6 +165,18 @@ def train(
                     "dtype": kwargs.get("dtype", "auto"),
                     "hf_overrides": hf_overrides,
                 }
+                # Quantization configuration
+                quant = kwargs.get("quantization", None)
+                if quant:
+                    llm_kwargs["quantization"] = quant
+                elif load_in_8bit:
+                    llm_kwargs["quantization"] = "fp8"
+                elif load_in_4bit:
+                    llm_kwargs["quantization"] = "bitsandbytes"
+                    llm_kwargs["load_format"] = "bitsandbytes"
+
+                if "kv_cache_dtype" in kwargs:
+                    llm_kwargs["kv_cache_dtype"] = kwargs["kv_cache_dtype"]
                 if kwargs.get("enforce_eager", False):
                     llm_kwargs["enforce_eager"] = True
                 if moe_backend:
