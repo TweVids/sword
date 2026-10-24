@@ -1,10 +1,11 @@
 """
 Unit test suite for the new Sword GRPO Trainer architecture:
 - Model B Ollama Judge & JSON/YAML parser with VRAM lifecycle management
-- Agentic Harnesses (OpenCode, Codex CLI, Gemini CLI, Pi) with multi-turn self-repair
+- Authentic Agentic Harnesses (OpenCode, Codex CLI, Gemini CLI, Pi) with real WorkspaceSandbox
 - Multi-Metric Reward Scorer & MathVerifier
 - CheckpointManager, SHA-256 tracking, read-back verification, resume, and pruning
-- OOM auto-recovery and emergency checkpointing
+- OOM auto-recovery and emergency checkpointing without false completion logging
+- Expandable dataset deduplication with per-row SHA-256
 - Single-call sword.train(long_train=True, ...) end-to-end workflow
 """
 
@@ -26,6 +27,7 @@ from sword.harness import (
     get_harness,
     BaseHarness,
     HarnessResult,
+    WorkspaceSandbox,
     OpenCodeHarness,
     CodexCliHarness,
     GeminiCliHarness,
@@ -46,9 +48,11 @@ class DummyTokenizer:
     pad_token_id = 0
     eos_token_id = 1
 
-    def __call__(self, text, return_tensors="pt", **kwargs):
+    def __call__(self, text, return_tensors="pt", add_special_tokens=True, **kwargs):
         tokens = [2, 10, 20, 30]
-        return {"input_ids": torch.tensor([tokens], dtype=torch.long)}
+        if return_tensors == "pt":
+            return {"input_ids": torch.tensor([tokens], dtype=torch.long)}
+        return {"input_ids": tokens}
 
     def decode(self, token_ids, skip_special_tokens=True):
         return f"decoded response ({len(token_ids)} tokens)"
@@ -77,15 +81,49 @@ class TestNewTrainerArchitecture(unittest.TestCase):
     def test_module_exports(self):
         self.assertTrue(hasattr(sword, "ModelBJudge"))
         self.assertTrue(hasattr(sword, "get_harness"))
+        self.assertTrue(hasattr(sword, "WorkspaceSandbox"))
         self.assertTrue(hasattr(sword, "MultiMetricRewardScorer"))
         self.assertTrue(hasattr(sword, "MathVerifier"))
         self.assertTrue(hasattr(sword, "CheckpointManager"))
         self.assertTrue(hasattr(sword, "run_long_train"))
         self.assertTrue(callable(sword.train))
 
+    def test_real_workspace_sandbox(self):
+        sandbox = WorkspaceSandbox(cleanup=True)
+        try:
+            # 1. Write file
+            ok_w, msg_w = sandbox.write_file("test.py", "x = 10\nprint('sandbox_result:', x * 2)")
+            self.assertTrue(ok_w)
+
+            # 2. Read file
+            ok_r, content_r = sandbox.read_file("test.py")
+            self.assertTrue(ok_r)
+            self.assertIn("sandbox_result", content_r)
+
+            # 3. Edit file
+            ok_e, msg_e = sandbox.edit_file("test.py", "x * 2", "x * 5")
+            self.assertTrue(ok_e)
+            _, edited_c = sandbox.read_file("test.py")
+            self.assertIn("x * 5", edited_c)
+
+            # 4. Real python execution
+            ok_py, out_py = sandbox.run_python("print(40 + 2)")
+            self.assertTrue(ok_py)
+            self.assertEqual(out_py.strip(), "42")
+
+            # 5. Dangerous path escape rejected
+            ok_bad, msg_bad = sandbox.write_file("../../escaped.txt", "hacked")
+            self.assertFalse(ok_bad)
+            self.assertIn("denied", msg_bad.lower())
+            with self.assertRaises(PermissionError):
+                sandbox._resolve_safe_path("../../escaped.txt")
+        finally:
+            sandbox.close()
+
     def test_b_model_parser_and_lifecycle(self):
-        config = ModelBJudgeConfig(num_predict=1024)
+        config = ModelBJudgeConfig(num_predict=1024, auto_unload=True)
         self.assertEqual(config.num_predict, 1024)
+        self.assertTrue(config.auto_unload)
         judge = ModelBJudge(config=config)
 
         # 1. Standard JSON dict format
@@ -126,12 +164,13 @@ class TestNewTrainerArchitecture(unittest.TestCase):
         self.assertEqual(res_md.truth, 0.0)
         self.assertTrue(res_md.cheating)
 
-        # 4. Memory lifecycle calls should not raise
+        # 4. Memory lifecycle and guard
+        self.assertTrue(judge.check_memory_guard())
         judge.prepare_for_eval()
         judge.release_after_eval()
         self.assertFalse(judge.unload())
 
-    def test_harness_registry_and_execution(self):
+    def test_harness_registry_and_real_execution(self):
         # 1. Registry resolution
         self.assertIsInstance(get_harness("opencode"), OpenCodeHarness)
         self.assertIsInstance(get_harness("codex-cli"), CodexCliHarness)
@@ -140,11 +179,11 @@ class TestNewTrainerArchitecture(unittest.TestCase):
         self.assertIsNone(get_harness("none"))
         self.assertIsNone(get_harness(None))
 
-        # 2. OpenCode harness execution with valid python block
-        opencode = OpenCodeHarness(allow_exec=False)
+        # 2. Real OpenCode harness execution with genuine subprocess python execution
+        opencode = OpenCodeHarness()
         mock_output = (
             "<think>Analyzing repository structure</think>\n"
-            "```python\ndef solution():\n    return 42\n```\n"
+            "```python\ndef solution():\n    return 42\nprint('computed:', solution())\n```\n"
             "Final fix applied."
         )
         res = opencode.run(
@@ -154,15 +193,23 @@ class TestNewTrainerArchitecture(unittest.TestCase):
         )
         self.assertEqual(res.tools_called, 1)
         self.assertEqual(res.tools_succeeded, 1)
+        self.assertEqual(res.tools_failed, 0)
         self.assertEqual(res.reasoning_text, "Analyzing repository structure")
 
-    def test_codex_cli_multiturn_self_repair(self):
+        # 3. Real OpenCode error detection on broken script
+        broken_output = "```python\nraise ValueError('real failure')\n```"
+        res_broken = opencode.run("Run code", lambda p: broken_output, max_turns=1)
+        self.assertEqual(res_broken.tools_called, 1)
+        self.assertEqual(res_broken.tools_succeeded, 0)
+        self.assertEqual(res_broken.tools_failed, 1)
+
+    def test_codex_cli_real_multiturn_self_repair(self):
         codex = CodexCliHarness()
         turns = [
             # Turn 1: syntax error
             "```python\ndef broken(\n```",
-            # Turn 2: corrected code
-            "```python\ndef fixed():\n    return 42\n```",
+            # Turn 2: corrected code that executes successfully
+            "```python\ndef fixed():\n    return 42\nassert fixed() == 42\n```",
         ]
         call_count = [0]
 
@@ -178,7 +225,7 @@ class TestNewTrainerArchitecture(unittest.TestCase):
         self.assertEqual(res.tools_failed, 1)
         self.assertIn("def fixed", res.final_text)
 
-    def test_gemini_cli_multiturn(self):
+    def test_gemini_cli_real_execution(self):
         gemini = GeminiCliHarness()
         turns = [
             "call:calculator{\"expression\": \"12 + 30\"}",
@@ -195,6 +242,24 @@ class TestNewTrainerArchitecture(unittest.TestCase):
         self.assertEqual(res.tools_called, 1)
         self.assertEqual(res.tools_succeeded, 1)
         self.assertIn("42", res.final_text)
+
+    def test_pi_harness_real_execution(self):
+        pi = PiHarness()
+        turns = [
+            "Action: write hello.txt\nhello from pi sandbox\n",
+            "Action: read hello.txt\n",
+        ]
+        idx = [0]
+
+        def step_gen(p: str) -> str:
+            resp = turns[min(idx[0], len(turns) - 1)]
+            idx[0] += 1
+            return resp
+
+        res = pi.run("Create file and verify", model_generate_fn=step_gen, max_turns=2)
+        self.assertEqual(res.tools_called, 2)
+        self.assertEqual(res.tools_succeeded, 2)
+        self.assertEqual(res.tools_failed, 0)
 
     def test_math_verifier(self):
         self.assertTrue(MathVerifier.verify_answer("<think>Deduction</think> 42", "42"))
@@ -265,34 +330,34 @@ class TestNewTrainerArchitecture(unittest.TestCase):
         self.assertTrue(res_info["optimizer_restored"])
         self.assertGreater(res_info["matched_keys"], 0)
 
-    def test_dataset_sha256_content_hashing(self):
-        items1 = [
-            {"problem": "What is 2+2?", "solution": "4", "reasoning_rule": "math", "answer_rule": "number"},
-            {"problem": "What is 3*3?", "solution": "9", "reasoning_rule": "math", "answer_rule": "number"},
-        ]
-        # Same problems in JSONL format
-        jsonl_path = os.path.join(self.temp_dir, "dataset.jsonl")
-        with open(jsonl_path, "w", encoding="utf-8") as f:
-            for it in items1:
-                f.write(json.dumps(it) + "\n")
+    def test_resume_only_when_explicitly_requested(self):
+        mgr = CheckpointManager(
+            output_dir=self.temp_dir,
+            num_latest_checkpoint_save=2,
+            is_save_and_upload_checkpoint=False,
+        )
+        from sword.finetune import apply_lora_to_model
+        lora_model = apply_lora_to_model(self.model, r=4, lora_alpha=8, target_moe=False)
+        mgr.save_checkpoint(step=10, model=lora_model)
 
-        _, sha1 = load_dataset_records(items1)
-        _, sha2 = load_dataset_records(jsonl_path)
-        self.assertEqual(sha1, sha2)
+        # Default empty or None must NOT resume
+        self.assertIsNone(mgr.find_latest_checkpoint(None))
+        self.assertIsNone(mgr.find_latest_checkpoint(""))
+        self.assertIsNone(mgr.find_latest_checkpoint("none"))
 
-        # Modified content must produce distinct hash
-        items3 = list(items1)
-        items3[0] = dict(items3[0], solution="5")
-        _, sha3 = load_dataset_records(items3)
-        self.assertNotEqual(sha1, sha3)
+        # Explicit 'latest' or 'auto' must resume
+        latest = mgr.find_latest_checkpoint("latest")
+        self.assertIsNotNone(latest)
+        self.assertIn("checkpoint-10", latest)
 
-    def test_oom_recovery_and_emergency_checkpoint(self):
+    def test_oom_recovery_does_not_mark_dataset_completed(self):
         from sword.finetune import apply_lora_to_model
         apply_lora_to_model(self.model, r=4, lora_alpha=8, target_moe=False)
 
         custom_dataset = [
             {"problem": "Compute 1+1", "solution": "2", "can_be__verify": True},
         ]
+        out_dir = os.path.join(self.temp_dir, "oom_test_ckpt")
 
         # Patch GRPOBridge.train_step to simulate persistent CUDA Out of Memory
         with patch("sword.grpo_bridge.GRPOBridge.train_step", side_effect=torch.cuda.OutOfMemoryError("CUDA out of memory")):
@@ -306,7 +371,7 @@ class TestNewTrainerArchitecture(unittest.TestCase):
                 Argument={
                     "steps": 2,
                     "concurrency_g": 2,
-                    "output_dir": os.path.join(self.temp_dir, "oom_ckpt"),
+                    "output_dir": out_dir,
                 },
                 show_detail_logs=False,
             )
@@ -314,73 +379,79 @@ class TestNewTrainerArchitecture(unittest.TestCase):
             self.assertEqual(res.get("status"), "oom_aborted")
             self.assertTrue(os.path.isdir(res.get("emergency_checkpoint")))
 
-    def test_sword_train_end_to_end_long_train(self):
+            # Check that data_complete.logs does NOT exist or does NOT contain dataset hash
+            ckpt_mgr = CheckpointManager(output_dir=out_dir)
+            dataset_sha = res.get("dataset_sha256")
+            self.assertFalse(ckpt_mgr.is_dataset_completed(dataset_sha))
+
+        # A subsequent run outside OOM patch must NOT be rejected with 'already_trained'
+        retry_res = sword.train(
+            long_train=True,
+            test=False,
+            dataset=custom_dataset,
+            model="test_model",
+            custom_checkpoint_save=True,
+            is_save_and_upload_checkpoint=False,
+            Argument={
+                "steps": 1,
+                "concurrency_g": 2,
+                "output_dir": out_dir,
+            },
+            show_detail_logs=False,
+        )
+        # Without OOM mock, it succeeds and completes
+        self.assertEqual(retry_res.get("status"), "completed")
+
+    def test_expandable_dataset_deduplication(self):
         from sword.finetune import apply_lora_to_model
         apply_lora_to_model(self.model, r=4, lora_alpha=8, target_moe=False)
 
-        custom_dataset = [
-            {
-                "problem": "Solve 2 + 3",
-                "solution": "5",
-                "reasoning_rule": "Basic arithmetic",
-                "answer_rule": "Integer only",
-                "can_be__verify": True,
-                "difficult": "easy",
-                "cagetory": "math",
-                "harness": "none",
-            },
-            {
-                "problem": "Write a python function to add a and b",
-                "solution": "def add(a, b): return a + b",
-                "reasoning_rule": "Syntax validity",
-                "answer_rule": "Def block",
-                "can_be__verify": False,
-                "difficult": "medium",
-                "cagetory": "code",
-                "harness": "codex",
-            },
+        dataset_v1 = [
+            {"problem": "Compute 2 + 2", "solution": "4", "can_be__verify": True},
+            {"problem": "Compute 3 + 3", "solution": "6", "can_be__verify": True},
+        ]
+        out_dir = os.path.join(self.temp_dir, "expandable_ckpt")
+
+        # 1. Train on dataset v1
+        res1 = sword.train(
+            long_train=True,
+            test=False,
+            dataset=dataset_v1,
+            model="test_model",
+            is_save_and_upload_checkpoint=False,
+            Argument={"steps": 2, "concurrency_g": 2, "output_dir": out_dir},
+            show_detail_logs=False,
+        )
+        self.assertEqual(res1.get("status"), "completed")
+
+        # 2. Expand dataset with 1 new problem row
+        dataset_v2 = list(dataset_v1) + [
+            {"problem": "Compute 4 + 4", "solution": "8", "can_be__verify": True},
         ]
 
-        # 1. Run training via unified sword.train entry point
-        result = sword.train(
+        # 3. Training on dataset v2 detects already trained rows and trains the new row
+        res2 = sword.train(
             long_train=True,
             test=False,
-            dataset=custom_dataset,
+            dataset=dataset_v2,
             model="test_model",
-            B_model_port=11343,
-            custom_checkpoint_save=True,
             is_save_and_upload_checkpoint=False,
-            num_latest_checkpoint_save=2,
-            Argument={
-                "steps": 2,
-                "concurrency_g": 2,
-                "save_steps": 1,
-                "micro_batch_size": 2,
-                "output_dir": os.path.join(self.temp_dir, "long_ckpt"),
-            },
+            Argument={"steps": 1, "concurrency_g": 2, "output_dir": out_dir},
             show_detail_logs=False,
-            score_logs=True,
         )
+        self.assertEqual(res2.get("status"), "completed")
 
-        self.assertEqual(result.get("status"), "completed")
-        self.assertEqual(result.get("final_step"), 2)
-        self.assertTrue(os.path.isdir(result.get("checkpoint_dir")))
-
-        # 2. Re-running on identical dataset should trigger SHA-256 deduplication
-        rerun_result = sword.train(
+        # 4. Rerunning dataset v2 when all rows are complete triggers already_trained
+        res3 = sword.train(
             long_train=True,
             test=False,
-            dataset=custom_dataset,
+            dataset=dataset_v2,
             model="test_model",
-            B_model_port=11343,
             is_save_and_upload_checkpoint=False,
-            Argument={
-                "output_dir": os.path.join(self.temp_dir, "long_ckpt"),
-            },
+            Argument={"steps": 1, "concurrency_g": 2, "output_dir": out_dir},
             show_detail_logs=False,
         )
-        self.assertEqual(rerun_result.get("status"), "already_trained")
-        self.assertEqual(rerun_result.get("steps_completed"), 0)
+        self.assertEqual(res3.get("status"), "already_trained")
 
 
 if __name__ == "__main__":

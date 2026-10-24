@@ -27,7 +27,7 @@ except Exception:
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from sword.b_model import ModelBJudge, ModelBJudgeConfig
-from sword.harness import get_harness, HarnessResult
+from sword.harness import get_harness, HarnessResult, WorkspaceSandbox
 from sword.reward import MultiMetricRewardScorer, RewardBreakdown
 from sword.checkpoint import CheckpointManager
 from sword.grpo_bridge import GRPOBridge, GRPOBridgeConfig, RolloutBatch, RolloutItem
@@ -45,6 +45,7 @@ class DatasetProblemRow:
     category: str = "general"
     harness: Optional[str] = None
     problem_id: str = ""
+    row_hash: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -57,6 +58,7 @@ class DatasetProblemRow:
             "category": self.category,
             "harness": self.harness,
             "problem_id": self.problem_id,
+            "row_hash": self.row_hash,
         }
 
 
@@ -80,6 +82,19 @@ def parse_dataset_row(raw: Dict[str, Any], index: int = 0) -> DatasetProblemRow:
     category = str(raw.get("cagetory") or raw.get("category") or "general").strip().lower()
     harness = str(raw.get("harness") or "").strip().lower() or None
 
+    # Deterministic row hash for expandable deduplication
+    row_dict = {
+        "problem": problem,
+        "solution": solution,
+        "reasoning_rule": reasoning_rule,
+        "answer_rule": answer_rule,
+        "can_be_verify": can_be_verify,
+        "difficulty": difficulty,
+        "category": category,
+        "harness": harness,
+    }
+    row_hash = hashlib.sha256(json.dumps(row_dict, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+
     return DatasetProblemRow(
         problem=problem,
         solution=solution,
@@ -90,6 +105,7 @@ def parse_dataset_row(raw: Dict[str, Any], index: int = 0) -> DatasetProblemRow:
         category=category,
         harness=harness,
         problem_id=str(raw.get("id") or f"problem_{index}"),
+        row_hash=row_hash,
     )
 
 
@@ -193,11 +209,13 @@ def run_long_train(
     Argument: Optional[Dict[str, Any]] = None,
     show_detail_logs: bool = True,
     score_logs: bool = True,
+    auto_unload_B_model: bool = True,
+    B_model_keep_alive: str = "5m",
     **kwargs,
 ) -> Dict[str, Any]:
     """
     Main long-running infinite GRPO training entry point.
-    Coordinates continuous dataset ingestion, SHA-256 tracking, Model B scoring,
+    Coordinates continuous dataset ingestion, expandable SHA-256 tracking, Model B scoring,
     agentic harnesses, custom checkpointing, and OOM auto-recovery.
     """
     args = Argument or {}
@@ -235,11 +253,14 @@ def run_long_train(
         is_save_and_upload_checkpoint=is_save_and_upload_checkpoint,
     )
 
-    # 2. Ingest Dataset & Check SHA-256 Deduplication
+    # 2. Ingest Dataset & Check Expandable SHA-256 Deduplication
     records, dataset_sha256 = load_dataset_records(dataset, hf_token=HF_TOKEN)
     print(f"[*] Dataset SHA-256: {dataset_sha256} ({len(records)} problem rows)")
 
-    if ckpt_mgr.is_dataset_completed(dataset_sha256):
+    completed_hashes = ckpt_mgr.get_completed_dataset_hashes()
+
+    # If entire dataset SHA-256 matches completed log
+    if dataset_sha256 in completed_hashes:
         print(f"\n[Sword] The data is already train on, suggest prepare new dataset to continues.")
         return {
             "status": "already_trained",
@@ -247,12 +268,30 @@ def run_long_train(
             "steps_completed": 0,
         }
 
+    # Expandable dataset: filter out already-completed rows
+    uncompleted_records = [r for r in records if r.row_hash not in completed_hashes]
+    if not uncompleted_records:
+        ckpt_mgr.mark_dataset_completed(dataset_sha256, str(dataset)[:50])
+        print(f"\n[Sword] The data is already train on, suggest prepare new dataset to continues.")
+        return {
+            "status": "already_trained",
+            "dataset_sha256": dataset_sha256,
+            "steps_completed": 0,
+        }
+
+    if len(uncompleted_records) < len(records):
+        skipped = len(records) - len(uncompleted_records)
+        print(f"[*] Expandable dataset detected: skipping {skipped} already-trained rows. Continuing with {len(uncompleted_records)} new rows.")
+        records = uncompleted_records
+
     # 3. Model B Judge & Scorer Initialization
     b_judge_config = ModelBJudgeConfig(
         port=B_model_port,
         host=kwargs.get("B_model_host", "127.0.0.1"),
         model_name=kwargs.get("B_model_name", "gpt-oss:120b"),
         num_predict=int(kwargs.get("B_model_num_predict", 1024)),
+        auto_unload=auto_unload_B_model,
+        keep_alive_during_eval=B_model_keep_alive,
     )
     b_judge = ModelBJudge(config=b_judge_config)
     reward_scorer = MultiMetricRewardScorer(b_model_judge=b_judge)
@@ -279,7 +318,7 @@ def run_long_train(
     trainable_params = [p for p in bridge.trainer_model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable_params, lr=lr)
 
-    # 5. Checkpoint Resume Discovery
+    # 5. Checkpoint Resume Discovery (only when explicitly requested)
     start_step = 0
     resolved_ckpt = ckpt_mgr.find_latest_checkpoint(resume_from_checkpoint)
     if resolved_ckpt:
@@ -312,7 +351,13 @@ def run_long_train(
             harness = get_harness(current_row.harness)
 
             step_success = False
+            log_start_len = len(reward_history_logs)
+
             for attempt in range(2):
+                # Clean up reward logs from previous failed attempt to avoid duplicates
+                if attempt > 0 and len(reward_history_logs) > log_start_len:
+                    del reward_history_logs[log_start_len:]
+
                 try:
                     # Rollout Phase
                     prompts = [current_row.problem]
@@ -340,8 +385,25 @@ def run_long_train(
                             )
                             tools_called = h_res.tools_called
                             tools_succeeded = h_res.tools_succeeded
-                            if h_res.final_text:
+
+                            # Synchronize tokens and logprobs with updated multi-turn response text
+                            if h_res.final_text and h_res.final_text != item.response_text:
                                 item.response_text = h_res.final_text
+                                if hasattr(bridge, "tokenizer") and bridge.tokenizer is not None:
+                                    try:
+                                        tok_out = bridge.tokenizer(item.response_text, add_special_tokens=False)
+                                        r_ids = tok_out.get("input_ids", []) if isinstance(tok_out, dict) else getattr(tok_out, "input_ids", [])
+                                        if isinstance(r_ids, torch.Tensor):
+                                            r_ids = r_ids.squeeze().tolist()
+                                        if isinstance(r_ids, int):
+                                            r_ids = [r_ids]
+                                        item.response_token_ids = list(r_ids)
+                                        if len(item.rollout_logprobs) < len(item.response_token_ids):
+                                            item.rollout_logprobs.extend([0.0] * (len(item.response_token_ids) - len(item.rollout_logprobs)))
+                                        elif len(item.rollout_logprobs) > len(item.response_token_ids):
+                                            item.rollout_logprobs = item.rollout_logprobs[:len(item.response_token_ids)]
+                                    except Exception:
+                                        pass
 
                         score_breakdown = reward_scorer.score(
                             problem=current_row.problem,
@@ -366,7 +428,7 @@ def run_long_train(
                                 "scores": score_breakdown.to_dict(),
                             })
 
-                    # Release Model B VRAM before training step
+                    # Release Model B VRAM before training forward / backward pass
                     b_judge.release_after_eval()
 
                     # Calculate group-centered advantages
@@ -403,13 +465,14 @@ def run_long_train(
                             torch.cuda.empty_cache()
                         b_judge.release_after_eval()
 
+                        # Emergency save: NEVER mark incomplete dataset as completed
                         emergency_ckpt = ckpt_mgr.save_checkpoint(
                             step=current_step,
                             model=bridge.trainer_model,
                             optimizer=optimizer,
                             base_model_name=model,
                             reward_logs=reward_history_logs[-50:],
-                            completed_dataset_hash=dataset_sha256,
+                            completed_dataset_hash=None,
                         )
                         print(f"[Sword] Emergency checkpoint successfully secured at: {emergency_ckpt}")
                         return {
@@ -458,9 +521,11 @@ def run_long_train(
     except KeyboardInterrupt:
         print("\n[Sword] Training interrupted by user. Saving current checkpoint...")
     finally:
-        # Only mark dataset completed if training finished all steps
+        # Mark dataset completed ONLY if training truly completed all planned steps
         if completed_successfully:
             ckpt_mgr.mark_dataset_completed(dataset_sha256, str(dataset)[:50])
+            for r in records:
+                ckpt_mgr.mark_dataset_completed(r.row_hash, f"row_{r.problem_id}")
             print(f"[Sword] Dataset {dataset_sha256} marked completed in data_complete.logs.")
 
         final_ckpt = ckpt_mgr.save_checkpoint(

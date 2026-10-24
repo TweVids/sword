@@ -90,6 +90,8 @@ def train(
     Argument: Optional[Dict[str, Any]] = None,
     show_detail_logs: bool = True,
     score_logs: bool = True,
+    auto_unload_B_model: bool = True,
+    B_model_keep_alive: str = "5m",
     concurrent: int = 8,
     prompt: Optional[Union[int, str, List[str]]] = None,
     max_new_tokens: int = 64,
@@ -144,6 +146,8 @@ def train(
             Argument=Argument,
             show_detail_logs=show_detail_logs,
             score_logs=score_logs,
+            auto_unload_B_model=auto_unload_B_model,
+            B_model_keep_alive=B_model_keep_alive,
             **kwargs,
         )
 

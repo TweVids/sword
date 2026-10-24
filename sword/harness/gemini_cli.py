@@ -1,25 +1,29 @@
 """
-Gemini CLI Harness: Function-calling and multi-turn tool interaction harness,
-handling structured call:tool_name{args} syntax and telemetry with environment feedback.
+Gemini CLI Harness: Function-calling and multi-turn tool interaction harness.
+Handles call:tool_name{args} and structured JSON tool invocations with real execution
+in an isolated WorkspaceSandbox environment.
 """
 
 import re
+import ast
 import json
 from typing import Dict, Any, List, Optional, Callable, Tuple
 
 from sword.harness.base import BaseHarness, HarnessResult
+from sword.harness.sandbox import WorkspaceSandbox
 
 
 class GeminiCliHarness(BaseHarness):
     """
     Harness for Gemini CLI function calling style agents.
-    Parses `call:tool_name{...}` patterns, validates argument schemas,
-    dispatches tools, and feeds results back into a multi-turn interaction loop.
+    Parses function calls, verifies parameter schemas, executes tools in a real sandbox,
+    and returns genuine observation telemetry.
     """
     name: str = "gemini_cli"
 
-    def __init__(self, allow_exec: bool = False):
-        self.allow_exec = allow_exec
+    def __init__(self, timeout_sec: float = 10.0, workspace_dir: Optional[str] = None):
+        self.timeout_sec = timeout_sec
+        self.workspace_dir = workspace_dir
 
     def extract_reasoning(self, text: str) -> str:
         """Extracts thought traces."""
@@ -30,7 +34,7 @@ class GeminiCliHarness(BaseHarness):
         return m_alt.group(1).strip() if m_alt else ""
 
     def parse_function_calls(self, text: str) -> List[Dict[str, Any]]:
-        """Parses call:func{args} or {"action": ...} patterns."""
+        """Parses call:func{args} or ```json {"action": ...}``` patterns."""
         calls = []
 
         # Pattern 1: call:tool_name{...}
@@ -60,38 +64,59 @@ class GeminiCliHarness(BaseHarness):
 
         return calls
 
-    def execute_call(self, call: Dict[str, Any]) -> Tuple[bool, str]:
-        """Validates and executes function call."""
+    def execute_call_in_sandbox(self, call: Dict[str, Any], sandbox: WorkspaceSandbox) -> Tuple[bool, str]:
+        """Validates function schema and executes real tool in sandbox."""
         if not call.get("valid_json", False):
             return False, "Malformed JSON arguments in function call."
 
         fname = str(call.get("name", "")).strip().lower()
         args = call.get("args", {})
+        if not isinstance(args, dict):
+            return False, "Function call arguments must be a JSON dictionary."
 
-        # Standard built-in tool validations
-        if fname in ("calculator", "math_eval"):
+        if fname in ("calculator", "math_eval", "eval_math"):
             expr = str(args.get("expression") or args.get("expr") or "").strip()
             if not expr:
-                return False, "Missing expression argument."
+                return False, "Missing required 'expression' parameter."
+            if not re.match(r"^[\d\s\+\-\*\/\(\)\.\%]+$", expr):
+                return False, f"Invalid characters in arithmetic expression: {expr}"
             try:
-                # Safe evaluation of basic arithmetic
-                if re.match(r"^[\d\s\+\-\*\/\(\)\.\%]+$", expr):
-                    result = eval(expr, {"__builtins__": None}, {})
-                    return True, str(result)
-                return True, "Expression parsed (emulated)"
+                # Safe AST-based evaluation of arithmetic
+                node = ast.parse(expr, mode="eval")
+                for sub in ast.walk(node):
+                    if not isinstance(sub, (ast.Expression, ast.BinOp, ast.UnaryOp, ast.Constant, ast.Num, ast.operator, ast.unaryop)):
+                        return False, "Forbidden AST node in arithmetic expression."
+                result = eval(expr, {"__builtins__": {}}, {})
+                return True, str(result)
             except Exception as e:
                 return False, f"Evaluation error: {e}"
 
-        elif fname in ("bash", "shell", "run_command"):
+        elif fname in ("bash", "run_bash", "shell", "run_command"):
             cmd = str(args.get("command") or args.get("cmd") or "").strip()
             if not cmd:
-                return False, "Missing command argument."
-            return True, f"Command '{cmd[:40]}' accepted."
+                return False, "Missing required 'command' parameter."
+            return sandbox.run_bash(cmd)
 
-        elif fname in ("read_file", "search", "web_search"):
-            return True, f"Function {fname} executed successfully."
+        elif fname in ("python", "run_python", "python_eval"):
+            code = str(args.get("code") or args.get("script") or "").strip()
+            if not code:
+                return False, "Missing required 'code' parameter."
+            return sandbox.run_python(code)
 
-        return True, f"Tool {fname} executed."
+        elif fname in ("read_file", "read"):
+            path = str(args.get("path") or args.get("file") or "").strip()
+            if not path:
+                return False, "Missing required 'path' parameter."
+            return sandbox.read_file(path)
+
+        elif fname in ("write_file", "write"):
+            path = str(args.get("path") or args.get("file") or "").strip()
+            content = str(args.get("content") or "")
+            if not path:
+                return False, "Missing required 'path' parameter."
+            return sandbox.write_file(path, content)
+
+        return False, f"Unknown Gemini CLI tool: {fname}"
 
     def run(
         self,
@@ -100,7 +125,8 @@ class GeminiCliHarness(BaseHarness):
         max_turns: int = 2,
         task_id: str = "",
     ) -> HarnessResult:
-        """Runs the multi-turn Gemini CLI harness loop."""
+        """Runs the authentic Gemini CLI multi-turn function calling loop."""
+        sandbox = WorkspaceSandbox(base_dir=self.workspace_dir, timeout_sec=self.timeout_sec)
         curr_prompt = prompt
         tools_called = 0
         tools_succeeded = 0
@@ -109,38 +135,43 @@ class GeminiCliHarness(BaseHarness):
         final_text = ""
         reasoning_text = ""
 
-        for turn in range(max(1, max_turns)):
-            response = model_generate_fn(curr_prompt)
-            final_text = response
-            r = self.extract_reasoning(response)
-            if r:
-                reasoning_text = r
+        try:
+            for turn in range(max(1, max_turns)):
+                response = model_generate_fn(curr_prompt)
+                final_text = response
+                r = self.extract_reasoning(response)
+                if r:
+                    reasoning_text = r
 
-            calls = self.parse_function_calls(response)
-            if not calls:
-                break
+                calls = self.parse_function_calls(response)
+                if not calls:
+                    break
 
-            turn_feedbacks = []
-            for c in calls:
-                tools_called += 1
-                ok, output = self.execute_call(c)
-                if ok:
-                    tools_succeeded += 1
-                else:
-                    tools_failed += 1
+                turn_feedbacks = []
+                for c in calls:
+                    tools_called += 1
+                    ok, output = self.execute_call_in_sandbox(c, sandbox)
+                    if ok:
+                        tools_succeeded += 1
+                    else:
+                        tools_failed += 1
 
-                tag = "[Tool Output]" if ok else "[Tool Error]"
-                turn_feedbacks.append(f"{tag} {c.get('name')}: {output}")
-                history.append({"turn": turn, "call": c, "success": ok, "output": output})
+                    tag = "[Tool Output]" if ok else "[Tool Error]"
+                    turn_feedbacks.append(f"{tag} {c.get('name')}: {output}")
+                    history.append({"turn": turn, "call": c, "success": ok, "output": output})
 
-            if turn >= max_turns - 1:
-                break
+                if turn >= max_turns - 1:
+                    break
 
-            feedback_str = "\n".join(turn_feedbacks)
-            curr_prompt = (
-                f"{curr_prompt}\n\nModel:\n{response}\n\n"
-                f"Environment Feedback:\n{feedback_str}\nProceed to complete the response:"
-            )
+                feedback_str = "\n".join(turn_feedbacks)
+                curr_prompt = (
+                    f"{curr_prompt}\n\nModel:\n{response}\n\n"
+                    f"Gemini Environment Feedback:\n{feedback_str}\n\n"
+                    "Proceed to complete the response:"
+                )
+
+        finally:
+            sandbox.close()
 
         success_rate = (tools_succeeded / tools_called) if tools_called > 0 else 0.0
 

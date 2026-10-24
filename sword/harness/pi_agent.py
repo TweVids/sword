@@ -1,20 +1,28 @@
 """
-Pi Agent Harness: Autonomous iterative agent loop,
-tracking multi-turn plan, action, and reflection cycles.
+Pi Agent Harness: Mario Zechner's minimalist terminal coding agent harness (pi.dev).
+Ships with foundational tools (read, write, edit, bash) executed in an isolated WorkspaceSandbox,
+tracking iterative plan, action, and observation cycles.
 """
 
 import re
+import json
 from typing import Dict, Any, List, Optional, Callable, Tuple
 
 from sword.harness.base import BaseHarness, HarnessResult
+from sword.harness.sandbox import WorkspaceSandbox
 
 
 class PiHarness(BaseHarness):
     """
-    Harness for Pi autonomous coding agent.
-    Tracks structured plan, action, observation, and reflection cycles across multiple turns.
+    Harness for Pi autonomous coding agent (pi.dev).
+    Dispatches foundational tools (read, write, edit, bash) to WorkspaceSandbox.
+    Captures true execution status, observation outputs, and plan progress.
     """
     name: str = "pi"
+
+    def __init__(self, timeout_sec: float = 10.0, workspace_dir: Optional[str] = None):
+        self.timeout_sec = timeout_sec
+        self.workspace_dir = workspace_dir
 
     def extract_reasoning(self, text: str) -> str:
         """Extracts thought / plan sections."""
@@ -28,27 +36,67 @@ class PiHarness(BaseHarness):
         return m_plan.group(1).strip() if m_plan else ""
 
     def parse_actions(self, text: str) -> List[Dict[str, Any]]:
-        """Extracts explicit action steps or code actions."""
+        """Extracts Pi foundational actions (read, write, edit, bash) or code blocks."""
         actions = []
 
-        # Pattern: Action: command or code
-        for match in re.finditer(r"(?:^|\n)Action:\s*(.+?)(?=\n(?:Plan|Observation|Reflection|Action|$))", text, re.DOTALL | re.IGNORECASE):
-            act_text = match.group(1).strip()
-            if act_text:
-                actions.append({"type": "action_directive", "content": act_text})
+        # 1. Structured action directives: Action: read path / Action: bash cmd / Action: write path \n content
+        for match in re.finditer(r"(?:^|\n)Action:\s*(read|write|edit|bash|python)\s+(.+?)(?=\n(?:Plan|Observation|Reflection|Action|$))", text, re.DOTALL | re.IGNORECASE):
+            tool_name = match.group(1).lower()
+            args_raw = match.group(2).strip()
+            actions.append({"tool": tool_name, "raw_args": args_raw})
 
-        # Code actions: ```bash ... ``` or ```python ... ```
-        for match in re.finditer(r"```([a-z0-9_-]+)\n(.*?)```", text, re.DOTALL):
-            actions.append({"type": match.group(1), "content": match.group(2).strip()})
+        # 2. Markdown code execution blocks: ```(bash|python) ... ```
+        for match in re.finditer(r"```(bash|sh|python)\n(.*?)```", text, re.DOTALL):
+            lang = match.group(1).lower()
+            code = match.group(2).strip()
+            actions.append({"tool": "bash" if lang in ("bash", "sh") else "python", "raw_args": code})
+
+        # 3. JSON tool calls
+        for match in re.finditer(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL):
+            try:
+                data = json.loads(match.group(1))
+                if isinstance(data, dict) and "action" in data:
+                    actions.append({"tool": data.get("action"), "params": data.get("parameters") or {}})
+            except Exception:
+                pass
 
         return actions
 
-    def execute_action(self, action: Dict[str, Any]) -> Tuple[bool, str]:
-        """Validates action content."""
-        content = action.get("content", "").strip()
-        if not content:
-            return False, "Empty action block."
-        return True, "Action recorded and executed (emulated environment)."
+    def execute_action_in_sandbox(self, act: Dict[str, Any], sandbox: WorkspaceSandbox) -> Tuple[bool, str]:
+        """Executes Pi foundational tool in real sandbox."""
+        tool = str(act.get("tool", "")).lower()
+        raw = str(act.get("raw_args", "")).strip()
+        params = act.get("params", {})
+
+        if tool in ("bash", "sh"):
+            cmd = raw or params.get("command") or params.get("cmd") or ""
+            return sandbox.run_bash(cmd)
+
+        elif tool == "python":
+            code = raw or params.get("code") or ""
+            return sandbox.run_python(code)
+
+        elif tool in ("read", "read_file"):
+            path = raw or params.get("path") or ""
+            return sandbox.read_file(path)
+
+        elif tool in ("write", "write_file"):
+            if params:
+                path = params.get("path") or "output.txt"
+                content = params.get("content") or ""
+            else:
+                lines = raw.split("\n", 1)
+                path = lines[0].strip()
+                content = lines[1] if len(lines) > 1 else ""
+            return sandbox.write_file(path, content)
+
+        elif tool in ("edit", "edit_file"):
+            path = params.get("path") or ""
+            old_str = params.get("old_str") or ""
+            new_str = params.get("new_str") or ""
+            return sandbox.edit_file(path, old_str, new_str)
+
+        return False, f"Unknown Pi tool: {tool}"
 
     def run(
         self,
@@ -57,7 +105,8 @@ class PiHarness(BaseHarness):
         max_turns: int = 2,
         task_id: str = "",
     ) -> HarnessResult:
-        """Runs the multi-turn Pi agent interaction cycle."""
+        """Runs the authentic Pi multi-turn plan/action/observation cycle."""
+        sandbox = WorkspaceSandbox(base_dir=self.workspace_dir, timeout_sec=self.timeout_sec)
         curr_prompt = prompt
         tools_called = 0
         tools_succeeded = 0
@@ -66,37 +115,42 @@ class PiHarness(BaseHarness):
         final_text = ""
         reasoning_text = ""
 
-        for turn in range(max(1, max_turns)):
-            response = model_generate_fn(curr_prompt)
-            final_text = response
-            r = self.extract_reasoning(response)
-            if r:
-                reasoning_text = r
+        try:
+            for turn in range(max(1, max_turns)):
+                response = model_generate_fn(curr_prompt)
+                final_text = response
+                r = self.extract_reasoning(response)
+                if r:
+                    reasoning_text = r
 
-            actions = self.parse_actions(response)
-            if not actions:
-                break
+                actions = self.parse_actions(response)
+                if not actions:
+                    break
 
-            turn_feedbacks = []
-            for act in actions:
-                tools_called += 1
-                ok, msg = self.execute_action(act)
-                if ok:
-                    tools_succeeded += 1
-                else:
-                    tools_failed += 1
+                turn_feedbacks = []
+                for act in actions:
+                    tools_called += 1
+                    ok, msg = self.execute_action_in_sandbox(act, sandbox)
+                    if ok:
+                        tools_succeeded += 1
+                    else:
+                        tools_failed += 1
 
-                turn_feedbacks.append(f"Observation: {msg}")
-                history.append({"turn": turn, "action": act, "success": ok, "output": msg})
+                    tag = "Observation" if ok else "Action Error"
+                    turn_feedbacks.append(f"{tag}: {msg}")
+                    history.append({"turn": turn, "action": act, "success": ok, "output": msg})
 
-            if turn >= max_turns - 1:
-                break
+                if turn >= max_turns - 1:
+                    break
 
-            feedback_str = "\n".join(turn_feedbacks)
-            curr_prompt = (
-                f"{curr_prompt}\n\nModel:\n{response}\n\n"
-                f"{feedback_str}\nProceed to complete task or state Final Answer:"
-            )
+                feedback_str = "\n".join(turn_feedbacks)
+                curr_prompt = (
+                    f"{curr_prompt}\n\nModel:\n{response}\n\n"
+                    f"{feedback_str}\n\nProceed to complete task or state Final Answer:"
+                )
+
+        finally:
+            sandbox.close()
 
         success_rate = (tools_succeeded / tools_called) if tools_called > 0 else 0.0
 

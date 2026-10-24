@@ -1,29 +1,28 @@
 """
-OpenCode CLI Harness: Tracks bash, python, and file tool invocations,
-capturing tool execution results, success rates, and reasoning traces.
+OpenCode CLI Harness: Anomaly's terminal-first dual-agent coding harness (Plan / Build).
+Executes real bash commands, Python scripts, and workspace file tools in an isolated sandbox,
+capturing real execution status, tool success rates, and reasoning traces.
 """
 
 import re
-import ast
 import json
-import shlex
-import subprocess
 from typing import Dict, Any, List, Optional, Callable, Tuple
 
 from sword.harness.base import BaseHarness, HarnessResult
+from sword.harness.sandbox import WorkspaceSandbox
 
 
 class OpenCodeHarness(BaseHarness):
     """
     OpenCode agentic loop adapter.
-    Parses tool commands, executes safe sandboxed sub-processes or emulations,
-    and returns tool execution telemetry.
+    Dispatches tool calls to an isolated WorkspaceSandbox for real execution.
+    Tracks Plan and Build modes, real exit codes, and output telemetry.
     """
     name: str = "opencode"
 
-    def __init__(self, timeout_sec: float = 10.0, allow_exec: bool = False):
+    def __init__(self, timeout_sec: float = 10.0, workspace_dir: Optional[str] = None):
         self.timeout_sec = timeout_sec
-        self.allow_exec = allow_exec
+        self.workspace_dir = workspace_dir
 
     def extract_reasoning(self, text: str) -> str:
         """Extracts thought / reasoning channel contents."""
@@ -36,10 +35,10 @@ class OpenCodeHarness(BaseHarness):
         return ""
 
     def parse_tools(self, text: str) -> List[Dict[str, Any]]:
-        """Finds structured tool calls or code execution blocks in model output."""
+        """Parses structured OpenCode tool invocations or code blocks from model response."""
         calls = []
 
-        # 1. JSON tool_call blocks
+        # 1. OpenCode JSON tool_call blocks
         for match in re.finditer(r"<tool_call>(.*?)</tool_call>", text, re.DOTALL):
             raw = match.group(1).strip()
             try:
@@ -48,69 +47,67 @@ class OpenCodeHarness(BaseHarness):
             except Exception:
                 calls.append({"type": "tool_call", "payload": {"command": raw}, "raw": raw})
 
-        # 2. Bash / Python code blocks intended for execution
+        # 2. Markdown bash / python code execution blocks
         for match in re.finditer(r"```(bash|sh|python)\n(.*?)```", text, re.DOTALL):
-            lang = match.group(1)
+            lang = match.group(1).lower()
             code = match.group(2).strip()
             calls.append({"type": lang, "payload": {"code": code}, "raw": code})
 
+        # 3. File directive blocks: ```file:path/to/file.ext\ncontent\n```
+        for match in re.finditer(r"```file:([^\n]+)\n(.*?)```", text, re.DOTALL):
+            fpath = match.group(1).strip()
+            fcontent = match.group(2)
+            calls.append({"type": "write_file", "payload": {"path": fpath, "content": fcontent}, "raw": fcontent})
+
         return calls
 
-    def execute_tool(self, call: Dict[str, Any]) -> Tuple[bool, str]:
-        """Safely runs or validates tool invocation."""
+    def execute_tool_in_sandbox(self, call: Dict[str, Any], sandbox: WorkspaceSandbox) -> Tuple[bool, str]:
+        """Dispatches tool call to real sandbox execution."""
         ctype = call.get("type", "")
         payload = call.get("payload", {})
-        raw = call.get("raw", "")
 
-        # Reject dangerous shell instructions
-        dangerous_patterns = ("rm -rf /", ":(){ :|:& };:", "dd if=/dev/zero", "mkfs.")
-        if any(bad in raw for bad in dangerous_patterns):
-            return False, "Tool execution rejected: dangerous command pattern detected."
+        if ctype in ("bash", "sh"):
+            cmd = payload.get("code") or payload.get("command") or call.get("raw", "")
+            return sandbox.run_bash(cmd)
 
-        if not self.allow_exec:
-            # Emulated / safe validation without spawning real host shell
-            if ctype == "python":
-                code = payload.get("code") or raw
-                try:
-                    ast.parse(code)
-                    return True, "Executed successfully (valid Python syntax)"
-                except SyntaxError as e:
-                    return False, f"SyntaxError: {e.msg} at line {e.lineno}"
-            elif ctype in ("bash", "sh"):
-                cmd = payload.get("code") or payload.get("command") or raw
-                try:
-                    shlex.split(cmd)
-                    if len(cmd.strip()) > 0:
-                        return True, "Executed successfully (valid shell syntax)"
-                    return False, "Empty shell command"
-                except Exception as e:
-                    return False, f"Shell parse error: {str(e)}"
-            elif ctype == "tool_call":
-                if isinstance(payload, dict) and ("command" in payload or "action" in payload or "name" in payload):
-                    return True, "Executed successfully (valid tool payload)"
-                return False, "Malformed tool_call payload"
-            return len(raw.strip()) > 0, "Executed successfully (emulated)"
+        elif ctype == "python":
+            code = payload.get("code") or call.get("raw", "")
+            return sandbox.run_python(code)
 
-        # Live execution when allow_exec is True
-        try:
-            if ctype in ("bash", "sh"):
-                cmd = payload.get("code") or payload.get("command") or raw
-                res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=self.timeout_sec)
-                ok = res.returncode == 0
-                out = res.stdout if ok else res.stderr
-                return ok, (out[:500] if out else "Success (exit code 0)")
-            elif ctype == "python":
-                code = payload.get("code") or raw
-                res = subprocess.run(["python", "-c", code], capture_output=True, text=True, timeout=self.timeout_sec)
-                ok = res.returncode == 0
-                out = res.stdout if ok else res.stderr
-                return ok, (out[:500] if out else "Success (exit code 0)")
+        elif ctype == "write_file":
+            path = payload.get("path") or "output.txt"
+            content = payload.get("content") or ""
+            return sandbox.write_file(path, content)
+
+        elif ctype == "tool_call":
+            if not isinstance(payload, dict):
+                return False, "Malformed tool_call payload: expected JSON object"
+
+            action = str(payload.get("action") or payload.get("tool") or payload.get("name") or "").lower()
+            params = payload.get("parameters") or payload.get("args") or payload
+
+            if action in ("bash", "exec", "terminal", "command"):
+                cmd = str(params.get("command") or params.get("cmd") or payload.get("command") or "")
+                return sandbox.run_bash(cmd)
+            elif action in ("python", "python_eval", "script"):
+                code = str(params.get("code") or params.get("script") or payload.get("code") or "")
+                return sandbox.run_python(code)
+            elif action in ("write", "write_file", "create_file"):
+                path = str(params.get("path") or params.get("file") or "workspace.txt")
+                content = str(params.get("content") or "")
+                return sandbox.write_file(path, content)
+            elif action in ("read", "read_file"):
+                path = str(params.get("path") or params.get("file") or "")
+                return sandbox.read_file(path)
+            elif action in ("edit", "edit_file"):
+                path = str(params.get("path") or "")
+                old_str = str(params.get("old_str") or "")
+                new_str = str(params.get("new_str") or "")
+                return sandbox.edit_file(path, old_str, new_str)
             else:
-                return True, "Tool recognized"
-        except subprocess.TimeoutExpired:
-            return False, f"Execution timed out after {self.timeout_sec}s"
-        except Exception as e:
-            return False, str(e)[:200]
+                return False, f"Unknown OpenCode tool action: {action}"
+
+        return False, f"Unrecognized tool type: {ctype}"
 
     def run(
         self,
@@ -119,7 +116,8 @@ class OpenCodeHarness(BaseHarness):
         max_turns: int = 3,
         task_id: str = "",
     ) -> HarnessResult:
-        """Executes multi-turn tool interaction loop."""
+        """Executes the authentic OpenCode multi-turn interaction loop in a WorkspaceSandbox."""
+        sandbox = WorkspaceSandbox(base_dir=self.workspace_dir, timeout_sec=self.timeout_sec)
         curr_prompt = prompt
         tools_called = 0
         tools_succeeded = 0
@@ -128,42 +126,48 @@ class OpenCodeHarness(BaseHarness):
         final_text = ""
         reasoning_text = ""
 
-        for turn in range(max(1, max_turns)):
-            response = model_generate_fn(curr_prompt)
-            final_text = response
-            r_chunk = self.extract_reasoning(response)
-            if r_chunk:
-                reasoning_text = r_chunk
+        try:
+            for turn in range(max(1, max_turns)):
+                response = model_generate_fn(curr_prompt)
+                final_text = response
+                r_chunk = self.extract_reasoning(response)
+                if r_chunk:
+                    reasoning_text = r_chunk
 
-            calls = self.parse_tools(response)
-            if not calls:
-                # No more tools called, task finished
-                break
+                calls = self.parse_tools(response)
+                if not calls:
+                    break
 
-            for c in calls:
-                tools_called += 1
-                ok, output = self.execute_tool(c)
-                if ok:
-                    tools_succeeded += 1
-                else:
-                    tools_failed += 1
+                turn_feedbacks = []
+                for c in calls:
+                    tools_called += 1
+                    ok, output = self.execute_tool_in_sandbox(c, sandbox)
+                    if ok:
+                        tools_succeeded += 1
+                    else:
+                        tools_failed += 1
 
-                history.append({
-                    "turn": turn,
-                    "call": c,
-                    "success": ok,
-                    "output": output,
-                })
+                    tag = "[Tool Success]" if ok else "[Tool Failed]"
+                    turn_feedbacks.append(f"{tag}: {output}")
+                    history.append({
+                        "turn": turn,
+                        "call": c,
+                        "success": ok,
+                        "output": output,
+                    })
 
-            if turn < max_turns - 1:
-                # Append tool outputs for next turn
-                recent_calls = history[-len(calls):]
-                feedbacks = []
-                for h in recent_calls:
-                    tag = "[Tool Result]" if h["success"] else "[Tool Error]"
-                    feedbacks.append(f"{tag}: {h['output']}")
-                tool_feedback = "\n".join(feedbacks)
-                curr_prompt = f"{curr_prompt}\n\nModel:\n{response}\n\nEnvironment:\n{tool_feedback}\n\nProceed:"
+                if turn >= max_turns - 1:
+                    break
+
+                feedback_block = "\n".join(turn_feedbacks)
+                curr_prompt = (
+                    f"{curr_prompt}\n\nModel:\n{response}\n\n"
+                    f"OpenCode Environment:\n{feedback_block}\n\n"
+                    "Proceed to next action or output final solution:"
+                )
+
+        finally:
+            sandbox.close()
 
         success_rate = (tools_succeeded / tools_called) if tools_called > 0 else 0.0
 

@@ -57,7 +57,8 @@ class ModelBJudgeConfig:
     reasoning: Optional[str] = None
     force_gpu: bool = True
     use_mmap: bool = False
-    auto_unload: bool = False
+    auto_unload: bool = True
+    keep_alive_during_eval: str = "5m"
 
 
 class ModelBJudge:
@@ -120,8 +121,20 @@ class ModelBJudge:
         except Exception:
             return False
 
+    def check_memory_guard(self, min_free_vram_mb: int = 2048) -> bool:
+        """Verifies sufficient free VRAM exists before inference, clearing cache if tight."""
+        if torch is not None and torch.cuda.is_available():
+            free_bytes, _ = torch.cuda.mem_get_info()
+            if (free_bytes // (1024 * 1024)) < min_free_vram_mb:
+                gc.collect()
+                torch.cuda.empty_cache()
+                free_bytes, _ = torch.cuda.mem_get_info()
+                return (free_bytes // (1024 * 1024)) >= min_free_vram_mb
+        return True
+
     def prepare_for_eval(self):
-        """Clears PyTorch CUDA allocations before running Model B."""
+        """Clears PyTorch CUDA allocations and verifies memory guard before running Model B."""
+        self.check_memory_guard()
         gc.collect()
         if torch is not None and torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -281,7 +294,7 @@ class ModelBJudge:
                 {"role": "user", "content": user_content},
             ],
             "stream": False,
-            "keep_alive": -1,
+            "keep_alive": self.config.keep_alive_during_eval,
             "options": options,
         }
         if self.config.reasoning:

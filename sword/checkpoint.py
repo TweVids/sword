@@ -70,22 +70,23 @@ class CheckpointManager:
         return hasher.hexdigest()
 
     def get_completed_dataset_hashes(self) -> Set[str]:
-        """Collects all SHA-256 hashes recorded in local data_complete.logs."""
+        """
+        Collects all completed SHA-256 hashes recorded in the authoritative data_complete.logs.
+        Only reads the validated master log file in output_dir to prevent aborted runs from corrupting history.
+        """
         completed_hashes: Set[str] = set()
-        log_patterns = [
-            os.path.join(self.output_dir, "data_complete.logs"),
-            os.path.join(self.output_dir, "checkpoint-*", "data_complete.logs"),
-        ]
-        for pat in log_patterns:
-            for log_file in glob.glob(pat):
-                try:
-                    with open(log_file, "r", encoding="utf-8") as f:
-                        for line in f:
-                            h = line.strip().split()[0] if line.strip() else ""
+        main_log = os.path.join(self.output_dir, "data_complete.logs")
+        if os.path.isfile(main_log):
+            try:
+                with open(main_log, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line_str = line.strip()
+                        if line_str and not line_str.startswith("#"):
+                            h = line_str.split()[0]
                             if h:
                                 completed_hashes.add(h)
-                except Exception:
-                    pass
+            except Exception:
+                pass
         return completed_hashes
 
     def is_dataset_completed(self, dataset_hash: str) -> bool:
@@ -93,19 +94,27 @@ class CheckpointManager:
         return dataset_hash in self.get_completed_dataset_hashes()
 
     def mark_dataset_completed(self, dataset_hash: str, dataset_name: str = ""):
-        """Appends dataset hash to global data_complete.logs."""
+        """Appends validated dataset hash to global data_complete.logs."""
         main_log = os.path.join(self.output_dir, "data_complete.logs")
         with open(main_log, "a", encoding="utf-8") as f:
             f.write(f"{dataset_hash}  {dataset_name}\n")
+            f.flush()
 
     def find_latest_checkpoint(self, resume_query: Optional[str] = None) -> Optional[str]:
         """
         Discovers the matching or latest checkpoint-xxx directory locally or on Hugging Face.
-        Compares step numbers across local and remote repositories to select the newest state.
+        Only resumes if resume_query is explicitly requested (not None or empty).
         """
+        if not resume_query or not str(resume_query).strip():
+            return None
+
+        clean_query = str(resume_query).strip()
+        if clean_query.lower() in ("none", "false", "0"):
+            return None
+
         # 1. Exact path match
-        if resume_query and os.path.isdir(resume_query):
-            return resume_query
+        if os.path.isdir(clean_query):
+            return clean_query
 
         # 2. Local search in output_dir
         local_ckpts: Dict[int, str] = {}
@@ -115,13 +124,12 @@ class CheckpointManager:
                 local_ckpts[int(m.group(1))] = p
 
         query_step: Optional[int] = None
-        if resume_query:
-            clean_q = os.path.basename(resume_query.rstrip("/\\"))
-            m_q = re.search(r"(?:checkpoint-)?(\d+)$", clean_q)
-            if m_q:
-                query_step = int(m_q.group(1))
+        clean_name = os.path.basename(clean_query.rstrip("/\\"))
+        m_q = re.search(r"(?:checkpoint-)?(\d+)$", clean_name)
+        if m_q:
+            query_step = int(m_q.group(1))
 
-        # If a specific step query was given and found locally
+        # If a specific step was requested and exists locally
         if query_step is not None and query_step in local_ckpts:
             return local_ckpts[query_step]
 
@@ -136,11 +144,9 @@ class CheckpointManager:
                         step_num = int(m.group(2))
                         remote_ckpts[step_num] = m.group(1)
 
-                # If query requested a specific step available remotely
                 target_step = query_step if query_step is not None else (max(remote_ckpts.keys()) if remote_ckpts else None)
-
-                # If remote has a newer step than local, or matches query
                 local_max_step = max(local_ckpts.keys()) if local_ckpts else -1
+
                 if target_step is not None and (query_step is not None or target_step > local_max_step):
                     target_name = remote_ckpts[target_step]
                     local_target = os.path.join(self.output_dir, target_name)
@@ -157,8 +163,8 @@ class CheckpointManager:
             except Exception as e:
                 print(f"[CheckpointManager] Remote checkpoint lookup notice: {e}")
 
-        # Return latest local checkpoint if available
-        if local_ckpts:
+        # If query was 'latest' or 'auto', return newest local checkpoint
+        if clean_query.lower() in ("latest", "auto", "true", "1") and local_ckpts:
             latest_local_step = max(local_ckpts.keys())
             return local_ckpts[latest_local_step]
 
@@ -252,14 +258,16 @@ class CheckpointManager:
                 for entry in reward_logs:
                     f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
-        # 5. Copy / update data_complete.logs into checkpoint
+        # 5. Handle data_complete.logs:
+        # If completed_dataset_hash is provided, write to authoritative log
+        if completed_dataset_hash:
+            self.mark_dataset_completed(completed_dataset_hash)
+
+        # Copy authoritative log into checkpoint directory if it exists
         main_log = os.path.join(self.output_dir, "data_complete.logs")
         ckpt_log = os.path.join(ckpt_dir, "data_complete.logs")
         if os.path.exists(main_log):
             shutil.copy2(main_log, ckpt_log)
-        elif completed_dataset_hash:
-            with open(ckpt_log, "w", encoding="utf-8") as f:
-                f.write(f"{completed_dataset_hash}\n")
 
         # 6. Save optimizer state if provided
         if optimizer is not None:

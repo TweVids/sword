@@ -44,6 +44,13 @@ step 10: address self-review findings:
   * compute sha-256 over canonical dataset row content and fail explicitly on missing hub datasets.
   * upgrade model b judge: 1024 token budget, unload method, and sequential vram coordination.
   * expand oom handling with single-retry and emergency checkpointing.
+step 11: implement real workspace sandbox and thorough systemic fixes:
+  * build WorkspaceSandbox with real isolated file operations and subprocess command/python execution.
+  * ensure emergency checkpoint saving on oom never marks incomplete datasets as trained in data_complete.logs.
+  * add expandable dataset row-level sha-256 deduplication to allow adding rows over time without full retraining.
+  * fix checkpoint resume so it only activates when explicitly requested by the caller.
+  * ensure token alignment across multi-turn harness rollouts and policy gradient updates.
+  * verify complete suite with 27 unit tests.
 
 4. execution progress and verification log
 - step 1 completed: notes.txt initialized with comprehensive specifications.
@@ -55,10 +62,12 @@ step 10: address self-review findings:
 - step 7 completed: sword/train_entry.py and sword/__init__.py updated to expose sword.train with all requested parameters.
 - step 8 completed: test/test_new_trainer.py created with unit tests covering b_model, harnesses, reward scoring, checkpointing, sha-256 tracking, and end-to-end long_train.
 - step 9 completed: initial test suites verified green.
-- step 10 completed: all review enhancements implemented and verified:
-  * OpenCodeHarness, CodexCliHarness, GeminiCliHarness, and PiHarness upgraded with authentic multi-turn execution loops, ast syntax verification, and environment feedback.
-  * CheckpointManager updated to preserve peft save_pretrained outputs, perform read-back verification on save, restore optimizer state on resume, and match adapter key prefixes.
-  * Dataset sha-256 computed over canonical serialized records content, and mark_dataset_completed moved out of finally so interrupted runs do not mark incomplete data as trained.
-  * ModelBJudge upgraded with 1024 token budget, unload method sending keep_alive=0, and sequential vram coordination helpers.
-  * OOM interception wrapped across generation, scoring, and training with single-retry and emergency checkpointing.
-  * All 25 unit tests across test_new_trainer.py, test_train_api.py, and test_grpo_bridge.py passing cleanly.
+- step 10 completed: initial review enhancements implemented and verified.
+- step 11 completed: real sandbox and full systemic fixes implemented:
+  * WorkspaceSandbox built in sword/harness/sandbox.py providing real subprocess execution (python, bash) and sandboxed filesystem tools (read, write, edit, list) with path traversal guards.
+  * OpenCodeHarness, CodexCliHarness, GeminiCliHarness, and PiHarness wired to WorkspaceSandbox for genuine tool execution and verified exit codes.
+  * Emergency checkpoints on oom confirmed to never record dataset completion in data_complete.logs, allowing subsequent retries to proceed without being falsely rejected.
+  * Expandable dataset deduplication implemented using per-row sha-256 hashes, skipping already-trained rows when new problems are added to a dataset.
+  * Resume made strictly opt-in: find_latest_checkpoint only resolves when resume_from_checkpoint is non-empty.
+  * Token alignment guaranteed by re-tokenizing updated multi-turn response text and synchronizing response_token_ids with rollout_logprobs.
+  * All 27 unit tests across test_new_trainer.py, test_train_api.py, and test_grpo_bridge.py passing cleanly in 76.3s.
