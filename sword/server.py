@@ -242,6 +242,8 @@ class FastServer:
         backbone = getattr(self.model, "model", self.model)
         if hasattr(backbone, "base_model"):
             backbone = getattr(backbone, "base_model", backbone)
+        if hasattr(backbone, "language_model"):
+            backbone = getattr(backbone, "language_model", backbone)
         if hasattr(backbone, "model"):
             backbone = getattr(backbone, "model", backbone)
 
@@ -286,6 +288,8 @@ class FastServer:
         backbone = getattr(self.model, "model", self.model)
         if hasattr(backbone, "base_model"):
             backbone = getattr(backbone, "base_model", backbone)
+        if hasattr(backbone, "language_model"):
+            backbone = getattr(backbone, "language_model", backbone)
         if hasattr(backbone, "model"):
             backbone = getattr(backbone, "model", backbone)
 

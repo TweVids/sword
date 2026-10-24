@@ -147,15 +147,53 @@ def load_qwen_model(
         elif load_in_8bit:
             quant_config = BitsAndBytesConfig(load_in_8bit=True)
 
-        print(f"[Sword] Loading {model_name_or_path} via Transformers + BitsAndBytes...")
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name_or_path,
-            quantization_config=quant_config,
-            device_map=device_map if torch.cuda.is_available() else None,
-            # Only pass torch_dtype for non-quantized loads; quantization_config controls dtype for 4/8-bit
-            torch_dtype=dtype if quant_config is None else None,
-            trust_remote_code=True,
-        )
+        model_cls = AutoModelForCausalLM
+        try:
+            from transformers import AutoConfig
+            cfg = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
+            archs = getattr(cfg, "architectures", []) or []
+            if any("ConditionalGeneration" in a for a in archs):
+                try:
+                    from transformers import AutoModelForImageTextToText
+                    model_cls = AutoModelForImageTextToText
+                except ImportError:
+                    pass
+        except Exception:
+            pass
+
+        print(f"[Sword] Loading {model_name_or_path} via Transformers + BitsAndBytes ({model_cls.__name__})...")
+        try:
+            model = model_cls.from_pretrained(
+                model_name_or_path,
+                quantization_config=quant_config,
+                device_map=device_map if torch.cuda.is_available() else None,
+                # Only pass torch_dtype for non-quantized loads; quantization_config controls dtype for 4/8-bit
+                torch_dtype=dtype if quant_config is None else None,
+                trust_remote_code=True,
+            )
+        except Exception as e:
+            if model_cls is not AutoModelForCausalLM:
+                print(f"[Sword] {model_cls.__name__} failed ({e}), retrying with AutoModelForCausalLM...")
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_name_or_path,
+                    quantization_config=quant_config,
+                    device_map=device_map if torch.cuda.is_available() else None,
+                    torch_dtype=dtype if quant_config is None else None,
+                    trust_remote_code=True,
+                )
+            else:
+                try:
+                    from transformers import AutoModelForImageTextToText
+                    print(f"[Sword] AutoModelForCausalLM failed ({e}), retrying with AutoModelForImageTextToText...")
+                    model = AutoModelForImageTextToText.from_pretrained(
+                        model_name_or_path,
+                        quantization_config=quant_config,
+                        device_map=device_map if torch.cuda.is_available() else None,
+                        torch_dtype=dtype if quant_config is None else None,
+                        trust_remote_code=True,
+                    )
+                except Exception:
+                    raise e
 
     # Patch with pure PyTorch FlashAttention
     model = patch_qwen(model)
