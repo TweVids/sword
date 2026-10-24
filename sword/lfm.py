@@ -78,7 +78,11 @@ class StaticLfmCache(Cache):
 
         self.num_layers = getattr(config, "num_hidden_layers", 40)
         self.hidden_size = getattr(config, "hidden_size", 2048)
-        self.conv_L_cache = getattr(config, "conv_L_cache", 3)
+        self.conv_L_cache = getattr(
+            config,
+            "conv_L_cache",
+            getattr(config, "conv_kernel_size", getattr(config, "L_cache", 3)),
+        )
         self.num_attention_heads = getattr(config, "num_attention_heads", 32)
         self.num_key_value_heads = getattr(config, "num_key_value_heads", 8)
         self.head_dim = getattr(config, "head_dim", self.hidden_size // self.num_attention_heads)
@@ -344,14 +348,41 @@ def make_fast_lfm_conv_forward(original_forward):
             w2d = self.conv.weight[:, 0, :].contiguous()
             self._sword_w2d = w2d
 
+        kernel_size = w2d.shape[-1] if w2d is not None else 3
+        l_cache = getattr(
+            self,
+            "L_cache",
+            getattr(
+                self,
+                "conv_L_cache",
+                getattr(
+                    getattr(self, "config", None),
+                    "conv_L_cache",
+                    getattr(
+                        getattr(self, "config", None),
+                        "conv_kernel_size",
+                        kernel_size,
+                    ),
+                ),
+            ),
+        )
+        if not hasattr(self, "L_cache"):
+            try:
+                self.L_cache = l_cache
+            except Exception:
+                pass
+
+        layer_idx = getattr(self, "layer_idx", 0)
+        has_bias = getattr(self, "bias", getattr(self.conv, "bias", None) is not None)
+
         # 3. Single-token decode fast path ($L = 1$)
-        if seqlen == 1 and past_key_values is not None and past_key_values.has_previous_state(self.layer_idx):
+        if seqlen == 1 and past_key_values is not None and past_key_values.has_previous_state(layer_idx):
             # Update rolling conv state
-            conv_state = past_key_values.update_conv_state(bx, self.layer_idx)  # [batch, hidden_size, L_cache]
+            conv_state = past_key_values.update_conv_state(bx, layer_idx)  # [batch, hidden_size, L_cache]
 
             # Fused dot product across the kernel dimension
             conv_out = torch.sum(conv_state * w2d, dim=-1, keepdim=True)  # [batch, hidden_size, 1]
-            if self.bias and self.conv.bias is not None:
+            if has_bias and self.conv.bias is not None:
                 conv_out = conv_out + self.conv.bias.view(1, -1, 1)
 
             # Gating: y = C * conv_out
@@ -362,12 +393,12 @@ def make_fast_lfm_conv_forward(original_forward):
         # 4. Multi-token prefill path ($L > 1$)
         if past_key_values is not None:
             # Update cache with the tail of the sequence
-            pad_len = max(0, self.L_cache - seqlen)
+            pad_len = max(0, l_cache - seqlen)
             if pad_len > 0:
                 conv_state = F.pad(bx, (pad_len, 0))
             else:
-                conv_state = bx[:, :, -self.L_cache:]
-            past_key_values.update_conv_state(conv_state, self.layer_idx)
+                conv_state = bx[:, :, -l_cache:]
+            past_key_values.update_conv_state(conv_state, layer_idx)
 
         # Pure PyTorch depthwise 1D convolution with causal padding
         conv_out = self.conv(bx)[..., :seqlen]
@@ -458,6 +489,7 @@ def make_fast_lfm_attention_forward(original_forward):
         bsz, q_len, _ = hidden_states.shape
         input_shape = hidden_states.shape[:-1]
         head_dim = getattr(self, "head_dim", 64)
+        scaling = getattr(self, "scaling", head_dim ** -0.5)
         hidden_shape = (*input_shape, -1, head_dim)
 
         # 1. Projections + QK-RMSNorm
@@ -506,7 +538,7 @@ def make_fast_lfm_attention_forward(original_forward):
                     attention_mask=None,
                     dropout_p=0.0,
                     is_causal=False,
-                    scale=self.scaling,
+                    scale=scaling,
                 )
                 attn_output = attn_out_b.view(bsz, num_heads, 1, head_dim)
             else:
@@ -515,7 +547,7 @@ def make_fast_lfm_attention_forward(original_forward):
                     attention_mask=None,
                     dropout_p=0.0,
                     is_causal=False,
-                    scale=self.scaling,
+                    scale=scaling,
                 )
         elif q_len == 1 and attention_mask is not None:
             # Single-token decode with left-padding mask: respect padding mask on cached K/V
@@ -537,7 +569,7 @@ def make_fast_lfm_attention_forward(original_forward):
                     attention_mask=mask_b,
                     dropout_p=0.0,
                     is_causal=False,
-                    scale=self.scaling,
+                    scale=scaling,
                 )
                 attn_output = attn_out_b.view(bsz, num_heads, 1, head_dim)
             else:
@@ -549,7 +581,7 @@ def make_fast_lfm_attention_forward(original_forward):
                     attention_mask=attn_mask,
                     dropout_p=0.0,
                     is_causal=False,
-                    scale=self.scaling,
+                    scale=scaling,
                 )
         else:
             # Multi-token prefill or speculative verification
@@ -566,7 +598,7 @@ def make_fast_lfm_attention_forward(original_forward):
                 attention_mask=attn_mask,
                 dropout_p=0.0,
                 is_causal=is_causal and attn_mask is None,
-                scale=self.scaling,
+                scale=scaling,
             )
 
         attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, q_len, -1)
@@ -769,10 +801,25 @@ def patch_lfm(model, mode: str = "flash", patch_moe: bool = True):
 
         # 2. Patch ShortConv layers
         elif mod_cls_name in ("Lfm2MoeShortConv", "Lfm2ShortConv") or (
-            hasattr(module, "conv") and hasattr(module, "in_proj") and hasattr(module, "L_cache")
+            hasattr(module, "conv") and hasattr(module, "in_proj")
         ):
             if not hasattr(module, "_sword_original_forward"):
                 module._sword_original_forward = module.forward
+            if not hasattr(module, "L_cache"):
+                k_size = getattr(getattr(module, "conv", None), "kernel_size", [3])[0]
+                setattr(
+                    module,
+                    "L_cache",
+                    getattr(
+                        module,
+                        "conv_L_cache",
+                        getattr(
+                            getattr(module, "config", None),
+                            "conv_L_cache",
+                            getattr(getattr(module, "config", None), "conv_kernel_size", k_size),
+                        ),
+                    ),
+                )
             module.forward = types.MethodType(make_fast_lfm_conv_forward(module._sword_original_forward), module)
             patched_conv += 1
 

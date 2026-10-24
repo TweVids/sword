@@ -136,6 +136,13 @@ class TestLfm2MoeArchitecture(unittest.TestCase):
             dec_diff = (out_hf_dec - out_sword_dec).abs().max().item()
             self.assertLess(dec_diff, 1e-5, f"Conv decode step {step} diverged: {dec_diff}")
 
+        # C. Resilience when L_cache attribute is missing from module
+        if hasattr(conv_module, "L_cache"):
+            delattr(conv_module, "L_cache")
+        with torch.no_grad():
+            out_missing_attr = conv_module(x_prefill, past_key_values=cache_sword)
+        self.assertEqual(out_missing_attr.shape, (2, 7, cfg.hidden_size))
+
     # =========================================================
     # 2. Pure-PyTorch FlashAttention SDPA for Lfm2MoeAttention
     # =========================================================
