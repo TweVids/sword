@@ -28,6 +28,41 @@ def _fix_torchvision_compatibility():
 _fix_torchvision_compatibility()
 
 
+def _fix_transformers_generation_cache():
+    """
+    Prevents 'ImportError: cannot import name GenerationMixin from transformers.generation'
+    caused by stale sys.modules caches or unsloth/vLLM hot-reloads during notebook execution.
+    """
+    try:
+        import sys
+        import importlib
+
+        if "transformers.generation" in sys.modules:
+            gen_mod = sys.modules.get("transformers.generation")
+            if gen_mod is not None and not hasattr(gen_mod, "GenerationMixin"):
+                try:
+                    from transformers.generation.utils import GenerationMixin
+                    gen_mod.GenerationMixin = GenerationMixin
+                except Exception:
+                    for mod_name in list(sys.modules.keys()):
+                        if mod_name == "transformers" or mod_name.startswith("transformers."):
+                            del sys.modules[mod_name]
+                    importlib.invalidate_caches()
+
+        try:
+            import transformers.generation as _tg
+            if not hasattr(_tg, "GenerationMixin"):
+                from transformers.generation.utils import GenerationMixin as _GM
+                _tg.GenerationMixin = _GM
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+_fix_transformers_generation_cache()
+
+
 def _fix_transformers_fp8_quantizer_bug():
     """
     Hotfixes upstream Transformers bug in FineGrainedFP8HfQuantizer.update_tp_plan

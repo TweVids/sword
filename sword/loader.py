@@ -1,6 +1,15 @@
 import os
 import torch
 from typing import Optional, Tuple
+
+try:
+    import transformers.generation as _tg
+    if not hasattr(_tg, "GenerationMixin"):
+        from transformers.generation.utils import GenerationMixin as _GM
+        _tg.GenerationMixin = _GM
+except Exception:
+    pass
+
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from .patcher import patch_qwen
 from .lfm import FastLfm2MoeModel
