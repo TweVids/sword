@@ -30,6 +30,14 @@ except ImportError:
     class Cache:
         pass
 
+try:
+    from torch.nn.attention.flex_attention import flex_attention, BlockMask
+    _HAS_FLEX_ATTENTION = True
+except Exception:
+    flex_attention = None
+    BlockMask = None
+    _HAS_FLEX_ATTENTION = False
+
 
 # =====================================================================
 # 1. Zero-Allocation Static Hybrid Cache (KV Cache + Conv Cache)
@@ -334,7 +342,12 @@ def make_fast_lfm_conv_forward(original_forward):
         bsz = hidden_states.shape[0]
 
         # 1. Padding mask tuning if provided
-        if attention_mask is not None and attention_mask.shape[1] > 1 and attention_mask.shape[0] > 1:
+        if (
+            isinstance(attention_mask, torch.Tensor)
+            and getattr(attention_mask, "ndim", 0) >= 2
+            and attention_mask.shape[1] > 1
+            and attention_mask.shape[0] > 1
+        ):
             hidden_states = hidden_states * attention_mask[:, :, None].to(hidden_states.dtype)
 
         # 2. In-projection [batch, seq_len, 3 * hidden_size] -> channels-first [batch, 3 * hidden_size, seq_len]
@@ -428,7 +441,7 @@ def _fast_sdpa_attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    attention_mask: Optional[torch.Tensor] = None,
+    attention_mask: Optional[Any] = None,
     dropout_p: float = 0.0,
     is_causal: bool = False,
     scale: Optional[float] = None,
@@ -438,6 +451,15 @@ def _fast_sdpa_attention(
         target_dtype = query.dtype
         key = key.to(target_dtype)
         value = value.to(target_dtype)
+
+    if attention_mask is not None and not isinstance(attention_mask, torch.Tensor):
+        if hasattr(attention_mask, "to_dense"):
+            try:
+                attention_mask = attention_mask.to_dense()
+            except Exception:
+                attention_mask = None
+        else:
+            attention_mask = None
 
     if query.is_cuda:
         try:
@@ -551,14 +573,31 @@ def make_fast_lfm_attention_forward(original_forward):
                 )
         elif q_len == 1 and attention_mask is not None:
             # Single-token decode with left-padding mask: respect padding mask on cached K/V
-            if attention_mask.ndim == 4:
-                attn_mask = attention_mask[:, :, -1:, :kv_len]
-            elif attention_mask.ndim == 2:
-                attn_mask = attention_mask[:, None, None, :kv_len].to(torch.bool)
+            if isinstance(attention_mask, torch.Tensor):
+                if attention_mask.ndim == 4:
+                    attn_mask = attention_mask[:, :, -1:, :kv_len]
+                elif attention_mask.ndim == 2:
+                    attn_mask = attention_mask[:, None, None, :kv_len].to(torch.bool)
+                else:
+                    attn_mask = attention_mask
+            elif hasattr(attention_mask, "to_dense"):
+                try:
+                    dense = attention_mask.to_dense()
+                    if isinstance(dense, torch.Tensor):
+                        if dense.ndim == 4:
+                            attn_mask = dense[:, :, -1:, :kv_len]
+                        elif dense.ndim == 2:
+                            attn_mask = dense[:, None, None, :kv_len].to(torch.bool)
+                        else:
+                            attn_mask = dense
+                    else:
+                        attn_mask = None
+                except Exception:
+                    attn_mask = None
             else:
-                attn_mask = attention_mask
+                attn_mask = None
 
-            if num_groups > 1 and attn_mask.shape[1] == 1:
+            if num_groups > 1 and attn_mask is not None and getattr(attn_mask, "ndim", 0) == 4 and attn_mask.shape[1] == 1:
                 # Zero-copy GQA view reshape with broadcast mask: [bsz * num_kv_heads, 1, 1, kv_len]
                 q_b = query_states.view(bsz * num_kv_heads, 1, num_groups, head_dim)
                 k_b = key_states.view(bsz * num_kv_heads, 1, -1, head_dim)
@@ -589,9 +628,43 @@ def make_fast_lfm_attention_forward(original_forward):
                 key_states = repeat_kv(key_states, num_groups)
                 value_states = repeat_kv(value_states, num_groups)
 
+            is_block_mask = (
+                (BlockMask is not None and isinstance(attention_mask, BlockMask))
+                or type(attention_mask).__name__ == "BlockMask"
+                or (attention_mask is not None and not isinstance(attention_mask, torch.Tensor) and hasattr(attention_mask, "to_dense"))
+            )
+            if is_block_mask and _HAS_FLEX_ATTENTION and flex_attention is not None and query_states.is_cuda:
+                try:
+                    attn_output = flex_attention(
+                        query_states,
+                        key_states,
+                        value_states,
+                        block_mask=attention_mask,
+                        scale=scaling,
+                    )
+                    attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, q_len, -1)
+                    return self.out_proj(attn_output), None
+                except Exception:
+                    pass
+
             attn_mask = attention_mask
-            if attn_mask is not None and attn_mask.ndim == 4 and attn_mask.shape[-1] > kv_len:
-                attn_mask = attn_mask[:, :, :, :kv_len]
+            if isinstance(attn_mask, torch.Tensor):
+                if attn_mask.ndim == 4 and attn_mask.shape[-1] > kv_len:
+                    attn_mask = attn_mask[:, :, :, :kv_len]
+            elif hasattr(attn_mask, "to_dense"):
+                try:
+                    dense = attn_mask.to_dense()
+                    if isinstance(dense, torch.Tensor):
+                        if dense.ndim == 4 and dense.shape[-1] > kv_len:
+                            attn_mask = dense[:, :, :, :kv_len]
+                        else:
+                            attn_mask = dense
+                    else:
+                        attn_mask = None
+                except Exception:
+                    attn_mask = None
+            else:
+                attn_mask = None
 
             attn_output = _fast_sdpa_attention(
                 query_states, key_states, value_states,

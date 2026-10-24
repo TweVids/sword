@@ -175,6 +175,18 @@ class TestLfm2MoeArchitecture(unittest.TestCase):
         diff = (out_hf - out_sword).abs().max().item()
         self.assertLess(diff, 1e-5, f"Attention output diverged: {diff}")
 
+        # Resilience against BlockMask (no .ndim, has .to_dense())
+        class MockBlockMask:
+            def __init__(self, tensor):
+                self._tensor = tensor
+            def to_dense(self):
+                return self._tensor
+
+        mock_mask = MockBlockMask(torch.ones(2, 1, 8, 8, dtype=torch.bool))
+        with torch.no_grad():
+            out_block_mask, _ = attn(x, position_embeddings=pos_emb, attention_mask=mock_mask)
+        self.assertEqual(out_block_mask.shape, out_hf.shape)
+
     # =========================================================
     # 3. Pure-PyTorch Zero-Sync MoE Dispatch
     # =========================================================
