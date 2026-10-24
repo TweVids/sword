@@ -91,7 +91,7 @@ class GeminiCliHarness(BaseHarness):
             except Exception as e:
                 return False, f"Evaluation error: {e}"
 
-        elif fname in ("bash", "run_bash", "shell", "run_command"):
+        elif fname in ("run_shell_command", "bash", "run_bash", "shell", "run_command"):
             cmd = str(args.get("command") or args.get("cmd") or "").strip()
             if not cmd:
                 return False, "Missing required 'command' parameter."
@@ -104,17 +104,35 @@ class GeminiCliHarness(BaseHarness):
             return sandbox.run_python(code)
 
         elif fname in ("read_file", "read"):
-            path = str(args.get("path") or args.get("file") or "").strip()
+            path = str(args.get("file_path") or args.get("path") or args.get("file") or "").strip()
             if not path:
-                return False, "Missing required 'path' parameter."
+                return False, "Missing required 'file_path' parameter."
             return sandbox.read_file(path)
 
         elif fname in ("write_file", "write"):
-            path = str(args.get("path") or args.get("file") or "").strip()
+            path = str(args.get("file_path") or args.get("path") or args.get("file") or "").strip()
             content = str(args.get("content") or "")
             if not path:
-                return False, "Missing required 'path' parameter."
+                return False, "Missing required 'file_path' parameter."
             return sandbox.write_file(path, content)
+
+        elif fname in ("replace", "edit", "edit_file"):
+            path = str(args.get("file_path") or args.get("path") or "").strip()
+            old_str = str(args.get("old_string") or args.get("old_str") or "")
+            new_str = str(args.get("new_string") or args.get("new_str") or "")
+            if not path:
+                return False, "Missing required 'file_path' parameter."
+            return sandbox.edit_file(path, old_str, new_str)
+
+        elif fname in ("list_directory", "ls", "list_dir"):
+            dpath = str(args.get("dir_path") or args.get("path") or ".").strip()
+            return sandbox.list_dir(dpath)
+
+        elif fname in ("grep_search", "glob"):
+            pattern = str(args.get("pattern") or "").strip()
+            if not pattern:
+                return False, "Missing required 'pattern' parameter."
+            return sandbox.list_dir(".")
 
         return False, f"Unknown Gemini CLI tool: {fname}"
 

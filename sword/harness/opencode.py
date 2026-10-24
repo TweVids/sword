@@ -86,7 +86,7 @@ class OpenCodeHarness(BaseHarness):
             action = str(payload.get("action") or payload.get("tool") or payload.get("name") or "").lower()
             params = payload.get("parameters") or payload.get("args") or payload
 
-            if action in ("bash", "exec", "terminal", "command"):
+            if action in ("shell", "bash", "exec", "terminal", "command"):
                 cmd = str(params.get("command") or params.get("cmd") or payload.get("command") or "")
                 return sandbox.run_bash(cmd)
             elif action in ("python", "python_eval", "script"):
@@ -101,8 +101,8 @@ class OpenCodeHarness(BaseHarness):
                 return sandbox.read_file(path)
             elif action in ("edit", "edit_file"):
                 path = str(params.get("path") or "")
-                old_str = str(params.get("old_str") or "")
-                new_str = str(params.get("new_str") or "")
+                old_str = str(params.get("oldString") or params.get("old_str") or "")
+                new_str = str(params.get("newString") or params.get("new_str") or "")
                 return sandbox.edit_file(path, old_str, new_str)
             else:
                 return False, f"Unknown OpenCode tool action: {action}"

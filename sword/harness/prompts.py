@@ -1,22 +1,52 @@
 """
 Harness System Prompts Loader:
-Loads authentic system prompts directly from cloned third_party repositories:
+Loads authentic system prompts and tool definitions directly from cloned third_party repositories:
 - OpenCode (third_party/opencode)
 - Pi (third_party/pi)
 - Codex CLI (third_party/codex)
 - Gemini CLI (third_party/gemini_cli)
-Provides tool usage instructions and schemas so models can interact with each playground.
+Automatically clones any missing repository shallowly on first load.
 """
 
 import os
-from typing import Dict, Optional
+import re
+from typing import Dict, List, Optional
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 THIRD_PARTY_DIR = os.path.join(REPO_ROOT, "third_party")
 
+HARNESS_GIT_REPOS: Dict[str, str] = {
+    "opencode": "https://github.com/anomalyco/opencode.git",
+    "pi": "https://github.com/earendil-works/pi.git",
+    "codex": "https://github.com/openai/codex.git",
+    "gemini_cli": "https://github.com/google-gemini/gemini-cli.git",
+}
+
+
+def ensure_harness_repo(harness_key: str) -> bool:
+    """Clones the authentic harness repo shallowly into third_party if not present."""
+    import subprocess
+    repo_url = HARNESS_GIT_REPOS.get(harness_key)
+    if not repo_url:
+        return False
+    dest_dir = os.path.join(THIRD_PARTY_DIR, harness_key)
+    if os.path.isdir(dest_dir):
+        return True
+    if os.environ.get("SWORD_AUTO_CLONE_HARNESS", "1") == "0":
+        return False
+    os.makedirs(THIRD_PARTY_DIR, exist_ok=True)
+    try:
+        print(f"[HarnessLoader] Cloning authentic harness {harness_key} from {repo_url}...")
+        subprocess.run(["git", "clone", "--depth", "1", repo_url, dest_dir], check=True, timeout=120)
+        return os.path.isdir(dest_dir)
+    except Exception as e:
+        print(f"[HarnessLoader] Note: unable to clone {harness_key}: {e}. Fallback prompts will be used.")
+        return False
+
 
 def load_opencode_prompt() -> str:
-    """Loads authentic OpenCode system prompt from cloned repository."""
+    """Loads authentic OpenCode system prompt and tool plugin schemas from cloned repository."""
+    ensure_harness_repo("opencode")
     raw_prompt_path = os.path.join(
         THIRD_PARTY_DIR,
         "opencode",
@@ -35,7 +65,7 @@ def load_opencode_prompt() -> str:
             guidance = (
                 "- Prefer dedicated tools over shell commands; fall back to the shell when a tool cannot do what you need.\n"
                 "- Use the write tool to create files or completely replace their content.\n"
-                "- Use the edit tool for targeted changes to existing text files with old_str and new_str."
+                "- Use the edit tool for targeted changes to existing text files with oldString and newString."
             )
             base_prompt = content.replace("${OPENCODE_TOOL_GUIDANCE}", guidance)
         except Exception:
@@ -43,20 +73,45 @@ def load_opencode_prompt() -> str:
     else:
         base_prompt = "You are an AI agent running in OpenCode, a coding agent harness."
 
+    # Extract tool schemas from OpenCode plugin definitions
+    plugin_dir = os.path.join(THIRD_PARTY_DIR, "opencode", "packages", "core", "src", "tool", "plugin")
+    plugin_summaries: List[str] = []
+    for tool_file, schema_hint in (
+        ("shell.ts", '{"action": "shell", "parameters": {"command": "...", "workdir": "...", "timeout": 120000}}'),
+        ("write.ts", '{"action": "write", "parameters": {"path": "...", "content": "..."}}'),
+        ("edit.ts", '{"action": "edit", "parameters": {"path": "...", "oldString": "...", "newString": "...", "replaceAll": false}}'),
+        ("read.ts", '{"action": "read", "parameters": {"path": "...", "offset": 1, "limit": 2000}}'),
+    ):
+        tpath = os.path.join(plugin_dir, tool_file)
+        desc = ""
+        if os.path.isfile(tpath):
+            try:
+                with open(tpath, "r", encoding="utf-8") as tf:
+                    tsrc = tf.read()
+                m_desc = re.search(r'editor\.add\(\{.*?description:\s*"([^"]+)"', tsrc, re.DOTALL)
+                if not m_desc:
+                    m_desc = re.search(r'description:\s*"([^"]+)"', tsrc)
+                if m_desc:
+                    desc = m_desc.group(1).split("\\n")[0]
+            except Exception:
+                pass
+        tname = tool_file.replace(".ts", "")
+        if desc:
+            plugin_summaries.append(f"- {tname}: {desc}\n  Call: <tool_call>{schema_hint}</tool_call>")
+        else:
+            plugin_summaries.append(f"- {tname}: <tool_call>{schema_hint}</tool_call>")
+
     tool_instructions = (
-        "\n\n# OpenCode Tool Protocol:\n"
-        "To invoke tools, output JSON tool_call blocks or code blocks:\n"
-        "1. Bash command: ```bash\ncommand here\n```\n"
-        "2. Python script: ```python\ncode here\n```\n"
-        "3. File writing: <tool_call>{\"action\": \"write\", \"parameters\": {\"path\": \"file.ext\", \"content\": \"...\"}}</tool_call>\n"
-        "4. File editing: <tool_call>{\"action\": \"edit\", \"parameters\": {\"path\": \"file.ext\", \"old_str\": \"...\", \"new_str\": \"...\"}}</tool_call>\n"
-        "5. File reading: <tool_call>{\"action\": \"read\", \"parameters\": {\"path\": \"file.ext\"}}</tool_call>"
+        "\n\n# OpenCode Tool Definitions:\n"
+        + "\n".join(plugin_summaries)
+        + "\n- Code execution blocks: ```bash\ncommand\n``` or ```python\ncode\n```"
     )
     return base_prompt + tool_instructions
 
 
 def load_codex_prompt() -> str:
-    """Loads authentic Codex CLI system prompt from cloned repository."""
+    """Loads authentic Codex CLI GPT-5 prompt, apply_patch grammar, and exec_command spec from cloned repository."""
+    ensure_harness_repo("codex")
     prompt_path = os.path.join(
         THIRD_PARTY_DIR,
         "codex",
@@ -73,56 +128,224 @@ def load_codex_prompt() -> str:
     else:
         base_prompt = "You are Codex, based on GPT-5. You are running as a coding agent in the Codex CLI on a user's computer."
 
-    tool_instructions = (
-        "\n\n# Codex CLI Execution Protocol:\n"
-        "To solve coding and algorithmic tasks, provide self-contained, executable Python code or commands:\n"
-        "- Enclose Python solutions and verification assertions in ```python\n...\n``` blocks.\n"
-        "- Enclose terminal verification commands in ```bash\n...\n``` blocks.\n"
-        "The harness executes your code in the sandbox and verifies syntax and unit assertions."
+    lark_path = os.path.join(
+        THIRD_PARTY_DIR,
+        "codex",
+        "codex-rs",
+        "core",
+        "assets",
+        "tools",
+        "apply_patch.lark",
     )
+    lark_grammar = ""
+    if os.path.isfile(lark_path):
+        try:
+            with open(lark_path, "r", encoding="utf-8") as lf:
+                lark_grammar = lf.read().strip()
+        except Exception:
+            pass
+
+    tool_instructions = (
+        "\n\n# Codex CLI Tool Specifications:\n"
+        "1. `exec_command` / `shell`: Execute a shell command with `{\"cmd\": \"...\", \"workdir\": \"...\"}` or inside ```bash\n...\n``` or ```python\n...\n``` blocks.\n"
+        "2. `apply_patch`: Edit, add, or delete files using the freeform patch grammar:\n"
+        "*** Begin Patch\n"
+        "*** Update File: path/to/file.py\n"
+        "@@\n"
+        "-old line\n"
+        "+new line\n"
+        "*** End Patch"
+    )
+    if lark_grammar:
+        tool_instructions += f"\n\nGrammar (`apply_patch.lark`):\n{lark_grammar}"
     return base_prompt + tool_instructions
 
 
 def load_pi_prompt() -> str:
-    """Loads authentic Pi system prompt from cloned repository."""
-    pi_md_path = os.path.join(THIRD_PARTY_DIR, "pi", "AGENTS.md")
-    rules_text = ""
-    if os.path.isfile(pi_md_path):
+    """Loads authentic Pi system prompt and tool contributions from packages/coding-agent/src/core/system-prompt.ts."""
+    ensure_harness_repo("pi")
+    sys_prompt_ts = os.path.join(
+        THIRD_PARTY_DIR,
+        "pi",
+        "packages",
+        "coding-agent",
+        "src",
+        "core",
+        "system-prompt.ts",
+    )
+    tools_dir = os.path.join(
+        THIRD_PARTY_DIR,
+        "pi",
+        "packages",
+        "coding-agent",
+        "src",
+        "core",
+        "tools",
+    )
+
+    preamble = (
+        "You are an expert coding assistant operating inside pi, a coding agent harness. "
+        "You help users by reading files, executing commands, editing code, and writing new files."
+    )
+    rules: List[str] = ["Use bash for file operations like ls, rg, find"]
+
+    if os.path.isfile(sys_prompt_ts):
         try:
-            with open(pi_md_path, "r", encoding="utf-8") as f:
-                rules_text = "\n" + f.read()[:1000]
+            with open(sys_prompt_ts, "r", encoding="utf-8") as f:
+                ts_content = f.read()
+            m_pre = re.search(r'promptSections\.preamble\s*=\s*"([^"]+)"', ts_content)
+            if m_pre:
+                preamble = m_pre.group(1)
         except Exception:
             pass
 
-    base_prompt = (
-        "You are an expert coding assistant operating inside pi, a coding agent harness (pi.dev). "
-        "You help users by reading files, executing commands, editing code, and writing new files.\n"
-        f"{rules_text}\n\n"
-        "# Pi Foundational Tool Protocol:\n"
-        "You have access to foundational tools:\n"
-        "- Action: read <path> (reads file)\n"
-        "- Action: write <path>\\n<content> (writes file)\n"
-        "- Action: edit (replaces target text in file)\n"
-        "- Action: bash <command> (executes shell command in workspace)\n"
-        "- Code blocks: ```bash ... ``` or ```python ... ``` for direct execution."
+    tool_lines: List[str] = []
+    for tname in ("read", "bash", "edit", "write"):
+        tfile = os.path.join(tools_dir, f"{tname}.ts")
+        snippet = ""
+        if os.path.isfile(tfile):
+            try:
+                with open(tfile, "r", encoding="utf-8") as tf:
+                    tcontent = tf.read()
+                m_snip = re.search(r'snippet:\s*"([^"]+)"', tcontent)
+                if m_snip:
+                    snippet = m_snip.group(1)
+                m_guide_block = re.search(r"guidelines:\s*\[(.*?)\]", tcontent, re.DOTALL)
+                if m_guide_block:
+                    for g in re.findall(r'"([^"]+)"', m_guide_block.group(1)):
+                        if g not in rules:
+                            rules.append(g)
+            except Exception:
+                pass
+        if snippet:
+            tool_lines.append(f"- {tname}: {snippet}")
+
+    rules.extend([
+        "Be concise in your responses",
+        "Show file paths clearly when working with files",
+    ])
+
+    tools_section = "\n".join(tool_lines) if tool_lines else (
+        "- read: Read file contents\n"
+        "- bash: Execute bash commands (ls, grep, find, etc.)\n"
+        "- edit: Make precise file edits with exact text replacement, including multiple disjoint edits in one call\n"
+        "- write: Create or overwrite files"
     )
-    return base_prompt
+    rules_section = "\n".join(f"- {r}" for r in rules)
+
+    schema_instructions = (
+        "\n\n<tool_schemas>\n"
+        "- read: {\"action\": \"read\", \"parameters\": {\"path\": \"...\", \"offset\": 1, \"limit\": 200}} or `Action: read <path>`\n"
+        "- bash: {\"action\": \"bash\", \"parameters\": {\"command\": \"...\"}} or `Action: bash <command>` or ```bash ... ```\n"
+        "- edit: {\"action\": \"edit\", \"parameters\": {\"path\": \"...\", \"edits\": [{\"oldText\": \"...\", \"newText\": \"...\"}]}}\n"
+        "- write: {\"action\": \"write\", \"parameters\": {\"path\": \"...\", \"content\": \"...\"}} or `Action: write <path>\\n<content>`\n"
+        "</tool_schemas>"
+    )
+
+    return (
+        f"{preamble}\n\n"
+        f"<tools>\n{tools_section}\n\nIn addition to the tools above, you may have access to other custom tools depending on the project.\n</tools>\n\n"
+        f"<rules>\n{rules_section}\n</rules>"
+        f"{schema_instructions}"
+    )
 
 
 def load_gemini_prompt() -> str:
-    """Loads authentic Gemini CLI system prompt from cloned repository."""
-    base_prompt = (
-        "You are Gemini CLI, an autonomous CLI agent specializing in software engineering tasks. "
-        "Your primary goal is to help users safely and effectively.\n\n"
-        "# Gemini CLI Function Calling Protocol:\n"
-        "To call tools, output function directives:\n"
-        "- call:calculator{\"expression\": \"<math expr>\"}\n"
-        "- call:python{\"code\": \"<python code>\"}\n"
-        "- call:bash{\"command\": \"<command>\"}\n"
-        "- call:read_file{\"path\": \"<file path>\"}\n"
-        "- call:write_file{\"path\": \"<file path>\", \"content\": \"<text>\"}"
+    """Loads authentic Gemini CLI system prompt from packages/core/src/prompts/snippets.ts and base-declarations.ts."""
+    ensure_harness_repo("gemini_cli")
+    snippets_path = os.path.join(
+        THIRD_PARTY_DIR,
+        "gemini_cli",
+        "packages",
+        "core",
+        "src",
+        "prompts",
+        "snippets.ts",
     )
-    return base_prompt
+    decls_path = os.path.join(
+        THIRD_PARTY_DIR,
+        "gemini_cli",
+        "packages",
+        "core",
+        "src",
+        "tools",
+        "definitions",
+        "base-declarations.ts",
+    )
+
+    tool_consts: Dict[str, str] = {
+        "GLOB_TOOL_NAME": "glob",
+        "GREP_TOOL_NAME": "grep_search",
+        "LS_TOOL_NAME": "list_directory",
+        "READ_FILE_TOOL_NAME": "read_file",
+        "SHELL_TOOL_NAME": "run_shell_command",
+        "WRITE_FILE_TOOL_NAME": "write_file",
+        "EDIT_TOOL_NAME": "replace",
+        "EDIT_PARAM_OLD_STRING": "old_string",
+        "GREP_PARAM_TOTAL_MAX_MATCHES": "total_max_matches",
+        "GREP_PARAM_INCLUDE_PATTERN": "include_pattern",
+        "GREP_PARAM_EXCLUDE_PATTERN": "exclude_pattern",
+        "GREP_PARAM_CONTEXT": "context",
+        "GREP_PARAM_BEFORE": "before",
+        "GREP_PARAM_AFTER": "after",
+        "READ_FILE_PARAM_START_LINE": "start_line",
+        "READ_FILE_PARAM_END_LINE": "end_line",
+    }
+
+    if os.path.isfile(decls_path):
+        try:
+            with open(decls_path, "r", encoding="utf-8") as df:
+                dcontent = df.read()
+            for k, v in re.findall(r"export const ([A-Z0-9_]+)\s*=\s*'([^']+)';", dcontent):
+                tool_consts[k] = v
+        except Exception:
+            pass
+
+    extracted_sections: List[str] = [
+        "You are Gemini CLI, an autonomous CLI agent specializing in software engineering tasks. You are currently operating in **Default** mode. Your primary goal is to help users safely and effectively."
+    ]
+
+    if os.path.isfile(snippets_path):
+        try:
+            with open(snippets_path, "r", encoding="utf-8") as sf:
+                scontent = sf.read()
+
+            # Extract Core Mandates template from renderCoreMandates
+            m_mandates = re.search(r"export function renderCoreMandates.*?return `(.*?)`\.trim\(\);", scontent, re.DOTALL)
+            if m_mandates:
+                mandates_text = m_mandates.group(1).strip()
+                mandates_text = mandates_text.replace("${formattedFilenames}", "`GEMINI.md`")
+                for k, v in tool_consts.items():
+                    mandates_text = mandates_text.replace(f"${{{k}}}", v)
+                # Strip remaining dynamic TS template expressions cleanly
+                mandates_text = re.sub(r"\$\{[^}]+\}", "", mandates_text)
+                extracted_sections.append(mandates_text)
+
+            # Extract Primary Workflows template from renderPrimaryWorkflows
+            m_workflows = re.search(r"export function renderPrimaryWorkflows.*?return `(.*?)`\.trim\(\);", scontent, re.DOTALL)
+            if m_workflows:
+                wf_text = m_workflows.group(1).strip()
+                for k, v in tool_consts.items():
+                    wf_text = wf_text.replace(f"${{formatToolName({k})}}", f"`{v}`")
+                    wf_text = wf_text.replace(f"${{{k}}}", v)
+                wf_text = re.sub(r"\$\{[^}]+\}", "", wf_text)
+                extracted_sections.append(wf_text)
+        except Exception:
+            pass
+
+    tool_protocol = (
+        "\n\n# Gemini CLI Tool Declarations:\n"
+        f"- `call:{tool_consts['SHELL_TOOL_NAME']}{{\"command\": \"<shell command>\"}}`\n"
+        f"- `call:{tool_consts['READ_FILE_TOOL_NAME']}{{\"file_path\": \"<path>\", \"start_line\": 1, \"end_line\": 200}}`\n"
+        f"- `call:{tool_consts['WRITE_FILE_TOOL_NAME']}{{\"file_path\": \"<path>\", \"content\": \"<text>\"}}`\n"
+        f"- `call:{tool_consts['EDIT_TOOL_NAME']}{{\"file_path\": \"<path>\", \"old_string\": \"<old>\", \"new_string\": \"<new>\"}}`\n"
+        f"- `call:{tool_consts['LS_TOOL_NAME']}{{\"dir_path\": \".\"}}`\n"
+        f"- `call:{tool_consts['GREP_TOOL_NAME']}{{\"pattern\": \"<regex>\"}}`\n"
+        "- `call:calculator{\"expression\": \"<math expr>\"}`\n"
+        "- `call:python{\"code\": \"<python code>\"}`"
+    )
+
+    return "\n\n".join(extracted_sections) + tool_protocol
 
 
 PROMPT_REGISTRY: Dict[str, callable] = {
@@ -136,30 +359,6 @@ PROMPT_REGISTRY: Dict[str, callable] = {
     "gemini_cli": load_gemini_prompt,
     "gemini-cli": load_gemini_prompt,
 }
-
-
-HARNESS_GIT_REPOS: Dict[str, str] = {
-    "opencode": "https://github.com/anomalyco/opencode.git",
-    "pi": "https://github.com/earendil-works/pi.git",
-    "codex": "https://github.com/openai/codex.git",
-    "gemini_cli": "https://github.com/google-gemini/gemini-cli.git",
-}
-
-
-def ensure_harness_repo(harness_key: str) -> None:
-    """Clones the authentic harness repo shallowly into third_party if not present."""
-    import subprocess
-    repo_url = HARNESS_GIT_REPOS.get(harness_key)
-    if not repo_url:
-        return
-    dest_dir = os.path.join(THIRD_PARTY_DIR, harness_key)
-    if not os.path.isdir(dest_dir):
-        os.makedirs(THIRD_PARTY_DIR, exist_ok=True)
-        try:
-            print(f"[HarnessLoader] Cloning authentic harness {harness_key} from {repo_url}...")
-            subprocess.run(["git", "clone", "--depth", "1", repo_url, dest_dir], check=True, timeout=120)
-        except Exception as e:
-            print(f"[HarnessLoader] Note: unable to clone {harness_key}: {e}. Fallback prompts will be used.")
 
 
 def get_harness_system_prompt(name: Optional[str]) -> str:

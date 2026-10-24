@@ -43,12 +43,33 @@ class BaseHarness:
         from sword.harness.prompts import get_harness_system_prompt
         return get_harness_system_prompt(self.name)
 
-    def format_prompt(self, problem: str) -> str:
-        """Combines authentic harness system prompt and tool guidelines with user problem."""
+    def format_prompt(
+        self,
+        problem: str,
+        max_prompt_chars: Optional[int] = None,
+        max_tokens: Optional[int] = None,
+    ) -> str:
+        """
+        Combines authentic harness system prompt and tool guidelines with user problem.
+        Applies a token/character budget check so the user task and tool declarations are never truncated.
+        """
         sys_prompt = self.get_system_prompt()
-        if sys_prompt:
-            return f"{sys_prompt}\n\nTask:\n{problem}"
-        return problem
+        if not sys_prompt:
+            return problem
+
+        task_block = f"\n\nTask:\n{problem}"
+        budget = max_prompt_chars
+        if budget is None and max_tokens is not None:
+            budget = max(256, int(max_tokens) * 3)
+
+        if budget is not None and len(sys_prompt) + len(task_block) > budget:
+            avail = max(128, budget - len(task_block) - 32)
+            if len(sys_prompt) > avail:
+                head_len = avail // 2
+                tail_len = avail - head_len
+                sys_prompt = sys_prompt[:head_len] + "\n...[trimmed]...\n" + sys_prompt[-tail_len:]
+
+        return f"{sys_prompt}{task_block}"
 
     def run(
         self,

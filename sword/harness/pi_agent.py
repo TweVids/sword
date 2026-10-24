@@ -51,14 +51,17 @@ class PiHarness(BaseHarness):
             code = match.group(2).strip()
             actions.append({"tool": "bash" if lang in ("bash", "sh") else "python", "raw_args": code})
 
-        # 3. JSON tool calls
-        for match in re.finditer(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL):
-            try:
-                data = json.loads(match.group(1))
-                if isinstance(data, dict) and "action" in data:
-                    actions.append({"tool": data.get("action"), "params": data.get("parameters") or {}})
-            except Exception:
-                pass
+        # 3. JSON tool calls (markdown json blocks or <tool_call> blocks)
+        for pattern in (r"```json\s*(\{.*?\})\s*```", r"<tool_call>\s*(\{.*?\})\s*</tool_call>"):
+            for match in re.finditer(pattern, text, re.DOTALL):
+                try:
+                    data = json.loads(match.group(1))
+                    if isinstance(data, dict):
+                        tool_name = data.get("action") or data.get("tool") or data.get("name")
+                        if tool_name:
+                            actions.append({"tool": tool_name, "params": data.get("parameters") or data.get("args") or data})
+                except Exception:
+                    pass
 
         return actions
 
@@ -92,8 +95,18 @@ class PiHarness(BaseHarness):
 
         elif tool in ("edit", "edit_file"):
             path = params.get("path") or ""
-            old_str = params.get("old_str") or ""
-            new_str = params.get("new_str") or ""
+            edits = params.get("edits")
+            if isinstance(edits, list) and edits:
+                for entry in edits:
+                    if isinstance(entry, dict):
+                        old_t = str(entry.get("oldText") or entry.get("old_str") or "")
+                        new_t = str(entry.get("newText") or entry.get("new_str") or "")
+                        ok, msg = sandbox.edit_file(path, old_t, new_t)
+                        if not ok:
+                            return False, msg
+                return True, f"Successfully applied {len(edits)} edit(s) to {path}"
+            old_str = params.get("oldText") or params.get("old_str") or ""
+            new_str = params.get("newText") or params.get("new_str") or ""
             return sandbox.edit_file(path, old_str, new_str)
 
         return False, f"Unknown Pi tool: {tool}"

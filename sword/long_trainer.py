@@ -360,8 +360,13 @@ def run_long_train(
                     del reward_history_logs[log_start_len:]
 
                 try:
-                    # Rollout Phase with authentic harness prompt injection
-                    rollout_prompt = harness.format_prompt(current_row.problem) if harness is not None else current_row.problem
+                    # Rollout Phase with authentic harness prompt injection and token-budget guard
+                    prompt_token_budget = max(128, max_seq_len - max_new_tokens)
+                    rollout_prompt = (
+                        harness.format_prompt(current_row.problem, max_tokens=prompt_token_budget)
+                        if harness is not None
+                        else current_row.problem
+                    )
                     prompts = [rollout_prompt]
                     batch = bridge.generate_rollouts(prompts)
 
@@ -548,9 +553,18 @@ def run_long_train(
         )
         print(f"\n[Sword] Training process recorded. Final checkpoint: {final_ckpt}")
 
+    if completed_successfully and all_rows_visited:
+        run_status = "completed"
+    elif completed_successfully:
+        run_status = "partial"
+    else:
+        run_status = "interrupted"
+
     return {
-        "status": "completed" if completed_successfully else "interrupted",
+        "status": run_status,
         "final_step": current_step,
+        "visited_rows": len(visited_row_hashes),
+        "total_rows": len(records),
         "dataset_sha256": dataset_sha256,
         "checkpoint_dir": final_ckpt,
     }

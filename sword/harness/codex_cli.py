@@ -6,6 +6,7 @@ exit codes, and driving multi-turn self-repair.
 
 import re
 import ast
+import json
 from typing import Dict, Any, List, Optional, Callable, Tuple
 
 from sword.harness.base import BaseHarness, HarnessResult
@@ -15,8 +16,8 @@ from sword.harness.sandbox import WorkspaceSandbox
 class CodexCliHarness(BaseHarness):
     """
     Codex CLI style benchmark and code execution harness.
-    Validates Python AST syntax, executes code in isolated WorkspaceSandbox,
-    and runs multi-turn error correction loops with real runtime feedback.
+    Supports Codex apply_patch freeform grammar, exec_command tool calls,
+    and Python/Bash blocks in an isolated WorkspaceSandbox.
     """
     name: str = "codex_cli"
 
@@ -39,9 +40,75 @@ class CodexCliHarness(BaseHarness):
         blocks = []
         for m in re.finditer(r"```(?:python|py)?\n(.*?)```", text, re.DOTALL):
             code = m.group(1).strip()
-            if code:
+            if code and not code.startswith("*** Begin Patch"):
                 blocks.append(code)
         return blocks
+
+    def extract_patches(self, text: str) -> List[str]:
+        """Extracts Codex apply_patch blocks (*** Begin Patch ... *** End Patch)."""
+        return [m.group(1).strip() for m in re.finditer(r"\*\*\* Begin Patch\s*\n(.*?)\*\*\* End Patch", text, re.DOTALL)]
+
+    def extract_exec_commands(self, text: str) -> List[str]:
+        """Extracts Codex exec_command JSON payloads or bash blocks."""
+        cmds: List[str] = []
+        for m in re.finditer(r"```(?:bash|sh)\n(.*?)```", text, re.DOTALL):
+            c = m.group(1).strip()
+            if c:
+                cmds.append(c)
+        for m in re.finditer(r"(\{[^{}]*\"cmd\"\s*:\s*\"[^\"]+\"[^{}]*\})", text):
+            try:
+                obj = json.loads(m.group(1))
+                if isinstance(obj, dict) and obj.get("cmd"):
+                    cmds.append(str(obj["cmd"]))
+            except Exception:
+                pass
+        return cmds
+
+    def apply_codex_patch(self, patch_body: str, sandbox: WorkspaceSandbox) -> Tuple[bool, str]:
+        """Applies a Codex apply_patch hunk block inside the sandbox."""
+        lines = patch_body.splitlines()
+        i = 0
+        applied_files: List[str] = []
+        while i < len(lines):
+            line = lines[i]
+            if line.startswith("*** Add File: "):
+                fname = line[len("*** Add File: "):].strip()
+                i += 1
+                added_lines = []
+                while i < len(lines) and not lines[i].startswith("*** "):
+                    if lines[i].startswith("+"):
+                        added_lines.append(lines[i][1:])
+                    i += 1
+                ok, msg = sandbox.write_file(fname, "\n".join(added_lines))
+                if not ok:
+                    return False, msg
+                applied_files.append(f"added {fname}")
+            elif line.startswith("*** Update File: "):
+                fname = line[len("*** Update File: "):].strip()
+                i += 1
+                old_chunk: List[str] = []
+                new_chunk: List[str] = []
+                while i < len(lines) and not lines[i].startswith("*** "):
+                    cur = lines[i]
+                    if cur.startswith("@@"):
+                        pass
+                    elif cur.startswith("-"):
+                        old_chunk.append(cur[1:])
+                    elif cur.startswith("+"):
+                        new_chunk.append(cur[1:])
+                    elif cur.startswith(" "):
+                        old_chunk.append(cur[1:])
+                        new_chunk.append(cur[1:])
+                    i += 1
+                ok, msg = sandbox.edit_file(fname, "\n".join(old_chunk), "\n".join(new_chunk))
+                if not ok:
+                    return False, msg
+                applied_files.append(f"updated {fname}")
+            else:
+                i += 1
+        if not applied_files:
+            return False, "No valid hunks found in patch."
+        return True, "Applied patch: " + ", ".join(applied_files)
 
     def validate_and_execute(self, code: str, sandbox: WorkspaceSandbox) -> Tuple[bool, str]:
         """Performs real AST syntax check followed by real subprocess execution in sandbox."""
@@ -82,13 +149,42 @@ class CodexCliHarness(BaseHarness):
                 if r:
                     reasoning_text = r
 
+                patches = self.extract_patches(response)
+                exec_cmds = self.extract_exec_commands(response)
                 code_blocks = self.extract_code_blocks(response)
-                if not code_blocks:
+
+                if not patches and not exec_cmds and not code_blocks:
                     break
 
                 turn_succeeded = 0
                 turn_failed = 0
                 feedback_items = []
+
+                for p_idx, patch_body in enumerate(patches):
+                    tools_called += 1
+                    ok, msg = self.apply_codex_patch(patch_body, sandbox)
+                    if ok:
+                        tools_succeeded += 1
+                        turn_succeeded += 1
+                        feedback_items.append(f"Patch {p_idx + 1} Passed: {msg}")
+                    else:
+                        tools_failed += 1
+                        turn_failed += 1
+                        feedback_items.append(f"Patch {p_idx + 1} Failed: {msg}")
+                    history.append({"turn": turn, "tool": "apply_patch", "success": ok, "message": msg})
+
+                for c_idx, cmd in enumerate(exec_cmds):
+                    tools_called += 1
+                    ok, msg = sandbox.run_bash(cmd)
+                    if ok:
+                        tools_succeeded += 1
+                        turn_succeeded += 1
+                        feedback_items.append(f"Command {c_idx + 1} Passed: {msg}")
+                    else:
+                        tools_failed += 1
+                        turn_failed += 1
+                        feedback_items.append(f"Command {c_idx + 1} Failed: {msg}")
+                    history.append({"turn": turn, "tool": "exec_command", "success": ok, "message": msg})
 
                 for idx, block in enumerate(code_blocks):
                     tools_called += 1

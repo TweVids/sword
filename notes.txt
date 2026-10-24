@@ -89,3 +89,15 @@ step 11: implement real workspace sandbox and thorough systemic fixes:
     - Only mark entire dataset complete if all rows were visited and steps completed.
   * Added test_partial_dataset_train_only_marks_visited_rows in test/test_new_trainer.py.
   * Verified full suite: 28 unit tests passing cleanly in 76.8s.
+- step 13 completed: addressed self-review items for upstream prompts, schemas, token budget, and partial status:
+  * Wired ensure_harness_repo into all four prompt loaders so missing third_party repos are automatically cloned.
+  * Extracted genuine upstream prompts and tool definitions from all four cloned repos:
+    - OpenCode: packages/core/src/session/runner/prompt/system.txt + packages/core/src/tool/plugin/{shell.ts,write.ts,edit.ts,read.ts}.
+    - Codex: codex-rs/core/gpt_5_codex_prompt.md + codex-rs/core/assets/tools/apply_patch.lark + shell_spec.rs.
+    - Pi: packages/coding-agent/src/core/system-prompt.ts + packages/coding-agent/src/core/tools/{read.ts,bash.ts,edit.ts,write.ts}.
+    - Gemini CLI: packages/core/src/prompts/snippets.ts (renderPreamble, renderCoreMandates, renderPrimaryWorkflows) + packages/core/src/tools/definitions/base-declarations.ts.
+  * Added upstream tool schema execution in OpenCodeHarness, CodexCliHarness (apply_patch freeform grammar + exec_command), PiHarness (edits[] array), and GeminiCliHarness (run_shell_command, replace, read_file, write_file, list_directory).
+  * Added token/character budget guard in BaseHarness.format_prompt and sword/long_trainer.py so long harness prompts never truncate the task.
+  * Updated sword/long_trainer.py to return status="partial" (with visited_rows and total_rows) when steps < dataset row count.
+  * Added test_upstream_prompts_and_schemas_and_budget_guard in test/test_new_trainer.py.
+  * Verified full suite: 29 unit tests passing cleanly in 79.3s.

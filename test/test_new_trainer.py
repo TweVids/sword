@@ -474,7 +474,9 @@ class TestNewTrainerArchitecture(unittest.TestCase):
             Argument={"steps": 1, "concurrency_g": 2, "output_dir": out_dir},
             show_detail_logs=False,
         )
-        self.assertEqual(res.get("status"), "completed")
+        self.assertEqual(res.get("status"), "partial")
+        self.assertEqual(res.get("visited_rows"), 1)
+        self.assertEqual(res.get("total_rows"), 3)
 
         # Entire dataset must NOT be marked completed because 2 rows remain unvisited
         ckpt_mgr = CheckpointManager(output_dir=out_dir)
@@ -487,6 +489,76 @@ class TestNewTrainerArchitecture(unittest.TestCase):
         self.assertIn(records[0].row_hash, completed_hashes)
         self.assertNotIn(records[1].row_hash, completed_hashes)
         self.assertNotIn(records[2].row_hash, completed_hashes)
+
+    def test_upstream_prompts_and_schemas_and_budget_guard(self):
+        from sword.harness.prompts import (
+            load_opencode_prompt,
+            load_codex_prompt,
+            load_pi_prompt,
+            load_gemini_prompt,
+        )
+
+        # 1. Verify ensure_harness_repo is invoked by all 4 prompt loaders
+        with patch("sword.harness.prompts.ensure_harness_repo", return_value=True) as mock_ensure:
+            opencode_p = load_opencode_prompt()
+            codex_p = load_codex_prompt()
+            pi_p = load_pi_prompt()
+            gemini_p = load_gemini_prompt()
+            called_keys = [c.args[0] for c in mock_ensure.call_args_list]
+            self.assertEqual(called_keys, ["opencode", "codex", "pi", "gemini_cli"])
+
+        # 2. Verify authentic upstream text extracted from third_party/ files
+        self.assertIn("You are an AI agent running in OpenCode", opencode_p)
+        self.assertIn("Writes a file to the local filesystem", opencode_p)
+        self.assertIn("You are Codex, based on GPT-5", codex_p)
+        self.assertIn("*** Begin Patch", codex_p)
+        self.assertIn("You are an expert coding assistant operating inside pi, a coding agent harness.", pi_p)
+        self.assertIn("Make precise file edits with exact text replacement", pi_p)
+        self.assertIn("# Core Mandates", gemini_p)
+        self.assertIn("# Primary Workflows", gemini_p)
+        self.assertIn("run_shell_command", gemini_p)
+
+        # 3. Verify token/character budget guard in BaseHarness.format_prompt
+        gemini_h = GeminiCliHarness()
+        task_text = "Write a function to compute Fibonacci numbers."
+        trimmed = gemini_h.format_prompt(task_text, max_prompt_chars=500)
+        self.assertLessEqual(len(trimmed), 500)
+        self.assertTrue(trimmed.endswith(f"Task:\n{task_text}"))
+        self.assertIn("...[trimmed]...", trimmed)
+
+        # 4. Verify Codex apply_patch freeform grammar execution in sandbox
+        codex_h = CodexCliHarness()
+        patch_turn = (
+            "*** Begin Patch\n"
+            "*** Add File: calc.py\n"
+            "+x = 21\n"
+            "+print(x * 2)\n"
+            "*** End Patch\n"
+            "```python\n"
+            "with open('calc.py') as f:\n"
+            "    exec(f.read())\n"
+            "```"
+        )
+        res_codex = codex_h.run("Create calc.py", lambda p: patch_turn, max_turns=1)
+        self.assertEqual(res_codex.tools_called, 2)
+        self.assertEqual(res_codex.tools_succeeded, 2)
+
+        # 5. Verify Pi edits[] array schema and Gemini replace / write_file schema
+        pi_h = PiHarness()
+        pi_turns = [
+            '```json\n{"action": "write", "parameters": {"path": "note.txt", "content": "alpha beta"}}\n```',
+            '```json\n{"action": "edit", "parameters": {"path": "note.txt", "edits": [{"oldText": "alpha", "newText": "omega"}]}}\n```',
+        ]
+        t_idx = [0]
+
+        def pi_gen(p: str) -> str:
+            r = pi_turns[min(t_idx[0], len(pi_turns) - 1)]
+            t_idx[0] += 1
+            return r
+
+        res_pi = pi_h.run("Edit note.txt", pi_gen, max_turns=2)
+        self.assertEqual(res_pi.tools_called, 2)
+        self.assertEqual(res_pi.tools_succeeded, 2)
 
 
 if __name__ == "__main__":
