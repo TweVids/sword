@@ -1063,7 +1063,14 @@ class FastLfmServer:
         max_seq_len: int = 4096,
         device: Optional[Union[str, torch.device]] = None,
         kv_cache_dtype: Optional[torch.dtype] = None,
+        max_batch_size: Optional[int] = None,
+        dtype: Optional[torch.dtype] = None,
+        **kwargs,
     ):
+        if max_batch_size is not None:
+            max_concurrency = max_batch_size
+        if dtype is not None and kv_cache_dtype is None:
+            kv_cache_dtype = dtype
         self.model = model
         self.tokenizer = tokenizer
         if hasattr(self.tokenizer, "padding_side"):
