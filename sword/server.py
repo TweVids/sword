@@ -173,6 +173,7 @@ class FastServer:
             head_dim=head_dim,
             dtype=dtype,
             device=self.device,
+            config=t_cfg,
         )
 
         # Attach cache to attention layers and guarantee layer_idx
@@ -255,7 +256,12 @@ class FastServer:
             try:
                 dummy_x = torch.zeros((1, 1, self.head_dim), device=self.device, dtype=self.dtype)
                 all_pos = torch.arange(0, self.max_seq_len, device=self.device).unsqueeze(0)
-                cos_c, sin_c = rotary_emb(dummy_x, all_pos)
+                try:
+                    cos_c, sin_c = rotary_emb(dummy_x, all_pos)
+                except Exception:
+                    pos_3d = all_pos.view(1, 1, -1).expand(3, 1, -1)
+                    cos_c, sin_c = rotary_emb(dummy_x, pos_3d)
+
                 if cos_c is not None and sin_c is not None:
                     if cos_c.ndim >= 3 and cos_c.shape[0] == 1:
                         cos_c = cos_c.squeeze(0)
@@ -298,7 +304,8 @@ class FastServer:
                     if hasattr(self.model, "config") and hasattr(getattr(self.model, "config"), "layer_types"):
                         if position_ids.ndim == 2:
                             pos_4d = position_ids[None, ...].expand(3, bsz, -1)
-                            pos_emb = backbone.rotary_emb(hidden_states, pos_4d)
+                            dummy_x = torch.zeros(1, 1, self.head_dim, device=self.device, dtype=self.dtype)
+                            pos_emb = backbone.rotary_emb(dummy_x, pos_4d)
                         else:
                             pos_emb = backbone.rotary_emb(hidden_states, position_ids)
                     else:
@@ -764,6 +771,8 @@ class FastServer:
         bsz = len(prompts)
         if bsz > self.max_concurrency:
             self.max_concurrency = bsz
+            cfg = getattr(self.model, "config", None)
+            t_cfg = getattr(cfg, "text_config", cfg)
             self.static_cache = StaticKVCache(
                 num_layers=self.num_layers,
                 max_batch_size=self.max_concurrency,
@@ -772,6 +781,7 @@ class FastServer:
                 head_dim=self.head_dim,
                 dtype=self.dtype,
                 device=self.device,
+                config=t_cfg,
             )
             for name, module in self.model.named_modules():
                 if hasattr(module, "q_proj") and hasattr(module, "k_proj"):

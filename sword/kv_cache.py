@@ -9,20 +9,108 @@ Optimizations:
 - Compatible with torch.compile(dynamic=True) and Blackwell FP8/BF16/FP16 tensor cores.
 """
 
-from typing import Optional, List, Tuple, Union
+from typing import Optional, List, Tuple, Union, Any
 import torch
 
 
 try:
-    from transformers.cache_utils import Cache
+    from transformers.cache_utils import Cache, CacheLayerMixin, LinearAttentionCacheLayerMixin
 except ImportError:
     class Cache:
         pass
+    class CacheLayerMixin:
+        pass
+    class LinearAttentionCacheLayerMixin:
+        pass
+
+
+class StaticLinearAttentionLayer(LinearAttentionCacheLayerMixin):
+    """
+    High-Throughput Static Linear Attention Cache Buffer (Qwen 3.5 GatedDeltaNet).
+    Pre-allocates static 3D conv_states and 4D recurrent_states with pinned static addresses.
+    """
+    def __init__(
+        self,
+        max_batch_size: int,
+        conv_dim: int,
+        conv_k: int,
+        num_v_heads: int,
+        head_k_dim: int,
+        head_v_dim: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ):
+        self.conv_states = torch.zeros((max_batch_size, conv_dim, conv_k), dtype=dtype, device=device)
+        self.recurrent_states = torch.zeros((max_batch_size, num_v_heads, head_k_dim, head_v_dim), dtype=dtype, device=device)
+        self.has_previous_state = False
+        self.is_conv_states_initialized = True
+        self.is_recurrent_states_initialized = True
+        self.conv_kernel_size = conv_k
+        self.dtype = dtype
+        self.device = device
+        if hasattr(torch, "_dynamo") and hasattr(torch._dynamo, "mark_static_address"):
+            try:
+                torch._dynamo.mark_static_address(self.conv_states)
+                torch._dynamo.mark_static_address(self.recurrent_states)
+            except Exception:
+                pass
+
+    def lazy_initialization(self, conv_states: Optional[torch.Tensor] = None, recurrent_states: Optional[torch.Tensor] = None) -> None:
+        pass
+
+    def update_conv_state(self, conv_states: torch.Tensor, **kwargs) -> torch.Tensor:
+        if not self.has_previous_state:
+            self.conv_states.copy_(conv_states)
+            self.has_previous_state = True
+        else:
+            num_new_tokens = conv_states.shape[-1]
+            if num_new_tokens >= self.conv_kernel_size:
+                self.conv_states.copy_(conv_states[..., -self.conv_kernel_size :])
+            else:
+                self.conv_states.copy_(torch.roll(self.conv_states, shifts=-num_new_tokens, dims=-1))
+                self.conv_states[..., -num_new_tokens:] = conv_states
+        return self.conv_states
+
+    def update_recurrent_state(self, recurrent_states: torch.Tensor, **kwargs) -> torch.Tensor:
+        self.recurrent_states.copy_(recurrent_states)
+        return self.recurrent_states
+
+    def reset(self):
+        self.conv_states.zero_()
+        self.recurrent_states.zero_()
+        self.has_previous_state = False
+
+
+class StaticAttentionLayer(CacheLayerMixin):
+    """
+    Lightweight layer view wrapping full attention static KV cache.
+    """
+    def __init__(self, parent_cache: "StaticKVCache", layer_idx: int):
+        super().__init__()
+        self.parent = parent_cache
+        self.layer_idx = layer_idx
+        self.is_initialized = True
+
+    def lazy_initialization(self, key_states: torch.Tensor, value_states: torch.Tensor) -> None:
+        pass
+
+    def update(self, key_states: torch.Tensor, value_states: torch.Tensor, *args, **kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.parent.update(key_states, value_states, self.layer_idx, **kwargs)
+
+    def get_seq_length(self) -> int:
+        return self.parent.current_pos
+
+    def get_max_cache_shape(self) -> int:
+        return self.parent.max_seq_len
+
+    def get_mask_sizes(self, query_length: int) -> Tuple[int, int]:
+        return query_length + self.parent.current_pos, self.parent.current_pos
 
 
 class StaticKVCache(Cache):
     """
-    High-Throughput Static Key-Value Cache Buffer.
+    High-Throughput Static Key-Value Cache Buffer for Dense and Hybrid models.
+    Supports pure Full Attention (Qwen 2/2.5/3, LLaMA) and Hybrid architectures (Qwen 3.5 GatedDeltaNet + Attention).
     Inherits from transformers Cache for full compatibility with native HF models & PeftModel.
     Eliminates dynamic memory allocations, garbage collection stalls,
     and tensor concatenations during token decode.
@@ -37,17 +125,9 @@ class StaticKVCache(Cache):
         dtype: torch.dtype = torch.bfloat16,
         device: Optional[torch.device] = None,
         auto_clear: bool = True,
+        config: Optional[Any] = None,
+        layer_types: Optional[List[str]] = None,
     ):
-        if issubclass(self.__class__, Cache) and hasattr(Cache, "__init__"):
-            try:
-                super().__init__(layers=[])
-            except Exception:
-                self.layers = []
-                self.offloading = False
-        else:
-            self.layers = []
-            self.offloading = False
-
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.num_layers = num_layers
@@ -77,6 +157,48 @@ class StaticKVCache(Cache):
             )
             for _ in range(num_layers)
         ]
+
+        # Inspect hybrid layer types (e.g. Qwen 3.5 GatedDeltaNet)
+        if layer_types is None and config is not None:
+            layer_types = getattr(config, "layer_types", None)
+            if layer_types is None and hasattr(config, "text_config"):
+                layer_types = getattr(config.text_config, "layer_types", None)
+
+        built_layers = []
+        for i in range(num_layers):
+            l_type = layer_types[i] if layer_types and i < len(layer_types) else "full_attention"
+            if l_type == "linear_attention" and config is not None:
+                t_cfg = getattr(config, "text_config", config)
+                lin_k_heads = getattr(t_cfg, "linear_num_key_heads", 2)
+                lin_v_heads = getattr(t_cfg, "linear_num_value_heads", 2)
+                lin_k_dim = getattr(t_cfg, "linear_key_head_dim", 32)
+                lin_v_dim = getattr(t_cfg, "linear_value_head_dim", 32)
+                conv_k = getattr(t_cfg, "linear_conv_kernel_dim", 4)
+                conv_dim = lin_k_dim * lin_k_heads * 2 + lin_v_dim * lin_v_heads
+                built_layers.append(
+                    StaticLinearAttentionLayer(
+                        max_batch_size=max_batch_size,
+                        conv_dim=conv_dim,
+                        conv_k=conv_k,
+                        num_v_heads=lin_v_heads,
+                        head_k_dim=lin_k_dim,
+                        head_v_dim=lin_v_dim,
+                        dtype=dtype,
+                        device=self.device,
+                    )
+                )
+            else:
+                built_layers.append(StaticAttentionLayer(self, i))
+
+        if issubclass(self.__class__, Cache) and hasattr(Cache, "__init__"):
+            try:
+                super().__init__(layers=built_layers)
+            except Exception:
+                self.layers = built_layers
+                self.offloading = False
+        else:
+            self.layers = built_layers
+            self.offloading = False
 
         # Tracking state
         self.seq_lengths = torch.zeros((max_batch_size,), dtype=torch.long, device=self.device)
@@ -117,6 +239,9 @@ class StaticKVCache(Cache):
         if batch_indices is None:
             self.seq_lengths.zero_()
             self.current_pos = 0
+            for l in self.layers:
+                if hasattr(l, "has_previous_state"):
+                    l.has_previous_state = False
         else:
             for b in batch_indices:
                 if b < self.max_batch_size:
@@ -137,6 +262,11 @@ class StaticKVCache(Cache):
             for k, v in zip(self.k_cache, self.v_cache):
                 k.zero_()
                 v.zero_()
+            for l in self.layers:
+                if hasattr(l, "reset"):
+                    l.reset()
+                elif hasattr(l, "has_previous_state"):
+                    l.has_previous_state = False
             self.seq_lengths.zero_()
             self.current_pos = 0
         else:
@@ -147,6 +277,29 @@ class StaticKVCache(Cache):
                         v[b].zero_()
                     self.seq_lengths[b] = 0
             self.current_pos = 0
+
+    def has_previous_state(self, layer_idx: Optional[int] = None) -> bool:
+        """
+        HF Cache interface for hybrid architectures (e.g. Qwen 3.5).
+        Returns whether the specified layer (or any linear attention layer) has previous state.
+        """
+        if layer_idx is not None:
+            if layer_idx < len(self.layers) and hasattr(self.layers[layer_idx], "has_previous_state"):
+                return bool(self.layers[layer_idx].has_previous_state)
+            return self.current_pos > 0
+        return any(getattr(l, "has_previous_state", False) for l in self.layers)
+
+    def update_conv_state(self, conv_states: torch.Tensor, layer_idx: int, **kwargs) -> torch.Tensor:
+        """Updates linear attention conv states."""
+        if layer_idx < len(self.layers) and hasattr(self.layers[layer_idx], "update_conv_state"):
+            return self.layers[layer_idx].update_conv_state(conv_states, **kwargs)
+        return conv_states
+
+    def update_recurrent_state(self, recurrent_states: torch.Tensor, layer_idx: int, **kwargs) -> torch.Tensor:
+        """Updates linear attention recurrent states."""
+        if layer_idx < len(self.layers) and hasattr(self.layers[layer_idx], "update_recurrent_state"):
+            return self.layers[layer_idx].update_recurrent_state(recurrent_states, **kwargs)
+        return recurrent_states
 
     @property
     def max_batch_size(self) -> int:
@@ -175,6 +328,10 @@ class StaticKVCache(Cache):
     def get_usable_length(self, new_seq_len: int, layer_idx: Optional[int] = 0) -> int:
         """Given the sequence length of the new tokens, returns the usable length of the cache."""
         return self.current_pos
+
+    def get_mask_sizes(self, query_length: int, layer_idx: Optional[int] = None) -> Tuple[int, int]:
+        """Returns (kv_length, kv_offset) for causal masking."""
+        return query_length + self.current_pos, self.current_pos
 
     def update(
         self,
@@ -250,10 +407,16 @@ class StaticKVCache(Cache):
 
             p_len = prompt_lens[i]
             for layer_idx in range(self.num_layers):
-                src_k = self.k_cache[layer_idx][src_slot : src_slot + 1, :, :p_len, :]
-                src_v = self.v_cache[layer_idx][src_slot : src_slot + 1, :, :p_len, :]
-                self.k_cache[layer_idx][dst_start:dst_end, :, :p_len, :].copy_(src_k)
-                self.v_cache[layer_idx][dst_start:dst_end, :, :p_len, :].copy_(src_v)
+                if layer_idx < len(self.layers) and hasattr(self.layers[layer_idx], "conv_states"):
+                    l_mod = self.layers[layer_idx]
+                    l_mod.conv_states[dst_start:dst_end].copy_(l_mod.conv_states[src_slot : src_slot + 1])
+                    l_mod.recurrent_states[dst_start:dst_end].copy_(l_mod.recurrent_states[src_slot : src_slot + 1])
+                    l_mod.has_previous_state = True
+                else:
+                    src_k = self.k_cache[layer_idx][src_slot : src_slot + 1, :, :p_len, :]
+                    src_v = self.v_cache[layer_idx][src_slot : src_slot + 1, :, :p_len, :]
+                    self.k_cache[layer_idx][dst_start:dst_end, :, :p_len, :].copy_(src_k)
+                    self.v_cache[layer_idx][dst_start:dst_end, :, :p_len, :].copy_(src_v)
 
     def get_layer_cache(
         self,

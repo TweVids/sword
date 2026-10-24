@@ -61,6 +61,12 @@ def setup_fla_compatibility():
         print(f"[Sword] [*] Native FLA not found ({e}). Loading Pure-PyTorch compatibility shims.")
         pass
 
+    import importlib.machinery
+
+    def _ensure_spec(mod, mod_name):
+        if not hasattr(mod, "__spec__") or mod.__spec__ is None:
+            mod.__spec__ = importlib.machinery.ModuleSpec(mod_name, None, is_package=True)
+
     # Retrieve or construct package hierarchy with __path__ for Python 3.13 dynamic imports
     fla_mod = sys.modules.get("fla")
     if fla_mod is None:
@@ -68,50 +74,60 @@ def setup_fla_compatibility():
         sys.modules["fla"] = fla_mod
     if not hasattr(fla_mod, "__path__"):
         fla_mod.__path__ = []
+    _ensure_spec(fla_mod, "fla")
     fla_mod._sword_loaded = True
 
     modules_mod = sys.modules.get("fla.modules") or types.ModuleType("fla.modules")
     modules_mod.__path__ = []
+    _ensure_spec(modules_mod, "fla.modules")
     sys.modules["fla.modules"] = modules_mod
     fla_mod.modules = modules_mod
 
     ops_mod = sys.modules.get("fla.ops") or types.ModuleType("fla.ops")
     ops_mod.__path__ = []
+    _ensure_spec(ops_mod, "fla.ops")
     sys.modules["fla.ops"] = ops_mod
     fla_mod.ops = ops_mod
 
     ops_kda_mod = sys.modules.get("fla.ops.kda") or types.ModuleType("fla.ops.kda")
     ops_kda_mod.__path__ = []
+    _ensure_spec(ops_kda_mod, "fla.ops.kda")
     sys.modules["fla.ops.kda"] = ops_kda_mod
     ops_mod.kda = ops_kda_mod
 
     ops_utils_mod = sys.modules.get("fla.ops.utils") or types.ModuleType("fla.ops.utils")
     ops_utils_mod.__path__ = []
+    _ensure_spec(ops_utils_mod, "fla.ops.utils")
     sys.modules["fla.ops.utils"] = ops_utils_mod
     ops_mod.utils = ops_utils_mod
 
     ops_utils_index_mod = sys.modules.get("fla.ops.utils.index") or types.ModuleType("fla.ops.utils.index")
     ops_utils_index_mod.__path__ = []
+    _ensure_spec(ops_utils_index_mod, "fla.ops.utils.index")
     sys.modules["fla.ops.utils.index"] = ops_utils_index_mod
-    ops_utils_mod.index = ops_utils_index_mod
+    ops_mod.utils.index = ops_utils_index_mod
 
     utils_mod = sys.modules.get("fla.utils") or types.ModuleType("fla.utils")
     utils_mod.__path__ = []
+    _ensure_spec(utils_mod, "fla.utils")
     sys.modules["fla.utils"] = utils_mod
     fla_mod.utils = utils_mod
 
     simple_gla_mod = sys.modules.get("fla.ops.simple_gla") or types.ModuleType("fla.ops.simple_gla")
     simple_gla_mod.__path__ = []
+    _ensure_spec(simple_gla_mod, "fla.ops.simple_gla")
     sys.modules["fla.ops.simple_gla"] = simple_gla_mod
     ops_mod.simple_gla = simple_gla_mod
 
     simple_gla_rec_mod = sys.modules.get("fla.ops.simple_gla.fused_recurrent") or types.ModuleType("fla.ops.simple_gla.fused_recurrent")
     simple_gla_rec_mod.__path__ = []
+    _ensure_spec(simple_gla_rec_mod, "fla.ops.simple_gla.fused_recurrent")
     sys.modules["fla.ops.simple_gla.fused_recurrent"] = simple_gla_rec_mod
     simple_gla_mod.fused_recurrent = simple_gla_rec_mod
 
     simple_gla_chunk_mod = sys.modules.get("fla.ops.simple_gla.chunk") or types.ModuleType("fla.ops.simple_gla.chunk")
     simple_gla_chunk_mod.__path__ = []
+    _ensure_spec(simple_gla_chunk_mod, "fla.ops.simple_gla.chunk")
     sys.modules["fla.ops.simple_gla.chunk"] = simple_gla_chunk_mod
     simple_gla_mod.chunk = simple_gla_chunk_mod
 

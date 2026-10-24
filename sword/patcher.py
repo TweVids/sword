@@ -600,16 +600,127 @@ def set_attention_mode(model, mode: str = "flash"):
     return count
 
 
+def fast_causal_conv1d_update(
+    hidden_states: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    activation: Optional[str] = None,
+) -> torch.Tensor:
+    """
+    Zero-allocation in-place causal conv1d update for Qwen 3.5 GatedDeltaNet.
+    Uses in-place rolling buffer and elementwise multiply-accumulate to avoid
+    torch.cat allocations and slow grouped 1D convolutions.
+    """
+    _, _, seq_len = hidden_states.shape
+    if seq_len == 1:
+        conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))
+        conv_state[:, :, -1:] = hidden_states
+        w = weight.squeeze(1) if weight.ndim == 3 else weight
+        out = (conv_state * w).sum(dim=-1, keepdim=True)
+        if bias is not None:
+            out = out + bias.view(1, -1, 1)
+        return F.silu(out)
+    else:
+        hidden_states_new = torch.cat([conv_state, hidden_states], dim=-1).to(weight.dtype)
+        conv_state.copy_(hidden_states_new[:, :, -conv_state.shape[-1]:])
+        w_conv = weight.unsqueeze(1) if weight.ndim == 2 else weight
+        out = F.conv1d(hidden_states_new, w_conv, bias, padding=0, groups=hidden_states.shape[1])
+        return F.silu(out[:, :, -seq_len:]).to(hidden_states.dtype)
+
+
+def fast_recurrent_gated_delta_rule(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: Optional[torch.Tensor],
+    output_final_state: bool,
+    use_qk_l2norm_in_kernel: bool = False,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """
+    Tensor-Core accelerated single-token recurrent delta rule step for Qwen 3.5 GatedDeltaNet.
+    Eliminates 5 contiguous transposes, Python loops, and intermediate tensor allocations.
+    Uses direct batched matrix multiplications (torch.matmul / GEMM).
+    """
+    seq_len = query.shape[1]
+    if seq_len == 1:
+        initial_dtype = query.dtype
+        scale = 1.0 / (query.shape[-1] ** 0.5)
+
+        if use_qk_l2norm_in_kernel:
+            q_norm = query * torch.rsqrt((query * query).sum(dim=-1, keepdim=True) + 1e-6)
+            k_norm = key * torch.rsqrt((key * key).sum(dim=-1, keepdim=True) + 1e-6)
+        else:
+            q_norm = query
+            k_norm = key
+
+        q = (q_norm.squeeze(1).float() * scale).unsqueeze(-2)
+        k = k_norm.squeeze(1).float().unsqueeze(-1)
+        v = value.squeeze(1).float().unsqueeze(-2)
+        g_decay = g.squeeze(1).float().exp().unsqueeze(-1).unsqueeze(-1)
+        beta_val = beta.squeeze(1).float().unsqueeze(-1).unsqueeze(-1)
+
+        if initial_state is None:
+            batch_size, _, num_heads, k_dim = query.shape
+            v_dim = value.shape[-1]
+            st = torch.zeros(batch_size, num_heads, k_dim, v_dim, device=query.device, dtype=torch.float32)
+        else:
+            st = initial_state.float() * g_decay
+
+        kv_mem = torch.matmul(k.transpose(-1, -2), st)
+        delta = (v - kv_mem) * beta_val
+        st = st + torch.matmul(k, delta)
+        out = torch.matmul(q, st).squeeze(-2)
+
+        final_st = st.to(initial_dtype) if output_final_state else None
+        return out.unsqueeze(1).to(initial_dtype), final_st
+
+    try:
+        from transformers.models.qwen3_5.modeling_qwen3_5 import torch_recurrent_gated_delta_rule
+        return torch_recurrent_gated_delta_rule(
+            query, key, value, g, beta, initial_state, output_final_state, use_qk_l2norm_in_kernel
+        )
+    except Exception:
+        initial_dtype = query.dtype
+        if use_qk_l2norm_in_kernel:
+            query = query * torch.rsqrt((query * query).sum(dim=-1, keepdim=True) + 1e-6)
+            key = key * torch.rsqrt((key * key).sum(dim=-1, keepdim=True) + 1e-6)
+        query_f, key_f, value_f, beta_f, g_f = [
+            x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta, g)
+        ]
+        b_sz, n_h, s_l, k_d = key_f.shape
+        v_d = value_f.shape[-1]
+        scale = 1.0 / (query_f.shape[-1] ** 0.5)
+        query_f = query_f * scale
+        core_out = torch.zeros(b_sz, n_h, s_l, v_d, device=query.device, dtype=torch.float32)
+        last_st = torch.zeros(b_sz, n_h, k_d, v_d, device=query.device, dtype=torch.float32) if initial_state is None else initial_state.to(torch.float32)
+        for i in range(s_l):
+            q_t = query_f[:, :, i]
+            k_t = key_f[:, :, i]
+            v_t = value_f[:, :, i]
+            g_t = g_f[:, :, i].exp().unsqueeze(-1).unsqueeze(-1)
+            b_t = beta_f[:, :, i].unsqueeze(-1)
+            last_st = last_st * g_t
+            kv_m = (last_st * k_t.unsqueeze(-1)).sum(dim=-2)
+            dl = (v_t - kv_m) * b_t
+            last_st = last_st + k_t.unsqueeze(-1) * dl.unsqueeze(-2)
+            core_out[:, :, i] = (last_st * q_t.unsqueeze(-1)).sum(dim=-2)
+        return core_out.transpose(1, 2).contiguous().to(initial_dtype), (last_st.to(initial_dtype) if output_final_state else None)
+
+
 def patch_model(model, mode: str = "flash", patch_moe: bool = True):
     """
     Universal patcher for all Transformer & MoE causal attention modules
-    (HYV3/Hunyuan-3, Qwen, Qwen2-MoE, DeepSeek, LLaMA, Mistral, etc.)
-    with Sword's pure FlashAttention SDPA kernel and Static KV cache routing,
-    plus Zero-Sync Fast MoE Expert Dispatch.
+    (HYV3/Hunyuan-3, Qwen, Qwen2.5, Qwen3, Qwen3.5, DeepSeek, LLaMA, Mistral, etc.)
+    with Sword's pure FlashAttention SDPA kernel, Static KV cache routing,
+    Qwen 3.5 hardware GatedDeltaNet kernels, plus Zero-Sync Fast MoE Expert Dispatch.
     Preserves all weights and quantization (native FP8, bitsandbytes 4-bit/8-bit, etc.).
     """
     import re
     patched_count = 0
+    deltanet_count = 0
     cur_layer_idx = 0
     for name, module in model.named_modules():
         mod_type = module.__class__.__name__.lower()
@@ -630,7 +741,17 @@ def patch_model(model, mode: str = "flash", patch_moe: bool = True):
 
                 module.forward = types.MethodType(make_patched_attention_forward(module._sword_original_forward), module)
                 patched_count += 1
+        elif "gateddeltanet" in mod_type or hasattr(module, "causal_conv1d_update"):
+            if not hasattr(module, "_sword_original_causal_conv1d_update"):
+                module._sword_original_causal_conv1d_update = module.causal_conv1d_update
+                module._sword_original_recurrent_gated_delta_rule = module.recurrent_gated_delta_rule
+            module.causal_conv1d_update = fast_causal_conv1d_update
+            module.recurrent_gated_delta_rule = fast_recurrent_gated_delta_rule
+            deltanet_count += 1
+
     print(f"[Sword] Patched {patched_count} attention modules with Pure FlashAttention SDPA (mode='{mode}').")
+    if deltanet_count > 0:
+        print(f"[Sword] Patched {deltanet_count} Qwen 3.5 GatedDeltaNet modules with hardware-accelerated kernels.")
 
     if patch_moe:
         patch_moe_experts(model)
@@ -702,6 +823,13 @@ def unpatch_model(model):
                 for attr in ("_sword_attn_mode", "_sword_static_cache", "_sword_num_heads", "_sword_num_kv_heads", "_sword_head_dim", "_sword_num_groups", "_has_q_norm", "_has_k_norm"):
                     if hasattr(m, attr):
                         delattr(m, attr)
+                unpatched_count += 1
+            if id(m) not in seen and hasattr(m, "_sword_original_causal_conv1d_update"):
+                seen.add(id(m))
+                m.causal_conv1d_update = m._sword_original_causal_conv1d_update
+                m.recurrent_gated_delta_rule = m._sword_original_recurrent_gated_delta_rule
+                delattr(m, "_sword_original_causal_conv1d_update")
+                delattr(m, "_sword_original_recurrent_gated_delta_rule")
                 unpatched_count += 1
     try:
         from .ling import unpatch_ling as _unpatch_ling
