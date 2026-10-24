@@ -847,44 +847,7 @@ def make_fast_lfm_moe_block_forward(original_forward):
             flat_exp_idx = selected_experts.reshape(-1)
             flat_tok_idx = _get_lfm_flat_tok_idx(num_tokens, num_exp_per_tok, hidden_states_reshaped.device)
 
-            # Deduplicate active experts when multiple streams route to the same expert on GPU
-            # (where expert weights are 19 MB each and gathering duplicates wastes HBM bandwidth)
-            w_up_full = experts_module.gate_up_proj
-            is_large_expert = (w_up_full.shape[1] * w_up_full.shape[2] >= 262144)
-            if is_large_expert and (not torch.cuda.is_current_stream_capturing() if hidden_states.is_cuda else True):
-                unique_exps, inv_idx, counts = torch.unique(flat_exp_idx, sorted=True, return_inverse=True, return_counts=True)
-                num_unique = unique_exps.numel()
-                if num_unique * 2 <= total_assignments:
-                    order = inv_idx.argsort(stable=True)
-                    sorted_tok_idx = flat_tok_idx[order]
-                    sorted_weights = routing_weights.reshape(-1)[order].unsqueeze(-1).to(hidden_states_reshaped.dtype)
-                    sorted_x = hidden_states_reshaped[sorted_tok_idx]
-
-                    final_hidden_states = torch.zeros_like(hidden_states_reshaped)
-                    exp_list = unique_exps.tolist()
-                    cnt_list = counts.tolist()
-                    cursor = 0
-                    for exp_id, cnt in zip(exp_list, cnt_list):
-                        sub_x = sorted_x[cursor : cursor + cnt]
-                        sub_w = sorted_weights[cursor : cursor + cnt]
-                        sub_tok = sorted_tok_idx[cursor : cursor + cnt]
-                        cursor += cnt
-
-                        w_up = w_up_full[exp_id]
-                        if w_up.dtype != sub_x.dtype:
-                            w_up = w_up.to(sub_x.dtype)
-                        gate, up = F.linear(sub_x, w_up).chunk(2, dim=-1)
-                        act = act_fn(gate) * up
-
-                        w_down = experts_module.down_proj[exp_id]
-                        if w_down.dtype != act.dtype:
-                            w_down = w_down.to(act.dtype)
-                        down = F.linear(act, w_down) * sub_w
-                        final_hidden_states.index_add_(0, sub_tok, down.to(final_hidden_states.dtype))
-
-                    return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
-
-            # Vectorized Batched BMM for low-overlap decode or CUDA Graph capture
+            # Pure PyTorch Vectorized BMM: zero host-device synchronizations, zero .tolist()
             x = hidden_states_reshaped[flat_tok_idx].unsqueeze(1)
             w_up = experts_module.gate_up_proj[flat_exp_idx]
             if w_up.dtype != x.dtype:
@@ -1446,6 +1409,27 @@ class FastLfmServer:
             if hasattr(module, "q_proj") and hasattr(module, "k_proj"):
                 module._sword_static_cache = self.static_cache
 
+        # Precompute RoPE table for 0..max_seq_len to eliminate dynamic RoPE graph computation
+        self.cos_cache = None
+        self.sin_cache = None
+        backbone = getattr(model, "model", model)
+        if hasattr(backbone, "base_model"):
+            backbone = getattr(backbone, "base_model", backbone)
+        if hasattr(backbone, "model"):
+            backbone = getattr(backbone, "model", backbone)
+
+        if hasattr(backbone, "pos_emb"):
+            try:
+                dummy_pos = torch.arange(max_seq_len, device=self.device).unsqueeze(0)
+                dummy_x = torch.zeros((1, 1, getattr(cfg, "hidden_size", 2048)), dtype=self.dtype, device=self.device)
+                with torch.no_grad():
+                    cos, sin = backbone.pos_emb(dummy_x, position_ids=dummy_pos)
+                    self.cos_cache = cos.squeeze(0).contiguous()
+                    self.sin_cache = sin.squeeze(0).contiguous()
+            except Exception:
+                self.cos_cache = None
+                self.sin_cache = None
+
         # Initialize Static CUDA Graph Engine for decode steps
         vocab_size = getattr(cfg, "vocab_size", 128256)
         self.graph_engine = FastLfmGraphEngine(
@@ -1596,7 +1580,14 @@ class FastLfmServer:
 
         if hasattr(backbone, "embed_tokens") and hasattr(backbone, "layers") and hasattr(backbone, "pos_emb"):
             hidden_states = backbone.embed_tokens(input_ids)
-            position_embeddings = backbone.pos_emb(hidden_states, position_ids=position_ids)
+            if self.cos_cache is not None:
+                pos_idx = position_ids.squeeze(-1) if position_ids.ndim > 1 else position_ids
+                cos = self.cos_cache[pos_idx].unsqueeze(1)
+                sin = self.sin_cache[pos_idx].unsqueeze(1)
+                position_embeddings = (cos, sin)
+            else:
+                position_embeddings = backbone.pos_emb(hidden_states, position_ids=position_ids)
+
             for layer in backbone.layers:
                 hidden_states = layer(
                     hidden_states,
@@ -1696,20 +1687,24 @@ class FastLfmServer:
         def _sample(logits: torch.Tensor) -> torch.Tensor:
             if temperature <= 0.0:
                 return torch.argmax(logits, dim=-1, keepdim=True)
-            l = logits / temperature
-            if top_k is not None and top_k > 0:
-                v, _ = torch.topk(l, min(top_k, l.size(-1)))
-                l[l < v[:, [-1]]] = -float("Inf")
-            if top_p is not None and top_p < 1.0:
-                sorted_l, sorted_indices = torch.sort(l, descending=True)
-                cum_probs = torch.cumsum(F.softmax(sorted_l, dim=-1), dim=-1)
-                mask = cum_probs > top_p
+            k_val = min(top_k, logits.size(-1)) if (top_k is not None and top_k > 0) else min(50, logits.size(-1))
+            val_k, idx_k = torch.topk(logits, k=k_val, dim=-1)
+            l = val_k / temperature
+            probs_k = F.softmax(l, dim=-1)
+            if top_p is not None and 0.0 < top_p < 1.0:
+                sorted_p, sort_idx = torch.sort(probs_k, descending=True)
+                cum_p = torch.cumsum(sorted_p, dim=-1)
+                mask = cum_p > top_p
                 mask[..., 1:] = mask[..., :-1].clone()
-                mask[..., 0] = 0
-                to_remove = mask.scatter(1, sorted_indices, mask)
-                l[to_remove] = -float("Inf")
-            probs = F.softmax(l, dim=-1)
-            return torch.multinomial(probs, num_samples=1)
+                mask[..., 0] = False
+                sorted_p[mask] = 0.0
+                p_sum = sorted_p.sum(dim=-1, keepdim=True)
+                sorted_p = sorted_p / (p_sum + 1e-8)
+                sample_k = torch.multinomial(sorted_p, num_samples=1)
+                chosen_idx = torch.gather(sort_idx, -1, sample_k)
+            else:
+                chosen_idx = torch.multinomial(probs_k, num_samples=1)
+            return torch.gather(idx_k, -1, chosen_idx)
 
         next_token = _sample(next_logits)
         generated = [next_token]
@@ -1759,8 +1754,8 @@ class FastLfmServer:
                 next_token = torch.where(unfinished.unsqueeze(-1), next_token, torch.full_like(next_token, pad_id))
                 unfinished = unfinished & (~is_eos)
                 generated.append(next_token)
-                # Only synchronize every 8 steps or on the final step to avoid per-token CPU-GPU sync
-                if (step_idx % 8 == 0 or step_idx == max_new_tokens - 1) and not unfinished.any():
+                # Check termination only every 16 steps or at the end to minimize GPU-CPU sync stalls
+                if (step_idx % 16 == 0 or step_idx == max_new_tokens - 1) and not unfinished.any():
                     break
             else:
                 generated.append(next_token)
