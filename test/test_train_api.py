@@ -60,6 +60,31 @@ class TestTrainAPI(unittest.TestCase):
         self.assertTrue(out.get("ok"))
         self.assertEqual(len(out.get("steps")), 3)
 
+    def test_train_vllm_mock(self):
+        mock_output = MagicMock()
+        mock_output.outputs = [MagicMock(text="vllm output", token_ids=[1, 2, 3])]
+        mock_llm_instance = MagicMock()
+        mock_llm_instance.generate.return_value = [mock_output] * 2
+
+        mock_vllm = MagicMock()
+        mock_vllm.LLM.return_value = mock_llm_instance
+        mock_vllm.SamplingParams = MagicMock()
+
+        with patch.dict(sys.modules, {"vllm": mock_vllm}):
+            res = train(
+                test=True,
+                model="Qwen/Qwen3.5-0.8B",
+                concurrent=2,
+                prompt=2,
+                use_vllm=True,
+                mock_test=False,
+            )
+            self.assertTrue(res.get("ok"))
+            self.assertEqual(res.get("engine"), "vllm")
+            self.assertEqual(len(res.get("responses")), 2)
+            self.assertEqual(res.get("total_tokens"), 6)
+
+
 
 if __name__ == "__main__":
     unittest.main()

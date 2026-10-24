@@ -88,30 +88,94 @@ def train(
     speculative: Optional[bool] = None,
     speculative_k: int = 3,
     mock_test: bool = False,
+    use_vllm: bool = False,
     **kwargs,
 ) -> Dict[str, Any]:
     """
     Unified entry point for Sword training and concurrent inference testing.
     Usage:
         import sword
+        # Using Sword Native Speed Engine:
         results = sword.train(test=True, model="Qwen/Qwen3.5-0.8B", concurrent=8, prompt=8)
+
+        # Using patched vLLM engine:
+        results = sword.train(test=True, model="Qwen/Qwen3.5-0.8B", concurrent=8, prompt=8, use_vllm=True)
     """
     prompts = resolve_prompts(prompt, concurrent)
 
     if test:
         device_str = "cuda" if torch.cuda.is_available() else "cpu"
         device_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
+        engine_name = "vLLM" if (use_vllm or kwargs.get("backend") == "vllm") else "Sword Speed Engine"
 
         print("=" * 72)
-        print(f"Sword Speed Engine - {concurrent}-Concurrency Serving Test")
+        print(f"{engine_name} - {concurrent}-Concurrency Serving Test")
         print("=" * 72)
         print(f"Model ID:            {model}")
         print(f"Concurrency:         {concurrent} concurrent streams")
         print(f"Max New Tokens:      {max_new_tokens}")
         print(f"Device:              {device_str} ({device_name})")
+        print(f"Engine Backend:      {engine_name}")
         print(f"Quantization 4-bit:  {load_in_4bit}")
         print(f"Compilation:         {'Enabled' if compile else 'Disabled'}")
         print("=" * 72)
+
+        if (use_vllm or kwargs.get("backend") == "vllm") and not mock_test:
+            try:
+                from vllm import LLM, SamplingParams
+                print(f"[Sword] Running with vLLM engine (vllm==0.23.0 patched)...")
+                llm = LLM(
+                    model=model,
+                    trust_remote_code=True,
+                    max_model_len=kwargs.get("max_model_len", 2048),
+                    gpu_memory_utilization=kwargs.get("gpu_memory_utilization", 0.9),
+                    dtype=kwargs.get("dtype", "auto"),
+                )
+                sampling_params = SamplingParams(
+                    temperature=temperature,
+                    top_k=top_k if top_k > 0 else -1,
+                    max_tokens=max_new_tokens,
+                )
+                t0 = time.perf_counter()
+                outputs = llm.generate(prompts, sampling_params)
+                elapsed = time.perf_counter() - t0
+                responses = [out.outputs[0].text for out in outputs]
+                total_tokens = sum(len(out.outputs[0].token_ids) for out in outputs)
+                tps = total_tokens / elapsed if elapsed > 0 else 0.0
+
+                print("-" * 72)
+                print("Generated Stream Outputs (vLLM):")
+                print("-" * 72)
+                for idx, (p, r) in enumerate(zip(prompts, responses)):
+                    p_snip = (p[:55] + "...") if len(p) > 58 else p
+                    r_snip = r.replace("\n", " ")
+                    r_snip = (r_snip[:65] + "...") if len(r_snip) > 68 else r_snip
+                    print(f"[Stream {idx + 1}] Prompt: {p_snip}")
+                    print(f"           Output: {r_snip}")
+
+                print("=" * 72)
+                print(f"Concurrent Streams:      {concurrent}")
+                print(f"Engine:                  vLLM (patched)")
+                print(f"Total Generated Tokens:  {total_tokens}")
+                print(f"Elapsed Time:            {elapsed:.2f} s")
+                print(f"Aggregate Throughput:    {tps:.2f} tok/s")
+                print("=" * 72)
+
+                return {
+                    "ok": True,
+                    "mode": "test",
+                    "engine": "vllm",
+                    "model": model,
+                    "concurrent": concurrent,
+                    "prompts": prompts,
+                    "responses": responses,
+                    "total_tokens": total_tokens,
+                    "elapsed_seconds": elapsed,
+                    "aggregate_tps": tps,
+                    "raw": outputs,
+                }
+            except ImportError:
+                print("[Sword] vLLM is not installed or importable. Falling back to Sword Speed Engine...")
 
         if not mock_test and (torch.cuda.is_available() or kwargs.get("force_load", False)):
             from sword.loader import load_qwen_model
