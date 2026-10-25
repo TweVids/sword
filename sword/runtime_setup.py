@@ -54,20 +54,49 @@ def _find_sword_source_repo() -> Optional[Path]:
 
 
 def _installed_git_origin() -> Optional[str]:
-    """Reads the git+...:// source URL recorded by pip in the dist metadata."""
+    """
+    Reads the VCS source URL recorded by pip/uv in the dist metadata
+    (direct_url.json). Tolerates canonicalized URLs that dropped the git+
+    prefix; falls back to scanning every installed distribution.
+    """
     import json
     from importlib import metadata
-    try:
-        dist = metadata.distribution("sword")
-        raw = dist.read_text("direct_url.json")
-        if raw:
-            info = json.loads(raw)
-            url = info.get("url")
-            if url and url.startswith("git+"):
-                return url
-    except Exception:
+
+    def _extract(url: Optional[str]) -> Optional[str]:
+        if not url:
+            return None
+        lowered = str(url).lower()
+        if lowered.startswith(("git+", "https://github.com/", "git@", "ssh://")):
+            return str(url).rstrip("/")
         return None
+
+    try:
+        for dist in metadata.distributions():
+            if dist.metadata.get("Name", "").lower() != "sword":
+                continue
+            raw = dist.read_text("direct_url.json")
+            if raw:
+                url = _extract(json.loads(raw).get("url"))
+                if url:
+                    return url
+    except Exception:
+        pass
     return None
+
+
+DEFAULT_SWORD_GIT_ORIGIN = "git+https://github.com/TweVids/sword"
+
+
+def _update_source_url() -> Optional[str]:
+    """Source URL for self_update: recorded origin, then env override, then the
+    published default (installed via `pip install git+TweVids/sword`)."""
+    origin = _installed_git_origin()
+    if origin:
+        return origin
+    env_url = os.environ.get("SWORD_SOURCE_URL", "").strip()
+    if env_url:
+        return env_url
+    return DEFAULT_SWORD_GIT_ORIGIN
 
 
 def _strip_vcs_pin(url: str) -> str:
@@ -148,7 +177,7 @@ def self_update() -> Dict[str, Any]:
                 "source_repo": str(repo), "installed_from": str(installed_dir)}
 
     if repo is None:
-        origin = _installed_git_origin()
+        origin = _update_source_url()
         if origin is None:
             return {"ok": True, "skipped": ("No source repo found and the installed "
                     "distribution records no git source; set SWORD_REPO_DIR to fix"),

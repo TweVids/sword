@@ -16,6 +16,20 @@ from typing import Dict, Any, List
 
 
 
+def _version_tuple(version: str):
+    """Parses '2.5.1' / '2.5' into a comparable tuple of ints."""
+    parts = []
+    for chunk in version.split("."):
+        digits = ""
+        for ch in chunk:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts)
+
+
 def write_python_patch(path: Path, source: str):
     """Validate syntax and atomically replace a patched Python file."""
     compile(source, str(path), "exec")
@@ -207,6 +221,29 @@ def bootstrap_environment(
             )})
     except OSError as exc:
         return {"ok": False, "steps": results, "error": str(exc)}
+    # Numba (imported by vLLM's ngram_proposer for speculative decoding) caps
+    # NumPy at 2.4; when a newer NumPy is present the engine core dies on
+    # import. Downgrade NumPy proactively so the version stays self-consistent.
+    try:
+        numpy_installed = metadata.version("numpy")
+        if numpy_installed not in ("", None) and _version_tuple(numpy_installed) >= (2, 5):
+            numpy_cmd = (["uv", "pip", "install", "--python", sys.executable, "numpy<2.5"]
+                         if shutil.which("uv") else
+                         [sys.executable, "-m", "pip", "install", "numpy<2.5"])
+            run = subprocess.run(numpy_cmd, text=True, capture_output=True, timeout=600)
+            results.append({
+                "command": " ".join(numpy_cmd), "returncode": run.returncode,
+                "detail": f"NumPy {numpy_installed} is incompatible with numba (needs <=2.4)",
+                "tail": (run.stdout + run.stderr)[-4000:],
+            })
+            if run.returncode:
+                return {"ok": False, "steps": results,
+                        "error": f"NumPy {numpy_installed} is incompatible with numba (needs <=2.4) "
+                                 f"and the downgrade failed"}
+    except metadata.PackageNotFoundError:
+        pass
+    except OSError as exc:
+        results.append({"command": "install numpy<2.5", "skipped": f"NumPy/numba check failed: {exc}"})
     importlib.invalidate_caches()
     spec = importlib.util.find_spec("vllm")
     if not spec or not spec.origin:

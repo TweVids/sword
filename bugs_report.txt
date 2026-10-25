@@ -112,6 +112,25 @@ STATUS UPDATE (same day, follow-up pass):
   "<name>.linear" (mixed cases get a partial-coverage note; wrapper-less
   siblings keep other targets). Regression: mixed-support redirect test.
 
+[N8] FOUND during runtime run 07:43 (2026-10-25): self_update still skipped -
+  "installed distribution records no git source" despite `uv pip install
+  git+...` (direct_url.json origin read returned None on the runtime).
+  Fixed: _installed_git_origin scans all sword distributions and tolerates
+  canonicalized (git+-stripped) URLs; _update_source_url then falls back to
+  SWORD_SOURCE_URL env and finally DEFAULT_SWORD_GIT_ORIGIN
+  (git+https://github.com/TweVids/sword). Regression: origin fallback test.
+
+[N9] FOUND during same runtime run: vLLM EngineCore died at import -
+  vllm.v1.spec_decode.ngram_proposer imports numba, and numba requires
+  NumPy <= 2.4 while the env had NumPy 2.5 (fresh uv env pulls the newest).
+  Fixed: bootstrap_environment (vllm_patch.py) now checks installed NumPy
+  after the vllm install step and downgrades to numpy<2.5 proactively,
+  reporting the step in bootstrap results. Regression: version-tuple test.
+
+[ENV-NOTE-2] Runtime run 07:43 sticky observation: LoRA attach PASSED this
+  time (Adjusted targets -> q_proj.linear ...); failure moved forward to
+  vLLM init [N9]. Target-redirect fix verified live on Gemma4-31B 8-bit.
+
 [ENV-NOTE] (runtime environment, resolved 2026-10-25 — not a code bug):
   runtime had torch 2.14.1+cu130 while vllm==0.23.0 pins torch==2.11.0 ->
   vllm/_C.abi3.so ABI failure ("undefined symbol c10_cuda_check_...").

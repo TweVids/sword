@@ -411,6 +411,33 @@ def test_peft_target_redirect_with_mixed_supported_and_wrapped_matches():
     assert adapted == ["q_proj.linear"]
 
 
+def test_self_update_origin_fallback_without_direct_url():
+    """
+    [N8] On the runtime, self_update skipped with 'records no git source'
+    even though the dist was installed via `uv pip install git+...` (direct_url
+    detection failed). _update_source_url must fall back to a usable source URL.
+    """
+    from sword import runtime_setup
+
+    # The helper chain must resolve without env setup or a local dist record.
+    url = runtime_setup._update_source_url()
+    assert url, "self_update needs a source URL fallback"
+    assert "github.com" in url or url.startswith(("git+", "https://"))
+    assert runtime_setup._strip_vcs_pin(
+        "https://github.com/TweVids/sword@72f0e60c5f74bb1007b288d073ae98719e00b70f#egg=sword"
+    ) == "https://github.com/TweVids/sword"
+
+
+def test_version_tuple_compares_like_numba_gate():
+    """[N9] Bootstrap's NumPy gate compares 2.x versions correctly."""
+    from sword.vllm_patch import _version_tuple
+
+    assert _version_tuple("2.5.0") >= (2, 5)
+    assert _version_tuple("2.5") >= (2, 5)
+    assert not (_version_tuple("2.4.3") >= (2, 5))
+    assert _version_tuple("2.4.3") >= (2, 4)
+
+
 def test_weight_sync_strips_linear_segment_for_vllm_mapping():
     from sword.grpo_bridge import WeightSynchronizer
     ws = WeightSynchronizer()
