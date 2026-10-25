@@ -418,6 +418,12 @@ setattr(sys.modules[__name__], "vllm-patcher", vllm_patcher)
 
 
 
+def sword_installed_dir() -> str:
+    """Absolute path of the sword package actually imported by this process."""
+    from pathlib import Path
+    return str(Path(__file__).resolve().parent)
+
+
 def run_standalone_math_grpo(*args, **kwargs):
     """Convenience entry point for running Math GRPO training directly from sword."""
     from sword.train_math_grpo import run_standalone_math_grpo as _run

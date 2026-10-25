@@ -19,6 +19,153 @@ from .vllm_patch import vllm_patcher, loaded_package_versions, changed_loaded_pa
 HARNESS_NAMES = ("opencode", "codex", "gemini_cli", "pi")
 
 
+# ---------------------------------------------------------------------------
+# Self-update: keep the INSTALLED sword package in sync with the source repo.
+# The runtime imports sword from site-packages, so a plain `git pull` cannot
+# change behavior. Setup running with setup=True therefore grafts the repo
+# code into the installed package (reinstall, or byte-copy if that fails).
+# Disable with SWORD_SELF_UPDATE=0. Point at a nonstandard checkout with
+# SWORD_REPO_DIR=/path/to/sword.
+# ---------------------------------------------------------------------------
+
+def _package_hashes(sword_dir: Path) -> Dict[str, str]:
+    import hashlib
+    return {path.relative_to(sword_dir).as_posix(): hashlib.sha256(path.read_bytes())
+            for path in sorted(sword_dir.rglob("*.py"))}
+
+
+def _find_sword_source_repo() -> Optional[Path]:
+    env_dir = os.environ.get("SWORD_REPO_DIR")
+    candidates: list = []
+    if env_dir:
+        candidates.append(Path(env_dir))
+    cwd = Path.cwd()
+    candidates.append(cwd)
+    candidates.extend(cwd.parents)
+    for candidate in candidates:
+        try:
+            inside = candidate / "sword" / "grpo_bridge.py"
+            is_repo = (candidate / ".git").exists()
+            if inside.exists() and is_repo:
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+def self_update() -> Dict[str, Any]:
+    """
+    BUG-FIX rollout helper (user-requested 2026-10-25): auto-update the installed
+    sword package from the source repo inside the running process.
+    """
+    from . import sword_installed_dir
+    installed_dir = Path(sword_installed_dir())
+    if os.environ.get("SWORD_SELF_UPDATE", "1").strip().lower() in ("0", "false", "no"):
+        return {"ok": True, "skipped": "SWORD_SELF_UPDATE=0"}
+
+    repo = _find_sword_source_repo()
+    if repo is None:
+        installed_hashes = _package_hashes(installed_dir)
+        return {"ok": True, "skipped": "No source repo found (SWORD_REPO_DIR unset)",
+                "installed_from": str(installed_dir), "installed_files": len(installed_hashes)}
+
+    if repo.resolve() == installed_dir.parent.resolve():
+        return {"ok": True, "skipped": "Running from the source repo; nothing to graft",
+                "source_repo": str(repo), "installed_from": str(installed_dir)}
+
+    before = {name: mod for name, mod in list(sys.modules.items())
+              if name == "sword" or name.startswith("sword.")}
+    before_hashes = _package_hashes(installed_dir)
+
+    # 1. Pull the source repo so the graft contains the remote change set.
+    pull_tail = ""
+    try:
+        run = subprocess.run(["git", "-C", str(repo), "pull", "--ff-only"],
+                             text=True, capture_output=True, timeout=90)
+        pull_tail = ((run.stdout or "") + (run.stderr or ""))[-500:]
+    except Exception as exc:
+        pull_tail = f"git pull failed: {exc} (using the existing checkout)"
+
+    repo_hashes = _package_hashes(Path(repo) / "sword")
+    already_current = repo_hashes == before_hashes
+    changed_files = []
+    for rel, digest in repo_hashes.items():
+        if before_hashes.get(rel) != digest:
+            changed_files.append(rel)
+
+    results: Dict[str, Any] = {
+        "ok": True, "source_repo": str(repo), "installed_from": str(installed_dir),
+        "changed_files": [] if already_current else changed_files,
+    }
+    if already_current:
+        results["skipped"] = (f"Installed package already matches {repo.resolve()}; "
+                              f"{'pull said: ' + pull_tail.strip() if pull_tail.strip() else 'no new commits'}")
+        return results
+
+    # 2. Preferred path: reinstall the repo as a wheel into the live venv.
+    reinstalled = False
+    command: list = []
+    if shutil.which("uv"):
+        command = ["uv", "pip", "install", "--python", sys.executable,
+                   "--force-reinstall", "--no-deps", "--no-build-isolation", str(repo)]
+    else:
+        command = [sys.executable, "-m", "pip", "install", "--force-reinstall",
+                   "--no-deps", str(repo)]
+    try:
+        run = subprocess.run(command, text=True, capture_output=True, timeout=600)
+        results["graft_command"] = " ".join(command)
+        results["graft_exit_code"] = run.returncode
+        results["graft_tail"] = ((run.stdout or "") + (run.stderr or ""))[-1500:]
+        reinstalled = run.returncode == 0
+    except Exception as exc:
+        results["graft_tail"] = f"reinstall failed: {exc}"
+
+    # 3. Fallback ("self-patch"): byte-copy the repo's python sources over the
+    #    installed package when wheel building/reinstalling is not viable.
+    if not reinstalled:
+        copied = 0
+        try:
+            for rel, _digest in repo_hashes.items():
+                src = Path(repo) / "sword" / rel
+                dst = installed_dir / rel
+                if src.exists():
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(src, dst)
+                    copied += 1
+            results["self_patch"] = f"copied {copied} files into {installed_dir}"
+        except OSError as exc:
+            results["ok"] = False
+            results["error"] = f"reinstall and self-patch both failed: {exc}"
+            return results
+
+    # 4. Reload already-imported sword modules whose bytes changed so the fix is
+    #    live in this process (lazily imported modules do not need this).
+    import importlib
+    importlib.invalidate_caches()
+    after_hashes = _package_hashes(installed_dir)
+    reloaded, reload_errors = [], []
+    stale = sorted((name for name, mod in list(before.items())
+                    if getattr(mod, "__file__", None)), key=lambda n: n.count("."))
+    for name in stale:
+        mod = sys.modules.get(name)
+        file = getattr(mod, "__file__", None)
+        path = Path(file) if file else None
+        rel = str(path.relative_to(installed_dir)) if path and installed_dir in path.parents else None
+        if rel and after_hashes.get(rel) != before_hashes.get(rel) and name != "sword":
+            try:
+                importlib.reload(sys.modules[name])
+                reloaded.append(name)
+            except Exception as exc:
+                reload_errors.append(f"{name}: {exc}")
+    results["reloaded_modules"] = reloaded
+    results["reload_errors"] = reload_errors
+    if reload_errors:
+        results["restart_kernel_required_hint"] = (
+            f"Some modules failed to hot-reload: {reload_errors}. A kernel restart "
+            "guarantees the updated code is live.")
+    return results
+
+
 def configure_training_environment() -> Dict[str, str]:
     values = {
         "VLLM_USE_FLASHINFER_SAMPLER": "0", "VLLM_USE_FLASHINFER": "0",
@@ -144,7 +291,7 @@ def setup_environment(
     whether already-imported packages changed so training can wait for a kernel restart.
     """
     environment = configure_training_environment()
-    names = ("platform", "dependencies", "vllm", "harnesses", "target_model", "b_model")
+    names = ("self_update", "platform", "dependencies", "vllm", "harnesses", "target_model", "b_model")
     if mock_test:
         return {
             "ok": True, "mode": "mock", "environment_validated": False,
@@ -169,6 +316,7 @@ def setup_environment(
         return bool(result.get("ok"))
 
     import torch
+    run("self_update", self_update)
     steps["platform"] = {
         "ok": platform.system() == "Linux" and torch.cuda.is_available(),
         "system": platform.system(), "cuda_available": torch.cuda.is_available(),

@@ -95,16 +95,24 @@ def peft_compatible_target_names(model: nn.Module, requested: List[str]) -> List
     changed = False
     for target in requested:
         matches = [m for key, m in named_modules if key == target or key.endswith("." + target)]
-        if matches and not any(isinstance(m, supported) for m in matches):
+        if not matches:
+            print(f"[GRPO] LoRA target scan: '{target}' -> no module matched; "
+                  f"PEFT may resolve it differently at attach time", flush=True)
+            adapted.append(target)
+            continue
+        classes = sorted({type(m).__name__ for m in matches})
+        dispatchable = any(isinstance(m, supported) for m in matches)
+        print(f"[GRPO] LoRA target scan: '{target}' -> {len(matches)} module(s), "
+              f"classes {classes}, {'dispatchable' if dispatchable else 'NOT dispatchable'}",
+              flush=True)
+        if not dispatchable:
             inner = [m for key, m in named_modules
                      if key.endswith("." + target + ".linear") and isinstance(m, supported)]
             if inner:
                 adapted.append(target + ".linear")
                 changed = True
                 continue
-            print(f"[GRPO] LoRA target '{target}' resolves only to unsupported classes "
-                  f"{sorted({type(m).__name__ for m in matches})} and no supported inner "
-                  f"'.linear' layer was found", flush=True)
+            print(f"[GRPO] LoRA target '{target}' has no supported inner '.linear' layer", flush=True)
         adapted.append(target)
     if changed:
         print(f"[GRPO] Adjusted LoRA targets for PEFT-compatible modules: {adapted}", flush=True)

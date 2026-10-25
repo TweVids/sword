@@ -86,6 +86,23 @@ STATUS UPDATE (same day, follow-up pass):
   Regression: target-redirect test with a wrapper-module tree + key
   normalization test in test/test_bugs_report.py.
 
+[N6] SELF-UPDATE MECHANISM (added 2026-10-25, user-requested):
+  Discovery from live run: the runtime imports sword from site-packages
+  (/tmp/uv-venv/lib/python3.13/site-packages/sword/...), so `git pull`
+  alone never changed runtime behavior - the identical grpo_training error
+  kept reproducing even with fixes committed. New sword/runtime_setup.py
+  self_update() runs as the FIRST setup step of sword.train(setup=True):
+    1) locates the source repo (SWORD_REPO_DIR env or cwd/.git search);
+    2) git pull --ff-only it;
+    3) grafts the repo into the live venv: preferred `uv pip install
+       --force-reinstall --no-deps --no-build-isolation <repo>`, fallback
+       byte-copy ("self-patch") of sword/*.py into the installed package;
+    4) importlib.invalidate_caches() + hot-reload already-imported sword
+       modules whose bytes changed.
+  Disabled with SWORD_SELF_UPDATE=0. A kernel restart is still the
+  bulletproof option; hot-reload covers lazily imported modules (bridge,
+  trainer tooling).
+
 [ENV-NOTE] (runtime environment, resolved 2026-10-25 — not a code bug):
   runtime had torch 2.14.1+cu130 while vllm==0.23.0 pins torch==2.11.0 ->
   vllm/_C.abi3.so ABI failure ("undefined symbol c10_cuda_check_...").
