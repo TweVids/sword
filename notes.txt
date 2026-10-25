@@ -108,3 +108,13 @@ step 11: implement real workspace sandbox and thorough systemic fixes:
   * Resolved dynamic TypeScript template expressions in load_gemini_prompt (mandateConfirm, mandateExplainBeforeActing, mandateContinueWork, workflowStepResearch, workflowStepStrategy) so no empty bullet lines remain; added HARNESS_GIT_COMMITS commit pinning, _PROMPT_CACHE caching, and RuntimeWarning on fallback.
   * Made BaseHarness.format_prompt tokenizer-aware and section-boundary-aware so tool declarations and the trailing Task block are preserved intact.
   * Audited callers of status == "partial" across sword/ and test/.
+- step 15 completed: added prep_and_logs mode for cloud diagnosis and 5-step test training:
+  * Added prep_and_logs parameter to sword.train(prep_and_logs=True, B_model_port=11343, test=True).
+  * Automatic environment variable injection: VLLM_USE_FLASHINFER_SAMPLER="0", VLLM_USE_FLASHINFER="0", VLLM_WORKER_MULTIPROC_METHOD="spawn", plus allow_global_per_layer_attribute_access in hf_overrides.
+  * Added ngram prompt lookup speculative decoding configuration in GRPOBridge vLLM initialization to speed up rollout generation.
+  * Added vllm_patcher bootstrap execution with detailed step-by-step diagnostic logging.
+  * Added all 4 harness validation checks (OpenCode, Codex, Gemini CLI, Pi) reporting repository cloning status, system prompt characters, and initialized classes.
+  * Added Model B Ollama server diagnostic check on B_model_port (checking URL reachability, installed models, target model match, and thinking verification).
+  * Built 5-sample balanced dataset satisfying dataset schema (2 code samples with harness annotations and 3 general/math samples).
+  * Added real loss and gradient norm tracking per step in sword/long_trainer.py and sword/grpo_bridge.py.
+  * Added test_prep_and_logs_execution in test/test_new_trainer.py.

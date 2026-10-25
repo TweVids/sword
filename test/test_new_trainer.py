@@ -624,6 +624,27 @@ class TestNewTrainerArchitecture(unittest.TestCase):
         self.assertIn("src/util.py", res_gem.tool_history[1]["output"])
         self.assertIn("src/util.py:1:def magic_helper():", res_gem.tool_history[2]["output"])
 
+    def test_prep_and_logs_execution(self):
+        import sword
+        res = sword.train(
+            prep_and_logs=True,
+            B_model_port=11343,
+            test=True,
+            mock_test=True,
+        )
+        self.assertTrue(res.get("ok"))
+        self.assertIn("patch_result", res)
+        self.assertIn("harness_status", res)
+        self.assertIn("b_model_diagnostic", res)
+        self.assertIn("train_result", res)
+        train_res = res["train_result"]
+        self.assertEqual(train_res.get("status"), "completed")
+        self.assertEqual(train_res.get("final_step"), 5)
+        self.assertEqual(train_res.get("visited_rows"), 5)
+        self.assertEqual(os.environ.get("VLLM_USE_FLASHINFER_SAMPLER"), "0")
+        self.assertEqual(os.environ.get("VLLM_USE_FLASHINFER"), "0")
+        self.assertEqual(os.environ.get("VLLM_WORKER_MULTIPROC_METHOD"), "spawn")
+
 
 if __name__ == "__main__":
     unittest.main()

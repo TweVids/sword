@@ -257,10 +257,11 @@ def run_long_train(
     records, dataset_sha256 = load_dataset_records(dataset, hf_token=HF_TOKEN)
     print(f"[*] Dataset SHA-256: {dataset_sha256} ({len(records)} problem rows)")
 
+    allow_retest = bool(kwargs.get("allow_retest", args.get("allow_retest", False)))
     completed_hashes = ckpt_mgr.get_completed_dataset_hashes()
 
     # If entire dataset SHA-256 matches completed log
-    if dataset_sha256 in completed_hashes:
+    if dataset_sha256 in completed_hashes and not allow_retest:
         print(f"\n[Sword] The data is already train on, suggest prepare new dataset to continues.")
         return {
             "status": "already_trained",
@@ -269,20 +270,21 @@ def run_long_train(
         }
 
     # Expandable dataset: filter out already-completed rows
-    uncompleted_records = [r for r in records if r.row_hash not in completed_hashes]
-    if not uncompleted_records:
-        ckpt_mgr.mark_dataset_completed(dataset_sha256, str(dataset)[:50])
-        print(f"\n[Sword] The data is already train on, suggest prepare new dataset to continues.")
-        return {
-            "status": "already_trained",
-            "dataset_sha256": dataset_sha256,
-            "steps_completed": 0,
-        }
+    if not allow_retest:
+        uncompleted_records = [r for r in records if r.row_hash not in completed_hashes]
+        if not uncompleted_records:
+            ckpt_mgr.mark_dataset_completed(dataset_sha256, str(dataset)[:50])
+            print(f"\n[Sword] The data is already train on, suggest prepare new dataset to continues.")
+            return {
+                "status": "already_trained",
+                "dataset_sha256": dataset_sha256,
+                "steps_completed": 0,
+            }
 
-    if len(uncompleted_records) < len(records):
-        skipped = len(records) - len(uncompleted_records)
-        print(f"[*] Expandable dataset detected: skipping {skipped} already-trained rows. Continuing with {len(uncompleted_records)} new rows.")
-        records = uncompleted_records
+        if len(uncompleted_records) < len(records):
+            skipped = len(records) - len(uncompleted_records)
+            print(f"[*] Expandable dataset detected: skipping {skipped} already-trained rows. Continuing with {len(uncompleted_records)} new rows.")
+            records = uncompleted_records
 
     # 3. Model B Judge & Scorer Initialization
     b_judge_config = ModelBJudgeConfig(
@@ -290,6 +292,8 @@ def run_long_train(
         host=kwargs.get("B_model_host", "127.0.0.1"),
         model_name=kwargs.get("B_model_name", "gpt-oss:120b"),
         num_predict=int(kwargs.get("B_model_num_predict", 1024)),
+        reasoning=kwargs.get("B_model_thinking", kwargs.get("B_model_reasoning", True)),
+        show_thinking=bool(kwargs.get("B_model_show_thinking", False)),
         auto_unload=auto_unload_B_model,
         keep_alive_during_eval=B_model_keep_alive,
     )
@@ -307,12 +311,19 @@ def run_long_train(
         lora_alpha=int(lora_conf.get("lora_alpha", 32)),
         lora_dropout=float(lora_conf.get("lora_dropout", 0.0)),
         target_modules=lora_conf.get("target_modules", ["q_proj", "k_proj", "v_proj", "o_proj"]),
+        vllm_quantization=kwargs.get("vllm_quantization", kwargs.get("quantization")),
+        kv_cache_dtype=str(kwargs.get("kv_cache_dtype", "auto")),
+        speculative_ngram=bool(kwargs.get("speculative_ngram", kwargs.get("ngram", False))),
+        num_speculative_tokens=int(kwargs.get("num_speculative_tokens", 4)),
+        ngram_prompt_lookup_max=int(kwargs.get("ngram_prompt_lookup_max", 4)),
+        hf_overrides=kwargs.get("hf_overrides"),
         device=device,
     )
     bridge = GRPOBridge(config=bridge_config)
     bridge.initialize_trainer(
         model=kwargs.get("trainer_model"),
         tokenizer=kwargs.get("tokenizer"),
+        mock_test=bool(kwargs.get("mock_test", False)),
     )
 
     trainable_params = [p for p in bridge.trainer_model.parameters() if p.requires_grad]
@@ -505,9 +516,11 @@ def run_long_train(
             if show_detail_logs:
                 avg_reward = sum(s.total_score for s in step_scores) / max(1, len(step_scores))
                 avg_truth = sum(s.truth for s in step_scores) / max(1, len(step_scores))
+                grad_norm_disp = metrics.get('grad_norm', 0.0)
                 print(
                     f"Step {step_idx:04d}/{start_step + steps:04d} | "
                     f"Loss: {metrics.get('grpo_loss', 0.0):.4f} | "
+                    f"GradNorm: {grad_norm_disp:.4f} | "
                     f"Avg Reward: {avg_reward:.3f} | "
                     f"Truth: {avg_truth:.2f} | "
                     f"Harness: {current_row.harness or 'none'} | "

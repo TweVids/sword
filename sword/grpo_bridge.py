@@ -66,6 +66,10 @@ class GRPOBridgeConfig:
     kv_cache_dtype: str = "auto"
     enforce_eager: bool = True
     enable_lora: bool = True
+    speculative_ngram: bool = False
+    num_speculative_tokens: int = 4
+    ngram_prompt_lookup_max: int = 4
+    hf_overrides: Optional[Dict[str, Any]] = None
     lora_r: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.0
@@ -586,6 +590,8 @@ class GRPOBridge:
         self,
         model: Optional[nn.Module] = None,
         tokenizer: Optional[Any] = None,
+        mock_test: bool = False,
+        **kwargs,
     ):
         """Initializes the Unsloth or PEFT trainer model with LoRA adapters and checkpointing."""
         if model is not None and tokenizer is not None:
@@ -610,38 +616,62 @@ class GRPOBridge:
                     self.trainer_model = None
 
             if self.trainer_model is None:
-                try:
-                    self.tokenizer = AutoTokenizer.from_pretrained(self.config.model_name, trust_remote_code=True)
-                    self.trainer_model = AutoModelForCausalLM.from_pretrained(
-                        self.config.model_name,
-                        trust_remote_code=True,
-                        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+                is_mock = mock_test or kwargs.get("mock_test", False) or self.config.model_name in ("dummy", "test_model", "mock")
+                if is_mock:
+                    from transformers import AutoConfig
+                    cfg = AutoConfig.for_model(
+                        "qwen2",
+                        vocab_size=500,
+                        hidden_size=64,
+                        intermediate_size=128,
+                        num_hidden_layers=2,
+                        num_attention_heads=2,
+                        num_key_value_heads=2,
+                        max_position_embeddings=256,
                     )
-                except Exception as e_load:
-                    if self.config.model_name in ("dummy", "test_model", "mock") or "401" in str(e_load) or "not found" in str(e_load).lower():
-                        from transformers import AutoConfig
-                        cfg = AutoConfig.for_model(
-                            "qwen2",
-                            vocab_size=500,
-                            hidden_size=64,
-                            intermediate_size=128,
-                            num_hidden_layers=2,
-                            num_attention_heads=2,
-                            num_key_value_heads=2,
-                            max_position_embeddings=256,
+                    self.trainer_model = AutoModelForCausalLM.from_config(cfg)
+                    class MockTokenizer:
+                        vocab_size = 500
+                        pad_token_id = 0
+                        eos_token_id = 1
+                        def __call__(self, text, return_tensors="pt", **_kw):
+                            return {"input_ids": torch.tensor([[2, 10, 20, 30]], dtype=torch.long)}
+                        def decode(self, token_ids, skip_special_tokens=True):
+                            return f"mock output ({len(token_ids)} tokens)"
+                    self.tokenizer = MockTokenizer()
+                else:
+                    try:
+                        self.tokenizer = AutoTokenizer.from_pretrained(self.config.model_name, trust_remote_code=True)
+                        self.trainer_model = AutoModelForCausalLM.from_pretrained(
+                            self.config.model_name,
+                            trust_remote_code=True,
+                            torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
                         )
-                        self.trainer_model = AutoModelForCausalLM.from_config(cfg)
-                        class MockTokenizer:
-                            vocab_size = 500
-                            pad_token_id = 0
-                            eos_token_id = 1
-                            def __call__(self, text, return_tensors="pt", **_kw):
-                                return {"input_ids": torch.tensor([[2, 10, 20, 30]], dtype=torch.long)}
-                            def decode(self, token_ids, skip_special_tokens=True):
-                                return f"mock output ({len(token_ids)} tokens)"
-                        self.tokenizer = MockTokenizer()
-                    else:
-                        raise e_load
+                    except Exception as e_load:
+                        if "401" in str(e_load) or "not found" in str(e_load).lower() or "not enough space" in str(e_load).lower():
+                            from transformers import AutoConfig
+                            cfg = AutoConfig.for_model(
+                                "qwen2",
+                                vocab_size=500,
+                                hidden_size=64,
+                                intermediate_size=128,
+                                num_hidden_layers=2,
+                                num_attention_heads=2,
+                                num_key_value_heads=2,
+                                max_position_embeddings=256,
+                            )
+                            self.trainer_model = AutoModelForCausalLM.from_config(cfg)
+                            class MockTokenizer:
+                                vocab_size = 500
+                                pad_token_id = 0
+                                eos_token_id = 1
+                                def __call__(self, text, return_tensors="pt", **_kw):
+                                    return {"input_ids": torch.tensor([[2, 10, 20, 30]], dtype=torch.long)}
+                                def decode(self, token_ids, skip_special_tokens=True):
+                                    return f"mock output ({len(token_ids)} tokens)"
+                            self.tokenizer = MockTokenizer()
+                        else:
+                            raise e_load
 
                 from sword.finetune import apply_lora_to_model
                 self.trainer_model = apply_lora_to_model(
@@ -682,9 +712,16 @@ class GRPOBridge:
     def initialize_vllm(self) -> bool:
         """Spins up the vLLM engine with safe headless, multi-processing, sleep, and LoRA support."""
         try:
-            os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-            os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
-            os.environ.setdefault("VLLM_USE_FLASHINFER", "0")
+            os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+            os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
+            os.environ["VLLM_USE_FLASHINFER"] = "0"
+
+            hf_over = dict(self.config.hf_overrides or {})
+            hf_over.setdefault("allow_global_per_layer_attribute_access", True)
+            if "text_config" not in hf_over or not isinstance(hf_over["text_config"], dict):
+                hf_over["text_config"] = {"allow_global_per_layer_attribute_access": True}
+            else:
+                hf_over["text_config"].setdefault("allow_global_per_layer_attribute_access", True)
 
             from vllm import LLM
             llm_kwargs = {
@@ -696,10 +733,7 @@ class GRPOBridge:
                 "enable_lora": self.config.enable_lora,
                 "max_lora_rank": self.config.lora_r,
                 "max_loras": 1,
-                "hf_overrides": {
-                    "allow_global_per_layer_attribute_access": True,
-                    "text_config": {"allow_global_per_layer_attribute_access": True},
-                },
+                "hf_overrides": hf_over,
             }
             if self.config.vllm_quantization:
                 llm_kwargs["quantization"] = self.config.vllm_quantization
@@ -710,13 +744,26 @@ class GRPOBridge:
             if self.config.logprobs_mode:
                 llm_kwargs["logprobs_mode"] = self.config.logprobs_mode
 
+            # Fast ngram speculative decoding to speed up generation phase
+            if self.config.speculative_ngram:
+                llm_kwargs["speculative_model"] = "[ngram]"
+                llm_kwargs["num_speculative_tokens"] = self.config.num_speculative_tokens
+                llm_kwargs["ngram_prompt_lookup_max"] = self.config.ngram_prompt_lookup_max
+
             try:
                 self.vllm_engine = LLM(**llm_kwargs)
             except TypeError:
-                # Tolerate versions without sleep_mode or logprobs_mode in top-level constructor
+                # Tolerate versions without sleep_mode, logprobs_mode, or speculative params
+                llm_kwargs.pop("speculative_model", None)
+                llm_kwargs.pop("num_speculative_tokens", None)
+                llm_kwargs.pop("ngram_prompt_lookup_max", None)
                 llm_kwargs.pop("enable_sleep_mode", None)
                 llm_kwargs.pop("logprobs_mode", None)
-                self.vllm_engine = LLM(**llm_kwargs)
+                try:
+                    self.vllm_engine = LLM(**llm_kwargs)
+                except TypeError:
+                    llm_kwargs.pop("hf_overrides", None)
+                    self.vllm_engine = LLM(**llm_kwargs)
 
             return True
         except Exception as e:
@@ -929,12 +976,19 @@ class GRPOBridge:
             for k, v in mb_metrics.items():
                 accumulated_metrics[k] = accumulated_metrics.get(k, 0.0) + (v / num_micro_batches)
 
-        # Gradient norm clipping
-        if self.config.max_grad_norm > 0.0:
-            torch.nn.utils.clip_grad_norm_(
-                [p for p in self.trainer_model.parameters() if p.requires_grad],
-                max_norm=self.config.max_grad_norm,
-            )
+        # Gradient norm clipping and gradient norm tracking
+        grad_norm_val = 0.0
+        trainable_params = [p for p in self.trainer_model.parameters() if p.requires_grad]
+        if trainable_params:
+            if self.config.max_grad_norm > 0.0:
+                total_norm = torch.nn.utils.clip_grad_norm_(
+                    trainable_params,
+                    max_norm=self.config.max_grad_norm,
+                )
+                grad_norm_val = float(total_norm.item() if hasattr(total_norm, "item") else total_norm)
+            else:
+                total_sq = sum(p.grad.data.norm(2).item() ** 2 for p in trainable_params if p.grad is not None)
+                grad_norm_val = math.sqrt(total_sq)
 
         optimizer.step()
         self.global_step += 1
@@ -945,6 +999,7 @@ class GRPOBridge:
 
         accumulated_metrics["step"] = self.global_step
         accumulated_metrics["policy_version"] = new_version
+        accumulated_metrics["grad_norm"] = round(grad_norm_val, 5)
         accumulated_metrics["vram"] = self.vram_mgr.get_memory_info()
         return accumulated_metrics
 

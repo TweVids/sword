@@ -9,7 +9,7 @@ import gc
 import json
 import time
 from dataclasses import dataclass, field
-from typing import Dict, Any, Tuple, Optional, List
+from typing import Dict, Any, Tuple, Optional, List, Union
 
 try:
     import requests
@@ -54,11 +54,12 @@ class ModelBJudgeConfig:
     temperature: float = 0.1
     num_ctx: int = 8192
     num_predict: int = 1024
-    reasoning: Optional[str] = None
+    reasoning: Optional[Union[str, bool]] = True
     force_gpu: bool = True
     use_mmap: bool = False
     auto_unload: bool = True
     keep_alive_during_eval: str = "5m"
+    show_thinking: bool = False
 
 
 class ModelBJudge:
@@ -99,10 +100,55 @@ class ModelBJudge:
         if requests is None:
             return False
         try:
-            resp = requests.get(f"{self.url}/api/tags", timeout=3)
+            resp = requests.get(f"{self.url}/api/tags", timeout=5)
             return resp.status_code == 200
         except Exception:
             return False
+
+    def list_models(self) -> List[str]:
+        """Returns list of models installed on the Ollama server."""
+        if requests is None:
+            return []
+        try:
+            resp = requests.get(f"{self.url}/api/tags", timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                models = data.get("models", [])
+                return [m.get("name", "") for m in models if m.get("name")]
+        except Exception:
+            pass
+        return []
+
+    def check_connection(self) -> Dict[str, Any]:
+        """Performs a comprehensive connection check to Ollama server and Model B."""
+        out = {
+            "url": self.url,
+            "port": self.config.port,
+            "host": self.config.host,
+            "model_name": self.config.model_name,
+            "reachable": False,
+            "installed_models": [],
+            "model_found": False,
+            "test_response": "",
+            "error": None,
+        }
+        if requests is None:
+            out["error"] = "requests library is not installed"
+            return out
+        try:
+            resp = requests.get(f"{self.url}/api/tags", timeout=5)
+            if resp.status_code == 200:
+                out["reachable"] = True
+                models = resp.json().get("models", [])
+                model_names = [m.get("name", "") for m in models if m.get("name")]
+                out["installed_models"] = model_names
+                target_base = self.config.model_name.split(":")[0]
+                out["model_found"] = any(self.config.model_name == name or target_base in name for name in model_names)
+            else:
+                out["error"] = f"HTTP {resp.status_code}: {resp.text}"
+        except Exception as e:
+            out["error"] = str(e)
+        return out
 
     def unload(self) -> bool:
         """
@@ -297,7 +343,7 @@ class ModelBJudge:
             "keep_alive": self.config.keep_alive_during_eval,
             "options": options,
         }
-        if self.config.reasoning:
+        if self.config.reasoning is not None:
             payload["think"] = self.config.reasoning
 
         try:
@@ -312,7 +358,10 @@ class ModelBJudge:
 
             resp.raise_for_status()
             message_obj = resp.json().get("message", {})
+            thinking = message_obj.get("thinking") or ""
             content = message_obj.get("content", "") or ""
+            if thinking and getattr(self.config, "show_thinking", False):
+                print(f"[ModelB Thinking]\n{thinking}\n" + "-" * 60)
             return self.parse_scores(content, fallback_tools_success=fallback_tool_ratio)
         except Exception:
             return self._deterministic_fallback(

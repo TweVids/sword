@@ -1,6 +1,8 @@
 import os
 import sys
 import time
+import json
+import subprocess
 from typing import Optional, Any, Dict, List, Union
 
 import torch
@@ -104,12 +106,16 @@ def train(
     speculative_k: int = 3,
     mock_test: bool = False,
     use_vllm: bool = False,
+    prep_and_logs: bool = False,
     **kwargs,
 ) -> Dict[str, Any]:
     """
     Unified entry point for Sword training and concurrent serving benchmark.
     Usage for quick inference testing:
         sword.train(test=True, model="Qwen/Qwen3.5-0.8B", concurrent=8)
+
+    Usage for preparation, environment validation, and 5-step test training:
+        sword.train(prep_and_logs=True, B_model_port=11343, test=True)
 
     Usage for long-running infinite GRPO training:
         sword.train(
@@ -130,6 +136,23 @@ def train(
             score_logs=True,
         )
     """
+    # 0. Preparation and comprehensive system diagnostic logs mode
+    if prep_and_logs:
+        return _run_prep_and_logs(
+            test=test,
+            long_train=long_train,
+            dataset=dataset,
+            model=model,
+            B_model_port=B_model_port,
+            concurrent=concurrent,
+            load_in_8bit=load_in_8bit,
+            load_in_4bit=load_in_4bit,
+            lora_cfg=lora_cfg,
+            Argument=Argument,
+            mock_test=mock_test,
+            **kwargs,
+        )
+
     if long_train or not test:
         from sword.long_trainer import run_long_train
         return run_long_train(
@@ -389,3 +412,281 @@ def train(
     print(f"[Sword] Starting training pipeline for {model}...")
     from sword.train_math_grpo import run_standalone_math_grpo
     return run_standalone_math_grpo(**kwargs)
+
+
+def _run_prep_and_logs(
+    test: bool = True,
+    long_train: bool = False,
+    dataset: Union[str, List[Any], Dict[str, Any]] = "math-ai/TemplateGSM",
+    model: str = "google/gemma-4-31B-it",
+    B_model_port: int = 11343,
+    concurrent: int = 8,
+    load_in_8bit: bool = True,
+    load_in_4bit: bool = False,
+    lora_cfg: Optional[Dict[str, Any]] = None,
+    Argument: Optional[Dict[str, Any]] = None,
+    mock_test: bool = False,
+    **kwargs,
+) -> Dict[str, Any]:
+    """
+    Diagnostic preparation, validation, and 5-step test training runner:
+    1. Sets required environment variables (vLLM spawn, disable broken flashinfer sampler).
+    2. Runs vllm_patcher bootstrap and prints step-by-step patch logs.
+    3. Validates and tests all 4 authentic harnesses (OpenCode, Codex, Gemini CLI, Pi).
+    4. Connects to Ollama on B_model_port, tests model tags and thinking activation.
+    5. Prints system environment, GPU info, and library versions.
+    6. Executes a 5-step simple test training run (2 code, 3 general/math) verifying
+       vLLM generation with ngram speedup, loss, and gradient norm tracking.
+    """
+    # 1. Environment variables setup
+    os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
+    os.environ["VLLM_USE_FLASHINFER"] = "0"
+    os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+
+    # Configure heterogeneous layer access
+    try:
+        from transformers.configuration_utils import PretrainedConfig
+        PretrainedConfig.allow_global_per_layer_attribute_access = True
+    except Exception:
+        pass
+
+    hf_overrides = kwargs.get("hf_overrides") or {
+        "allow_global_per_layer_attribute_access": True,
+        "text_config": {"allow_global_per_layer_attribute_access": True},
+    }
+
+    print("=" * 80)
+    print(" SWORD PREP & DIAGNOSTIC SYSTEM LOGS")
+    print("=" * 80)
+    print(f"[*] Environment Variables Set:")
+    print(f"    VLLM_USE_FLASHINFER_SAMPLER = {os.environ.get('VLLM_USE_FLASHINFER_SAMPLER')}")
+    print(f"    VLLM_USE_FLASHINFER         = {os.environ.get('VLLM_USE_FLASHINFER')}")
+    print(f"    VLLM_WORKER_MULTIPROC_METHOD = {os.environ.get('VLLM_WORKER_MULTIPROC_METHOD')}")
+    print(f"[*] Hugging Face Config Overrides: {hf_overrides}")
+
+    # System and device telemetry
+    print("\n[*] Hardware & Software Telemetry:")
+    print(f"    Python:       {sys.version.split()[0]} ({sys.executable})")
+    print(f"    PyTorch:      {torch.__version__}")
+    cuda_avail = torch.cuda.is_available()
+    print(f"    CUDA Avail:   {cuda_avail}")
+    if cuda_avail:
+        print(f"    GPU Device:   {torch.cuda.get_device_name(0)}")
+        print(f"    GPU Count:    {torch.cuda.device_count()}")
+        free_b, total_b = torch.cuda.mem_get_info()
+        print(f"    VRAM Info:    {free_b / (1024**3):.2f} GB free / {total_b / (1024**3):.2f} GB total")
+    else:
+        print(f"    Device:       CPU fallback")
+
+    # 2. Prepare vLLM Patcher
+    print("\n" + "-" * 80)
+    print(" STEP 1: PREPARE vLLM PATCHER")
+    print("-" * 80)
+    patch_result = {}
+    try:
+        from sword.vllm_patch import vllm_patcher
+        patch_result = vllm_patcher(verbose=True)
+    except Exception as e_patch:
+        print(f"[Sword Alert] vLLM patcher note: {e_patch}")
+        patch_result = {"ok": False, "error": str(e_patch)}
+
+    # 3. Harness Validation Checking (All 4 harnesses)
+    print("\n" + "-" * 80)
+    print(" STEP 2: HARNESS VALIDATION CHECK (ALL 4 HARNESSES)")
+    print("-" * 80)
+    from sword.harness import (
+        ensure_harness_repo,
+        get_harness,
+        get_harness_system_prompt,
+        WorkspaceSandbox,
+    )
+    harness_status: Dict[str, Any] = {}
+    test_harnesses = ["opencode", "codex", "gemini_cli", "pi"]
+    for h_name in test_harnesses:
+        try:
+            repo_ok = ensure_harness_repo(h_name)
+            p_text = get_harness_system_prompt(h_name)
+            h_inst = get_harness(h_name)
+            harness_status[h_name] = {
+                "repo_ready": repo_ok,
+                "prompt_chars": len(p_text),
+                "initialized": h_inst is not None,
+                "class": h_inst.__class__.__name__ if h_inst else None,
+            }
+            print(f"    [{h_name.upper()}] Repo: {'OK' if repo_ok else 'Missing'} | "
+                  f"Prompt: {len(p_text)} chars | Harness: {h_inst.__class__.__name__ if h_inst else 'None'}")
+        except Exception as e_h:
+            harness_status[h_name] = {"error": str(e_h)}
+            print(f"    [{h_name.upper()}] Validation failed: {e_h}")
+
+    # 4. Model B Check in Ollama
+    print("\n" + "-" * 80)
+    print(f" STEP 3: 'B' MODEL CHECK IN OLLAMA (Port {B_model_port})")
+    print("-" * 80)
+    from sword.b_model import ModelBJudge, ModelBJudgeConfig
+    b_model_name = kwargs.get("B_model_name", "qwen3.6:35b-a3b")
+    b_judge_cfg = ModelBJudgeConfig(
+        host=kwargs.get("B_model_host", "127.0.0.1"),
+        port=B_model_port,
+        model_name=b_model_name,
+        reasoning=kwargs.get("B_model_thinking", True),
+        show_thinking=True,
+        timeout=float(kwargs.get("B_model_timeout", 30.0)),
+        auto_unload=kwargs.get("auto_unload_B_model", False),
+    )
+    b_judge = ModelBJudge(config=b_judge_cfg)
+    b_diag = b_judge.check_connection()
+    print(f"    Ollama URL:         {b_diag['url']}")
+    print(f"    Reachable:          {b_diag['reachable']}")
+    print(f"    Installed Models:   {b_diag['installed_models']}")
+    print(f"    Target Model:       {b_model_name} (found={b_diag['model_found']})")
+    if b_diag.get("error"):
+        print(f"    Notice:             {b_diag['error']}")
+
+    # Perform quick thinking call test on Model B if reachable
+    b_eval_test = None
+    if b_diag["reachable"]:
+        print(f"    Executing quick thinking verification on {b_model_name}...")
+        try:
+            b_eval_test = b_judge.evaluate(
+                problem="What is 2 + 2?",
+                solution="4",
+                reasoning_rule="Show deduction.",
+                answer_rule="Final answer 4.",
+                candidate_response="<think>2 plus 2 equals 4.</think>4",
+            )
+            print(f"    Model B Score Test: truth={b_eval_test.truth}, formatted={b_eval_test.formatted}, rule={b_eval_test.rule_reasoning_follow}")
+        except Exception as e_beval:
+            print(f"    Model B Eval Test Notice: {e_beval}")
+
+    # 5. Build 5-sample balanced dataset satisfying dataset schema
+    print("\n" + "-" * 80)
+    print(" STEP 4: PREPARE 5-STEP TEST DATASET (2 Code + 3 General/Math)")
+    print("-" * 80)
+    test_5_samples = [
+        # Sample 1: Code (OpenCode / Pi)
+        {
+            "problem": "Write a Python function `is_prime(n: int) -> bool` that returns True if n is prime and False otherwise.",
+            "solution": "def is_prime(n: int) -> bool:\n    if n <= 1: return False\n    for i in range(2, int(n**0.5) + 1):\n        if n % i == 0: return False\n    return True",
+            "reasoning_rule": "Enclose algorithmic logic inside <think> tags.",
+            "answer_rule": "Provide clean python function in ```python ... ``` block.",
+            "can_be_verify": True,
+            "difficulty": "medium",
+            "category": "code",
+            "harness": "opencode",
+        },
+        # Sample 2: Code (Codex / Gemini)
+        {
+            "problem": "Write a Python function `reverse_words(s: str) -> str` that reverses the order of words in a sentence.",
+            "solution": "def reverse_words(s: str) -> str:\n    return ' '.join(s.strip().split()[::-1])",
+            "reasoning_rule": "State boundary handling in reasoning trace.",
+            "answer_rule": "Return exact single function definition.",
+            "can_be_verify": True,
+            "difficulty": "easy",
+            "category": "code",
+            "harness": "codex",
+        },
+        # Sample 3: Math (Calculus / Algebra)
+        {
+            "problem": "Solve for x: 3*x + 15 = 42.",
+            "solution": "9",
+            "reasoning_rule": "Isolate x step by step.",
+            "answer_rule": "State the exact numeric integer solution.",
+            "can_be_verify": True,
+            "difficulty": "easy",
+            "category": "math",
+            "harness": "gemini",
+        },
+        # Sample 4: General Reasoning (Logic / Deduction)
+        {
+            "problem": "If all roses are flowers and some flowers fade quickly, can we deduce that all roses fade quickly? Answer Yes or No.",
+            "solution": "No",
+            "reasoning_rule": "Analyze categorical syllogism validity.",
+            "answer_rule": "State Yes or No clearly.",
+            "can_be_verify": False,
+            "difficulty": "medium",
+            "category": "reasoning",
+            "harness": "pi",
+        },
+        # Sample 5: Science / General knowledge
+        {
+            "problem": "What is the primary gas found in Earth's atmosphere?",
+            "solution": "Nitrogen",
+            "reasoning_rule": "Identify gas constituent percentages.",
+            "answer_rule": "Give the name of the gas.",
+            "can_be_verify": False,
+            "difficulty": "easy",
+            "category": "science",
+            "harness": "base",
+        },
+    ]
+
+    for idx, s in enumerate(test_5_samples, 1):
+        print(f"    Sample {idx}: [{s['category'].upper()}] Harness: {s['harness']} | Problem: {s['problem'][:50]}...")
+
+    # 6. Execute 5-step simple test training run
+    print("\n" + "-" * 80)
+    print(" STEP 5: EXECUTE 5-STEP TEST TRAINING RUN (Loss & Gradient Tracking)")
+    print("-" * 80)
+    test_arg = dict(Argument or {})
+    test_arg.setdefault("steps", 5)
+    test_arg.setdefault("concurrency_g", concurrent)
+    test_arg.setdefault("max_seq_len", 16384)
+    test_arg.setdefault("max_new_tokens", 256)
+    test_arg.setdefault("save_steps", 10)
+
+    # In diagnostic test mode, ensure test dataset is evaluated fresh without stale deduplication locks
+    if test:
+        test_arg.setdefault("allow_retest", True)
+
+    # Configure 8-bit QLoRA and vLLM parameters
+    train_model = model if model != "Qwen/Qwen3.5-0.8B" else "google/gemma-4-31B-it"
+    effective_lora = lora_cfg or {
+        "r": 16,
+        "lora_alpha": 32,
+        "lora_dropout": 0.0,
+        "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+    }
+
+    from sword.long_trainer import run_long_train
+    train_result = run_long_train(
+        dataset=test_5_samples,
+        model=train_model,
+        B_model_port=B_model_port,
+        B_model_name=b_model_name,
+        B_model_thinking=kwargs.get("B_model_thinking", True),
+        custom_checkpoint_save=True,
+        is_save_and_upload_checkpoint=False,
+        Argument=test_arg,
+        lora_cfg=effective_lora,
+        show_detail_logs=True,
+        score_logs=True,
+        auto_unload_B_model=False,
+        # vLLM generation and memory settings
+        vllm_quantization="fp8" if load_in_8bit else None,
+        kv_cache_dtype="fp8",
+        speculative_ngram=True,
+        num_speculative_tokens=4,
+        ngram_prompt_lookup_max=4,
+        hf_overrides=hf_overrides,
+        mock_test=mock_test,
+        **kwargs,
+    )
+
+    print("\n" + "=" * 80)
+    print(" SWORD PREP & TEST RUN SUMMARY")
+    print("=" * 80)
+    print(f"[*] Training Status:    {train_result.get('status')}")
+    print(f"[*] Completed Steps:    {train_result.get('final_step')} / 5")
+    print(f"[*] Visited Rows:       {train_result.get('visited_rows')} / 5")
+    print(f"[*] Dataset SHA-256:    {train_result.get('dataset_sha256')}")
+    print(f"[*] Checkpoint Directory: {train_result.get('checkpoint_dir')}")
+    print("=" * 80 + "\n")
+
+    return {
+        "ok": train_result.get("status") in ("completed", "partial"),
+        "patch_result": patch_result,
+        "harness_status": harness_status,
+        "b_model_diagnostic": b_diag,
+        "train_result": train_result,
+    }
