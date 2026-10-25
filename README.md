@@ -155,6 +155,11 @@ Optional training arguments are `B_model_auto_setup=False` for a caller-managed
 server, `B_model_fallback_name=None` to disable the smaller-model retry,
 `B_model_models_dir`, `B_model_startup_timeout`, `B_model_pull_stall_s`,
 `B_model_timeout`, `B_model_num_ctx`, `B_model_force_gpu`, and `B_model_log_path`.
+Set `B_model_thinking=False` to explicitly disable judge thinking. When a thinking
+request returns no usable scores, the judge retries the same model with
+`think: false` and at least `B_model_num_predict_no_think` tokens (default `2048`)
+before trying the smaller fallback. Omitting `think` would keep Qwen's default
+thinking enabled.
 The model-directory default is `/marimo/.ollama` in Marimo containers and
 `~/.ollama/models` elsewhere. Pulls print streaming progress and report stalled
 layers. Mock training disables automatic setup by default. If both judges fail,

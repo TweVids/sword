@@ -230,7 +230,8 @@ def test_mock_diagnostics_passes_settings_and_cannot_claim_live_validation():
     network.post.assert_not_called()
 
 
-def test_live_fallback_probe_scores_twice_with_the_real_fallback_request_path():
+@pytest.mark.parametrize("exhaust_thinking_budget", [False, True])
+def test_live_fallback_probe_scores_twice_with_the_real_fallback_request_path(exhaust_thinking_budget):
     active = set()
     chats = []
     scores = {"truth": 1, "formatted": 1, "rule_reasoning_follow": 1,
@@ -244,8 +245,11 @@ def test_live_fallback_probe_scores_twice_with_the_real_fallback_request_path():
 
     def post(url, json, **_):
         if url.endswith("/api/chat"):
-            chats.append(json["model"])
+            chats.append((json["model"], json.get("think", "default")))
             active.add(json["model"])
+            if exhaust_thinking_budget and json.get("think", True):
+                return response({"message": {"thinking": "Still evaluating...", "content": ""},
+                                 "done_reason": "length"})
             return response({"message": {"content": score_content}})
         active.discard(json["model"])
         return response({"done": True})
@@ -255,7 +259,8 @@ def test_live_fallback_probe_scores_twice_with_the_real_fallback_request_path():
          patch("sword.b_model.ModelBJudge.prepare_for_eval", return_value=True):
         result = diagnostics.check_live_fallback(ModelBJudgeConfig(auto_setup=False))
     assert result["failure_injected"]
-    assert chats == [DEFAULT_B_MODEL_FALLBACK, DEFAULT_B_MODEL_FALLBACK]
+    expected_thinking = [True, False, True, False] if exhaust_thinking_budget else [True, True]
+    assert chats == [(DEFAULT_B_MODEL_FALLBACK, thinking) for thinking in expected_thinking]
     assert result["evaluation_counts"] == {DEFAULT_B_MODEL_FALLBACK: 2}
     assert not active
 

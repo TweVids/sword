@@ -58,6 +58,18 @@ STATUS UPDATE (same day, follow-up pass):
   Regression: test_bmodel_thinking_budget_retries_without_think + updated
   test_reward_retries_smaller_judge_and_unloads_active_model[parse].
 
+[N4] FOUND & FIXED during fallback follow-up (2026-10-25):
+  The no-thinking retry introduced in [N3] removed the "think" field instead
+  of sending "think": false. Qwen defaults to thinking when that field is
+  omitted, so the retry still exhausted its answer budget. The error log
+  reported field presence as a boolean, misleadingly printing think=False.
+  Fix: explicitly send think=False for the retry and disabled-thinking
+  configuration, use the dedicated no-thinking token budget, and log the
+  actual requested value. Models rejecting "think" still retry without it.
+  Regression: the fallback diagnostic now simulates default-on thinking and
+  reproduces the original failure before this fix. Tests also cover disabled
+  thinking and models that do not support the option.
+
 [ENV-NOTE] (runtime environment, resolved 2026-10-25 — not a code bug):
   runtime had torch 2.14.1+cu130 while vllm==0.23.0 pins torch==2.11.0 ->
   vllm/_C.abi3.so ABI failure ("undefined symbol c10_cuda_check_...").

@@ -319,7 +319,7 @@ def test_bmodel_parser_still_rejects_no_scores():
 
 def test_bmodel_thinking_budget_retries_without_think():
     """
-    Qwen 3.5/3.6 thinking models burn num_predict inside ````; the final
+    Qwen 3.5/3.6 thinking models burn num_predict inside thinking; the final
     JSON comes back empty. The scorer must re-request the same model with
     think disabled before falling back / going deterministic.
     """
@@ -329,7 +329,8 @@ def test_bmodel_thinking_budget_retries_without_think():
 
     def fake_request(payload):
         calls.append(dict(payload))
-        if payload.get("think"):
+        # Omitting "think" leaves Qwen's default thinking enabled.
+        if payload.get("think", True):
             # Budget exhausted during reasoning: empty answer, no JSON at all.
             return {"message": {"thinking": "deep reasoning", "content": ""}}
         return {"message": {"content": '{"truth": 0.5, "formatted": 1.0, '
@@ -345,7 +346,9 @@ def test_bmodel_thinking_budget_retries_without_think():
                             candidate_response="openh4")
     assert result.truth == 0.5 and result.formatted == 1.0
     # First (think) request failed, second (no-think) request succeeded.
-    assert "think" in calls[0] and "think" not in calls[1]
+    assert calls[0]["think"] is True and calls[1]["think"] is False
+    assert len(calls) == 2
+    assert calls[1]["options"]["num_predict"] >= judge.config.num_predict_no_think
     # Parsed from the real model, not deterministic fallback.
     assert judge.last_evaluation_source == judge.active_model_name
 

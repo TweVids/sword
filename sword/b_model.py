@@ -601,11 +601,9 @@ class ModelBJudge:
             if base_options.get("num_predict", 0) < self.config.num_predict_no_think:
                 think_options["num_predict"] = self.config.num_predict_no_think
             specs.append({"options": think_options, "payload": dict(base_payload, think=self.config.reasoning)})
-            no_think_payload = dict(base_payload)
-            no_think_payload.pop("think", None)
-            specs.append({"options": no_think_options, "payload": no_think_payload})
-        else:
-            specs.append({"options": base_options, "payload": dict(base_payload)})
+        # Omitting "think" uses the model's default, which is enabled for Qwen.
+        # Disable it explicitly for both retries and configured no-thinking calls.
+        specs.append({"options": no_think_options, "payload": dict(base_payload, think=False)})
 
         while True:
             current = self.active_model_name
@@ -627,7 +625,7 @@ class ModelBJudge:
                     self.evaluation_counts[current] = self.evaluation_counts.get(current, 0) + 1
                     return result
                 except Exception as exc:
-                    self.last_error = f"{exc} (model={current}, think={'think' in payload})"
+                    self.last_error = f"{exc} (model={current}, think={payload.get('think', 'default')!r})"
                     # Parse failure: try the next spec (no-think) on this model first.
                     if isinstance(exc, ValueError):
                         continue

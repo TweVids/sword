@@ -229,8 +229,9 @@ def test_preload_failure_uses_fallback_with_same_inference_options():
     assert calls[-1]["options"]["num_gpu"] == 999
 
 
-def test_unsupported_thinking_retries_primary_without_switching():
-    judge = ModelBJudge()
+@pytest.mark.parametrize("reasoning", [True, False])
+def test_unsupported_thinking_retries_primary_without_switching(reasoning):
+    judge = ModelBJudge(ModelBJudgeConfig(reasoning=reasoning))
     seen = []
 
     def post(url, json, **kwargs):
@@ -244,7 +245,30 @@ def test_unsupported_thinking_retries_primary_without_switching():
         result = judge.evaluate("p", "4", "", "", "4")
     assert result.truth == 1
     assert [call["model"] for call in seen] == [PRIMARY, PRIMARY]
+    assert seen[0]["think"] is reasoning
     assert "think" not in seen[-1]
+
+
+@pytest.mark.parametrize("reasoning", [False, None])
+def test_disabled_thinking_overrides_model_default(reasoning):
+    judge = ModelBJudge(ModelBJudgeConfig(auto_setup=False, reasoning=reasoning, num_predict=128,
+                                        num_predict_no_think=512))
+    seen = []
+
+    def post(url, json, **kwargs):
+        seen.append(copy.deepcopy(json))
+        if json.get("think", True):
+            return response({"message": {"thinking": "Still evaluating...", "content": ""}})
+        return response({"message": {"content": SCORE_CONTENT}})
+
+    with patch("sword.b_model.requests.get", return_value=tags(PRIMARY)), \
+         patch("sword.b_model.requests.post", side_effect=post):
+        result = judge.evaluate("p", "4", "", "", "4")
+    assert result.truth == 1
+    assert judge.last_evaluation_source == PRIMARY
+    assert len(seen) == 1
+    assert seen[0]["think"] is False
+    assert seen[0]["options"]["num_predict"] == 512
 
 
 def test_both_judges_failing_reports_deterministic_and_limits_retries():
