@@ -49,8 +49,25 @@ def _peft_base_layer_types() -> tuple:
         pass
     try:
         import bitsandbytes as bnb
-        types.extend(getattr(bnb.nn, attr) for attr in
-                     ("Linear8bitLt", "Linear4bit", "LinearNF4", "LinearFP4", "LinearFP8"))
+        # Each class is resolved independently: older/newer bitsandbytes releases
+        # may lack individual names, and a single failure previously dropped ALL
+        # quantized classes, silently disabling the wrapper-target redirect.
+        for attr in ("Linear8bitLt", "Linear4bit", "LinearNF4", "LinearFP4", "LinearFP8",
+                     "Linear8bit", "LinearNF", "LinearUInt8"):
+            cls = getattr(bnb.nn, attr, None)
+            if cls is not None and isinstance(cls, type) and issubclass(cls, nn.Module):
+                types.append(cls)
+    except Exception:
+        pass
+    # Last-ditch: accept every bitsandbytes quantized module class present in
+    # the current install (class names contain "Linear"; e.g. Linear8bitLt).
+    try:
+        import bitsandbytes.nn as bnb_nn
+        for obj in vars(bnb_nn).values():
+            if isinstance(obj, type) and issubclass(obj, nn.Module) \
+                    and "Linear" in obj.__name__ and obj.__module__.startswith("bitsandbytes"):
+                if obj not in types:
+                    types.append(obj)
     except Exception:
         pass
     return tuple(types)
@@ -81,6 +98,9 @@ def peft_compatible_target_names(model: nn.Module, requested: List[str]) -> List
                 adapted.append(target + ".linear")
                 changed = True
                 continue
+            print(f"[GRPO] LoRA target '{target}' resolves only to unsupported classes "
+                  f"{sorted({type(m).__name__ for m in matches})} and no supported inner "
+                  f"'.linear' layer was found", flush=True)
         adapted.append(target)
     if changed:
         print(f"[GRPO] Adjusted LoRA targets for PEFT-compatible modules: {adapted}", flush=True)
@@ -799,11 +819,36 @@ class GRPOBridge:
                     target_modules=adapter_targets,
                     bias="none", task_type="CAUSAL_LM",
                 )
-                self.trainer_model = get_peft_model(self.trainer_model, adapter_config)
+                try:
+                    self.trainer_model = get_peft_model(self.trainer_model, adapter_config)
+                except ValueError as exc:
+                    # PEFT dispatches replacements by module CLASS; belt-and-braces
+                    # re-derive target names if a wrapper type was still unmatched.
+                    if "not supported" not in str(exc):
+                        raise
+                    partially_wrapped = any("lora_" in name for name, _ in
+                                            self.trainer_model.named_parameters())
+                    if partially_wrapped:
+                        raise RuntimeError(
+                            "PEFT attach wrapped part of the model before failing; "
+                            "cannot retry without reloading the model") from exc
+                    retry_targets = peft_compatible_target_names(self.trainer_model, adapter_targets)
+                    if retry_targets == adapter_targets:
+                        raise
+                    print(f"[GRPO] Retrying PEFT attach with redirected targets: "
+                          f"{retry_targets}", flush=True)
+                    adapter_config = LoraConfig(
+                        r=self.config.lora_r,
+                        lora_alpha=self.config.lora_alpha,
+                        lora_dropout=self.config.lora_dropout,
+                        target_modules=retry_targets,
+                        bias="none", task_type="CAUSAL_LM",
+                    )
+                    self.trainer_model = get_peft_model(self.trainer_model, adapter_config)
                 # Keep the weight-sync config aligned with the module names PEFT
                 # actually wrapped, so exported adapter files name them correctly.
-                if adapter_targets != requested_targets:
-                    self.config.target_modules = adapter_targets
+                if self.config.target_modules and adapter_targets != requested_targets:
+                    self.config.target_modules = list(adapter_targets)
 
         if (self.trainer_model is not None and hasattr(self.trainer_model, "to")
                 and not getattr(self.trainer_model, "is_loaded_in_4bit", False)
