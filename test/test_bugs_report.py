@@ -273,6 +273,51 @@ def test_m10_binary_batch_size_guard():
 
 
 # ===========================================================================
+# b_model.live_fallback (FIXED) — score parser must survive small-model output
+# shapes: nested JSON, fenced/chatter-wrapped JSON, num_predict-truncated JSON
+# ===========================================================================
+def _load_model_b_judge():
+    pytest.importorskip("sword.b_model")
+    from sword.b_model import ModelBJudge
+    return ModelBJudge  # class; tests instantiate it themselves
+
+
+def test_bmodel_parser_handles_nested_json():
+    ModelBJudge = _load_model_b_judge()
+    judge = ModelBJudge()
+    result = judge.parse_scores(
+        '{"scores": {"truth": 0.5, "formatted": 1.0, "rule_reasoning_follow": 1.0,'
+        ' "rule_answer_follow": 1.0, "tools_success": 0.0}, "cheating": false}')
+    assert result.truth == 0.5 and result.formatted == 1.0
+    assert result.cheating is False
+
+
+def test_bmodel_parser_handles_plain_fenced_json():
+    ModelBJudge = _load_model_b_judge()
+    judge = ModelBJudge()
+    result = judge.parse_scores(
+        'Sure! Here is my evaluation:\n```json\n'
+        '{"truth": 0.5, "formatted": 1.0, "rule_reasoning_follow": 1.0,'
+        ' "rule_answer_follow": 1.0, "tools_success": 0.0, "cheating": false}\n')
+    assert result.truth == 0.5 and result.formatted == 1.0
+
+
+def test_bmodel_parser_handles_truncated_json():
+    ModelBJudge = _load_model_b_judge()
+    judge = ModelBJudge()
+    # num_predict budget exhausted mid-object: no closing brace
+    result = judge.parse_scores('{"truth": 0.5, "formatted": 1.0, "rule_reasoning_follow": 1.0,')
+    assert result.truth == 0.5 and result.rule_reasoning_follow == 1.0
+
+
+def test_bmodel_parser_still_rejects_no_scores():
+    ModelBJudge = _load_model_b_judge()
+    judge = ModelBJudge()
+    with pytest.raises(ValueError, match="no recognized scores"):
+        judge.parse_scores("I cannot evaluate this response, sorry.")
+
+
+# ===========================================================================
 # H6 — regression guard: engine_vllm_bypass.py stays compilable
 # (the initial audit suspected truncation; verified false, kept as a guard)
 # ===========================================================================

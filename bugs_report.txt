@@ -28,6 +28,26 @@ STATUS UPDATE (same day, follow-up pass):
   permanently True -> infinite restart demand loop. Fix: snapshot and
   compare from the SAME source (metadata), with a __module__: fallback when
   metadata is unavailable. Regression-covered by test/test_runtime_setup.py.
+
+[N2] FOUND & FIXED during live rollout (2026-10-25, third run):
+  b_model.live_fallback FAILED — "Model B returned no recognized scores".
+  Root cause: sword/b_model.py parse_scores path-1 regex \{[^{}]*\} cannot
+  match NESTED JSON objects, does not search fenced-code / think-tag copies,
+  and cannot recover a JSON object truncated mid-parse (num_predict budget).
+  The small fallback model (qwen3.5:9b) emits those shapes, so live scoring
+  collapsed to deterministic fallback. Fix: robust _extract_json_candidates
+  (balanced-brace scan + think-tag-stripped variant + truncation auto-close)
+  and _scores_from_dict picking the mapping with the MOST recognized keys
+  ({"scores": {...}, "cheating": false} now selects the nested score table).
+  Regression-covered by 4 new tests in test/test_bugs_report.py.
+
+[ENV-NOTE] (runtime environment, resolved 2026-10-25 — not a code bug):
+  runtime had torch 2.14.1+cu130 while vllm==0.23.0 pins torch==2.11.0 ->
+  vllm/_C.abi3.so ABI failure ("undefined symbol c10_cuda_check_...").
+  Fixed in the runtime with:
+    uv pip install vllm==0.23.0 --torch-backend=cu130 --reinstall-package torch
+  Future pass: setup should validate the torch/vllm ABI pairing
+  (candidate check: import vllm._C right after setup).
 ================================================================================
 
 ────────────────────────────────────────────────────────────────────────────────

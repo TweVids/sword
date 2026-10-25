@@ -369,29 +369,105 @@ class ModelBJudge:
             "Evaluate strictly and output only the JSON object."
         )
 
+    # Score keys are flattened from nested dicts when a model wraps them
+    # (e.g. {"scores": {...}}) instead of emitting the flat schema.
+    _SCORE_KEYS = ("truth", "formatted", "rule_reasoning_follow",
+                   "rule_answer_follow", "tools_success", "cheating")
+
+    def _extract_json_candidates(self, text: str) -> List[str]:
+        """
+        BUG (b_model.live_fallback) fix helper. Collects candidate JSON object
+        strings from model output, handling:
+          - fenced code blocks /                       reasoning tags and chatter prefixes,
+          - NESTED objects (the flat regex \\{[^{}]*\\} cannot match them),
+          - TRUNCATED tail objects when num_predict cuts the response mid-JSON.
+        """
+        candidates: List[str] = []
+        seen: set = set()
+        text = text.strip()
+
+        # Variant without think blocks: models bury the JSON inside reasoning.
+        stripped = re.sub(r"</think>.*?</think>", "", text, flags=re.DOTALL).strip()
+        sources = [text]
+        if stripped and stripped != text:
+            sources.append(stripped)
+
+        for src in sources:
+            for start in (m.start() for m in re.finditer(r"\{", src)):
+                depth = 0
+                end = None
+                for i in range(start, len(src)):
+                    if src[i] == "{":
+                        depth += 1
+                    elif src[i] == "}":
+                        depth -= 1
+                        if depth == 0:
+                            end = i + 1
+                            break
+                candidate = src[start:end] if end is not None else None
+                if candidate is None:
+                    # Truncated JSON: auto-close unbalanced braces and retry.
+                    truncated = src[start:]
+                    if depth > 0:
+                        candidate = truncated + ("}" * depth)
+                if candidate and candidate not in seen:
+                    seen.add(candidate)
+                    candidates.append(candidate)
+        return candidates
+
+    def _scores_from_dict(self, data: Any) -> Optional[Dict[str, Any]]:
+        """
+        BUG (b_model.live_fallback) fix helper. Returns the mapping containing
+        the MOST recognized score keys, searching top-level and nested dicts.
+        Models often emit {"scores": {...}, "cheating": false}: the top-level
+        mapping matches only via "cheating", so matching-count (not first-hit)
+        selection is required to reach the real score table.
+        """
+        best: Optional[Dict[str, Any]] = None
+        best_count = 0
+        candidates = [data] if isinstance(data, dict) else []
+
+        def visit(node: Any) -> None:
+            nonlocal best, best_count
+            queue = [node]
+            while queue:
+                cur = queue.pop()
+                if not isinstance(cur, dict):
+                    if isinstance(cur, (list, tuple)):
+                        queue.extend(cur)
+                    continue
+                count = sum(1 for k in self._SCORE_KEYS if k in cur)
+                if count > best_count:
+                    best, best_count = cur, count
+                queue.extend(v for v in cur.values() if isinstance(v, (dict, list, tuple)))
+
+        for start in candidates:
+            visit(start)
+        return best
+
     def parse_scores(self, text: str, fallback_tools_success: float = 0.0) -> ModelBEvaluationResult:
         """Robustly parses Model B's output into a ModelBEvaluationResult."""
         cleaned = text.strip()
         cleaned = re.sub(r"^```(?:json|yaml)?\s*", "", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"\s*```$", "", cleaned)
 
-        # 1. Direct JSON object parsing
-        try:
-            match = re.search(r"\{[^{}]*\}", cleaned, re.DOTALL)
-            if match:
-                data = json.loads(match.group(0))
-                if isinstance(data, dict) and any(k in data for k in ("truth", "formatted", "rule_reasoning_follow", "rule_answer_follow", "tools_success", "cheating")):
-                    return ModelBEvaluationResult(
-                        truth=float(data.get("truth", 0.0)),
-                        formatted=float(data.get("formatted", 0.0)),
-                        rule_reasoning_follow=float(data.get("rule_reasoning_follow", 0.0)),
-                        rule_answer_follow=float(data.get("rule_answer_follow", 0.0)),
-                        tools_success=float(data.get("tools_success", fallback_tools_success)),
-                        cheating=data.get("cheating", False),
-                        raw_response=text,
-                    )
-        except Exception:
-            pass
+        # 1. Direct JSON object parsing (flat or nested, possibly truncated)
+        for candidate in self._extract_json_candidates(cleaned):
+            try:
+                data = json.loads(candidate)
+            except Exception:
+                continue
+            score_data = self._scores_from_dict(data)
+            if isinstance(score_data, dict):
+                return ModelBEvaluationResult(
+                    truth=float(score_data.get("truth", 0.0)),
+                    formatted=float(score_data.get("formatted", 0.0)),
+                    rule_reasoning_follow=float(score_data.get("rule_reasoning_follow", 0.0)),
+                    rule_answer_follow=float(score_data.get("rule_answer_follow", 0.0)),
+                    tools_success=float(score_data.get("tools_success", fallback_tools_success)),
+                    cheating=score_data.get("cheating", False),
+                    raw_response=text,
+                )
 
         # 2. JSON array format [truth, formatted, reasoning, answer, tools, cheating]
         try:
