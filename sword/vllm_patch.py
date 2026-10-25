@@ -74,17 +74,43 @@ def patch_head_dim_source(source: str) -> str:
 
 
 def loaded_package_versions() -> Dict[str, str]:
-    """Record versions already imported by a notebook before package installation."""
+    """Record versions already imported by a notebook before package installation.
+
+    Reads from importlib.metadata so that the snapshot uses the SAME source as
+    `changed_loaded_packages()`'s comparison. Previously this used
+    `mod.__version__`, which can differ from the metadata version (e.g.
+    "2.9.0+cu130" vs "2.9.0"), causing `changed_loaded_packages` to report a
+    false positive on every run and demand a kernel restart in an infinite loop.
+    """
     names = ("torch", "transformers", "numpy", "vllm", "peft", "accelerate",
              "huggingface_hub", "tokenizers", "triton", "safetensors")
-    return {name: mod.__version__ for name in names
-            if (mod := sys.modules.get(name)) is not None
-            and isinstance(getattr(mod, "__version__", None), str)}
+    snapshot: Dict[str, str] = {}
+    for name in names:
+        if (mod := sys.modules.get(name)) is None:
+            continue
+        try:
+            snapshot[name] = metadata.version(name)
+        except metadata.PackageNotFoundError:
+            # Package metadata missing (e.g. vendored/embedded install):
+            # fall back to the module attribute so a real change still trips.
+            version = getattr(mod, "__version__", None)
+            if isinstance(version, str):
+                snapshot[name] = f"__module__:{version}"
+    return snapshot
 
 
 def changed_loaded_packages(before: Dict[str, str]) -> List[str]:
     changed = []
     for name, version in before.items():
+        if version.startswith("__module__:"):
+            try:
+                mod = sys.modules.get(name)
+                current = getattr(mod, "__version__", "") if mod is not None else ""
+            except Exception:
+                current = ""
+            if current != version.split(":", 1)[1]:
+                changed.append(name)
+            continue
         try:
             if metadata.version(name) != version:
                 changed.append(name)

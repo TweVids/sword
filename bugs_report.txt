@@ -18,6 +18,16 @@ STATUS UPDATE (same day, follow-up pass):
   test_grpo_audit.py::test_bridge_microbatching_preserves_parameter_updates_
   and_loss_metrics fails identically on the pre-fix baseline (CPU float
   tolerance too tight in that test, values differ ~6e-4).
+
+[N] FOUND & FIXED during live rollout (2026-10-25, second day finding):
+  "setup.restart: FAILED -- Imported packages changed" recurring after every
+  kernel restart. Root cause: sword/vllm_patch.py::loaded_package_versions
+  snapshotted torch.__version__ ("2.9.0+cu130"-style) while
+  changed_loaded_packages compared against importlib.metadata.version
+  ("2.9.0-style") -> mismatch on every run -> restart_kernel_required
+  permanently True -> infinite restart demand loop. Fix: snapshot and
+  compare from the SAME source (metadata), with a __module__: fallback when
+  metadata is unavailable. Regression-covered by test/test_runtime_setup.py.
 ================================================================================
 
 ────────────────────────────────────────────────────────────────────────────────
