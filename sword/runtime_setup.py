@@ -53,29 +53,113 @@ def _find_sword_source_repo() -> Optional[Path]:
     return None
 
 
+def _installed_git_origin() -> Optional[str]:
+    """Reads the git+...:// source URL recorded by pip in the dist metadata."""
+    import json
+    from importlib import metadata
+    try:
+        dist = metadata.distribution("sword")
+        raw = dist.read_text("direct_url.json")
+        if raw:
+            info = json.loads(raw)
+            url = info.get("url")
+            if url and url.startswith("git+"):
+                return url
+    except Exception:
+        return None
+    return None
+
+
+def _strip_vcs_pin(url: str) -> str:
+    """Drops an @commit / @ref pin (and any #egg=... fragment) to track the branch."""
+    import re as _re
+    base = url.split("#", 1)[0]
+    return _re.sub(r"@[0-9a-fA-F]{40}$", "", base)
+
+
+def _force_reinstall(source: str, results: Dict[str, Any]) -> bool:
+    """Reinstalls sword from a local repo path or git URL into the live venv."""
+    if shutil.which("uv"):
+        command = ["uv", "pip", "install", "--python", sys.executable,
+                   "--force-reinstall", "--no-deps", str(source)]
+    else:
+        command = [sys.executable, "-m", "pip", "install", "--force-reinstall",
+                   "--no-deps", str(source)]
+    results["graft_command"] = " ".join(command)
+    try:
+        run = subprocess.run(command, text=True, capture_output=True, timeout=600)
+        results["graft_exit_code"] = run.returncode
+        results["graft_tail"] = ((run.stdout or "") + (run.stderr or ""))[-1500:]
+        return run.returncode == 0
+    except Exception as exc:
+        results["graft_tail"] = f"reinstall failed: {exc}"
+        return False
+
+
+def _hot_reload_after_graft(results: Dict[str, Any], installed_dir: Path,
+                            before: Dict[str, Any], before_hashes: Dict[str, str]) -> Dict[str, Any]:
+    """Reloads already-imported sword modules whose bytes changed on disk."""
+    import importlib
+    importlib.invalidate_caches()
+    after_hashes = _package_hashes(installed_dir)
+    reloaded, reload_errors = [], []
+    stale = sorted((name for name, mod in list(before.items())
+                    if getattr(mod, "__file__", None)), key=lambda n: n.count("."))
+    for name in stale:
+        mod = sys.modules.get(name)
+        file = getattr(mod, "__file__", None)
+        path = Path(file) if file else None
+        rel = str(path.relative_to(installed_dir)) if path and installed_dir in path.parents else None
+        if rel and name != "sword" and after_hashes.get(rel) != before_hashes.get(rel):
+            try:
+                importlib.reload(sys.modules[name])
+                reloaded.append(name)
+            except Exception as exc:
+                reload_errors.append(f"{name}: {exc}")
+    results["reloaded_modules"] = reloaded
+    results["reload_errors"] = reload_errors
+    if reload_errors:
+        results["restart_kernel_required_hint"] = (
+            f"Some modules failed to hot-reload: {reload_errors}. A kernel restart "
+            "guarantees the updated code is live.")
+    return results
+
+
 def self_update() -> Dict[str, Any]:
     """
     BUG-FIX rollout helper (user-requested 2026-10-25): auto-update the installed
-    sword package from the source repo inside the running process.
+    sword package inside the running process. Sources, in order:
+      1) SWORD_REPO_DIR, or a repo with .git walking up from the cwd (local graft);
+      2) the git+... URL pip recorded when the package was installed via
+         `pip install git+...` / `uv pip install git+...` (force-reinstall).
     """
     from . import sword_installed_dir
     installed_dir = Path(sword_installed_dir())
     if os.environ.get("SWORD_SELF_UPDATE", "1").strip().lower() in ("0", "false", "no"):
         return {"ok": True, "skipped": "SWORD_SELF_UPDATE=0"}
 
-    repo = _find_sword_source_repo()
-    if repo is None:
-        installed_hashes = _package_hashes(installed_dir)
-        return {"ok": True, "skipped": "No source repo found (SWORD_REPO_DIR unset)",
-                "installed_from": str(installed_dir), "installed_files": len(installed_hashes)}
-
-    if repo.resolve() == installed_dir.parent.resolve():
-        return {"ok": True, "skipped": "Running from the source repo; nothing to graft",
-                "source_repo": str(repo), "installed_from": str(installed_dir)}
-
     before = {name: mod for name, mod in list(sys.modules.items())
               if name == "sword" or name.startswith("sword.")}
     before_hashes = _package_hashes(installed_dir)
+
+    repo = _find_sword_source_repo()
+    if repo is not None and repo.resolve() == installed_dir.parent.resolve():
+        return {"ok": True, "skipped": "Running from the source repo; nothing to graft",
+                "source_repo": str(repo), "installed_from": str(installed_dir)}
+
+    if repo is None:
+        origin = _installed_git_origin()
+        if origin is None:
+            return {"ok": True, "skipped": ("No source repo found and the installed "
+                    "distribution records no git source; set SWORD_REPO_DIR to fix"),
+                    "installed_from": str(installed_dir), "installed_files": len(before_hashes)}
+        results = {"ok": True, "source_url": origin, "installed_from": str(installed_dir)}
+        if _force_reinstall(_strip_vcs_pin(origin), results):
+            return _hot_reload_after_graft(results, installed_dir, before, before_hashes)
+        if "graft_exit_code" in results:
+            results["ok"] = False
+        results.setdefault("error", "reinstall from the recorded git URL failed; see graft_tail")
+        return results
 
     # 1. Pull the source repo so the graft contains the remote change set.
     pull_tail = ""
@@ -103,22 +187,7 @@ def self_update() -> Dict[str, Any]:
         return results
 
     # 2. Preferred path: reinstall the repo as a wheel into the live venv.
-    reinstalled = False
-    command: list = []
-    if shutil.which("uv"):
-        command = ["uv", "pip", "install", "--python", sys.executable,
-                   "--force-reinstall", "--no-deps", "--no-build-isolation", str(repo)]
-    else:
-        command = [sys.executable, "-m", "pip", "install", "--force-reinstall",
-                   "--no-deps", str(repo)]
-    try:
-        run = subprocess.run(command, text=True, capture_output=True, timeout=600)
-        results["graft_command"] = " ".join(command)
-        results["graft_exit_code"] = run.returncode
-        results["graft_tail"] = ((run.stdout or "") + (run.stderr or ""))[-1500:]
-        reinstalled = run.returncode == 0
-    except Exception as exc:
-        results["graft_tail"] = f"reinstall failed: {exc}"
+    reinstalled = _force_reinstall(str(repo), results)
 
     # 3. Fallback ("self-patch"): byte-copy the repo's python sources over the
     #    installed package when wheel building/reinstalling is not viable.
@@ -140,30 +209,7 @@ def self_update() -> Dict[str, Any]:
 
     # 4. Reload already-imported sword modules whose bytes changed so the fix is
     #    live in this process (lazily imported modules do not need this).
-    import importlib
-    importlib.invalidate_caches()
-    after_hashes = _package_hashes(installed_dir)
-    reloaded, reload_errors = [], []
-    stale = sorted((name for name, mod in list(before.items())
-                    if getattr(mod, "__file__", None)), key=lambda n: n.count("."))
-    for name in stale:
-        mod = sys.modules.get(name)
-        file = getattr(mod, "__file__", None)
-        path = Path(file) if file else None
-        rel = str(path.relative_to(installed_dir)) if path and installed_dir in path.parents else None
-        if rel and after_hashes.get(rel) != before_hashes.get(rel) and name != "sword":
-            try:
-                importlib.reload(sys.modules[name])
-                reloaded.append(name)
-            except Exception as exc:
-                reload_errors.append(f"{name}: {exc}")
-    results["reloaded_modules"] = reloaded
-    results["reload_errors"] = reload_errors
-    if reload_errors:
-        results["restart_kernel_required_hint"] = (
-            f"Some modules failed to hot-reload: {reload_errors}. A kernel restart "
-            "guarantees the updated code is live.")
-    return results
+    return _hot_reload_after_graft(results, installed_dir, before, before_hashes)
 
 
 def configure_training_environment() -> Dict[str, str]:
