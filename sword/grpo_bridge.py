@@ -36,6 +36,10 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from .rl.policy import token_statistics, safe_optimizer_step
 from .defaults import DEFAULT_GRPO_MODEL
 
+# Runtime-visibility stamp: printed when the trainer initializes, so live logs
+# always reveal which bridge change set is actually executing.
+_CODE_STAMP = "sword-grpo-bridge target-redirect/8911cb0"
+
 
 def _peft_base_layer_types() -> tuple:
     """Module classes PEFT's LoRA dispatchers can wrap directly."""
@@ -725,6 +729,8 @@ class GRPOBridge:
         **kwargs,
     ):
         """Initializes the Unsloth or PEFT trainer model with LoRA adapters and checkpointing."""
+        import sys as _sys
+        print(f"[GRPO] bridge code {_CODE_STAMP} (from {_sys.modules[__name__].__file__})", flush=True)
         self.mock_test = bool(mock_test or kwargs.get("mock_test", False))
         load_options = {
             "token": self.config.hf_token, "cache_dir": self.config.model_cache_dir,
