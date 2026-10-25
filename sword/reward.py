@@ -10,7 +10,10 @@ import math
 from dataclasses import dataclass, field
 from typing import Dict, Any, Optional, Tuple, Union
 
-from sword.b_model import ModelBJudge, ModelBEvaluationResult
+from sword.b_model import ModelBJudge, ModelBEvaluationResult, deterministic_evaluation
+
+
+_DEFAULT_JUDGE = object()
 
 
 @dataclass
@@ -116,8 +119,9 @@ class MultiMetricRewardScorer:
     Computes unified GRPO reward using dataset attributes:
     problem, solution, reasoning_rule, answer_rule, can_be_verify, difficult, category, harness.
     """
-    def __init__(self, b_model_judge: Optional[ModelBJudge] = None):
-        self.b_model_judge = b_model_judge or ModelBJudge()
+    def __init__(self, b_model_judge: Optional[ModelBJudge] = _DEFAULT_JUDGE):
+        # Omitted means the default judge; explicit None disables all Ollama IO.
+        self.b_model_judge = ModelBJudge() if b_model_judge is _DEFAULT_JUDGE else b_model_judge
 
     def check_formatting(self, candidate_response: str) -> float:
         """
@@ -186,6 +190,8 @@ class MultiMetricRewardScorer:
             category=category,
             tools_called=tools_called,
             tools_succeeded=tools_succeeded,
+        ) if self.b_model_judge is not None else deterministic_evaluation(
+            candidate_response, solution, tools_called, tools_succeeded,
         )
 
         rule_reasoning_follow = b_res.rule_reasoning_follow

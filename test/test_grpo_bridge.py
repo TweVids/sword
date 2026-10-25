@@ -257,7 +257,11 @@ class TestGRPOBridge(unittest.TestCase):
         self.assertEqual(result["batch_size"], 4)
         self.assertIn("metrics", result)
         self.assertIn("grpo_loss", result["metrics"])
-        self.assertEqual(result["metrics"]["policy_version"], 1)
+        # Every decoded response receives the same reward: no gradient exists,
+        # so neither Adam momentum/decay nor an adapter export should run.
+        self.assertTrue(result["metrics"]["optimizer_step_skipped"])
+        self.assertEqual(result["metrics"]["grad_norm"], 0)
+        self.assertEqual(result["metrics"]["policy_version"], 0)
 
 
 if __name__ == "__main__":

@@ -166,6 +166,21 @@ layers. Mock training disables automatic setup by default. If both judges fail,
 training can still use deterministic rewards; `train_result["b_model"]["evaluation_counts"]` records
 that explicitly and the real compatibility runner reports `ok=False`.
 
+Training logs show `RewardStd` (within-group reward standard deviation), `Judge`,
+and whether the optimizer update ran. Identical rewards produce zero GRPO
+advantages; a constant reward across steps still supplies no learning signal.
+Zero-gradient steps preserve weights and optimizer state instead of applying
+Adam momentum or weight decay. Loss and gradient metrics retain their precision;
+zero loss alone can be valid when gradients are nonzero. Live diagnostics reject
+runs with no reward-driven gradients. Results also report `optimizer_steps` and
+`skipped_optimizer_steps`, separately from the number of completed loop steps.
+
+The long trainer shares the bridge's optional historical reward baseline. Set
+`Argument={"use_cross_step_baseline": False, ...}` for strict group-centered GRPO.
+The coding diagnostic tasks use Model B's semantic truth scores; numeric answer
+verification remains enabled for the math task. `b_model=False` uses local
+heuristics without constructing an Ollama judge.
+
 ### Target environment setup and test suite
 
 Run this in the Linux GPU environment where you will train:

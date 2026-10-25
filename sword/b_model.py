@@ -651,37 +651,44 @@ class ModelBJudge:
         """Lightweight deterministic scoring when Model B server is unavailable."""
         self.last_evaluation_source = "deterministic"
         self.evaluation_counts["deterministic"] = self.evaluation_counts.get("deterministic", 0) + 1
-        resp = candidate_response.strip().lower()
-        sol = solution.strip().lower()
+        return deterministic_evaluation(candidate_response, solution, tools_called, tools_succeeded)
 
-        # Simple truth check
-        truth = 0.5
-        from sword.reward import MathVerifier
-        if sol and MathVerifier.verify_answer(candidate_response, solution):
-            truth = 1.0
 
-        # Formatted check: check tags
-        has_think = ("<think>" in resp and "</think>" in resp) or ("thought" in resp)
-        has_blocks = "```" in resp
-        formatted = 1.0 if (has_think or has_blocks) else 0.8
+def deterministic_evaluation(
+    candidate_response: str, solution: str, tools_called: int, tools_succeeded: int,
+) -> ModelBEvaluationResult:
+    """Local heuristic scoring, also usable when the caller disables Ollama."""
+    resp = candidate_response.strip().lower()
+    sol = solution.strip().lower()
 
-        tools_ratio = (tools_succeeded / max(1, tools_called)) if tools_called > 0 else 0.0
+    # Simple truth check
+    truth = 0.5
+    from sword.reward import MathVerifier
+    if sol and MathVerifier.verify_answer(candidate_response, solution):
+        truth = 1.0
 
-        # Cheating check
-        banned_patterns = [
-            "as an ai language model",
-            "i am programmed to",
-            "system prompt",
-            "ignore previous instructions",
-        ]
-        is_cheat = any(pat in resp for pat in banned_patterns)
+    # Formatted check: check tags
+    has_think = ("<think>" in resp and "</think>" in resp) or ("thought" in resp)
+    has_blocks = "```" in resp
+    formatted = 1.0 if (has_think or has_blocks) else 0.8
 
-        return ModelBEvaluationResult(
-            truth=truth,
-            formatted=formatted,
-            rule_reasoning_follow=0.8,
-            rule_answer_follow=0.8,
-            tools_success=tools_ratio,
-            cheating=is_cheat,
-            raw_response="deterministic fallback evaluation",
-        )
+    tools_ratio = (tools_succeeded / max(1, tools_called)) if tools_called > 0 else 0.0
+
+    # Cheating check
+    banned_patterns = [
+        "as an ai language model",
+        "i am programmed to",
+        "system prompt",
+        "ignore previous instructions",
+    ]
+    is_cheat = any(pat in resp for pat in banned_patterns)
+
+    return ModelBEvaluationResult(
+        truth=truth,
+        formatted=formatted,
+        rule_reasoning_follow=0.8,
+        rule_answer_follow=0.8,
+        tools_success=tools_ratio,
+        cheating=is_cheat,
+        raw_response="deterministic fallback evaluation",
+    )

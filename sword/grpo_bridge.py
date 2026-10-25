@@ -38,7 +38,7 @@ from .defaults import DEFAULT_GRPO_MODEL
 
 # Runtime-visibility stamp: printed when the trainer initializes, so live logs
 # always reveal which bridge change set is actually executing.
-_CODE_STAMP = "sword-grpo-bridge target-redirect/8911cb0"
+_CODE_STAMP = "sword-grpo-bridge reward-stall-diagnostics/v1"
 
 
 def _peft_base_layer_types() -> tuple:
@@ -218,6 +218,7 @@ class RolloutBatch:
     items: List[RolloutItem] = field(default_factory=list)
     policy_version: int = 0
     concurrency_g: int = 4
+    reward_diagnostics: Dict[str, Any] = field(default_factory=dict)
 
     def __len__(self) -> int:
         return len(self.items)
@@ -617,8 +618,8 @@ class DualCorrectionGRPOLoss(nn.Module):
         total_loss = policy_loss + self.entropy_coeff * entropy_loss
 
         metrics = {
-            "grpo_loss": round(total_loss.item(), 5),
-            "policy_loss": round(policy_loss.item(), 5),
+            "grpo_loss": total_loss.item(),
+            "policy_loss": policy_loss.item(),
             "mean_ratio": round(ratio_on_policy.masked_select(target_mask).mean().item() if target_mask.any() else 1.0, 4),
             "mean_is_weight": round(is_weight.masked_select(target_mask).mean().item() if target_mask.any() else 1.0, 4),
             "mean_entropy": round(mean_entropy.item(), 4),
@@ -718,6 +719,7 @@ class GRPOBridge:
         self._reward_ema: Optional[float] = None
         self._reward_ema_var: float = 1.0
         self._zero_var_groups_last_step = 0
+        self._reward_diagnostics: Dict[str, Any] = {}
         self.vram_mgr = VRAMLifecycleManager(
             device=self.device,
             enable_sleep=self.config.enable_vllm_sleep,
@@ -1131,44 +1133,52 @@ class GRPOBridge:
         """
         Evaluates rewards for all rollouts, validates and filters complete groups,
         and computes group-centered advantages.
-        Eliminates group sampling degeneracy (E4).
+        Uniform groups cannot supply a within-group preference signal.
         """
         if self.config.drop_incomplete_groups and not batch.validate_groups():
             batch.filter_valid_groups(self.config.concurrency_g)
 
         for item in batch.items:
             item.reward = float(reward_fn(item.prompt_text, item.response_text))
-            if not math.isfinite(item.reward):
-                raise ValueError("GRPO rewards must be finite")
+
+        self.compute_advantages(batch)
+
+    def compute_advantages(self, batch: RolloutBatch) -> Dict[str, Any]:
+        """Normalize already-scored rewards, shared by bridge and harness training.
+
+        The optional historical baseline uses previous batches only. It cannot
+        create a preference between equally rewarded responses, and a constant
+        reward across batches still supplies no policy-gradient signal.
+        """
+        if self.config.drop_incomplete_groups:
+            batch.filter_valid_groups(self.config.concurrency_g)
+        if any(not math.isfinite(it.reward) for it in batch.items):
+            raise ValueError("GRPO rewards must be finite")
 
         groups: Dict[int, List[RolloutItem]] = {}
         for item in batch.items:
             groups.setdefault(item.group_id, []).append(item)
 
         zero_var_groups = 0
-        scored_groups = 0
+        baseline_groups = 0
+        group_stds = []
         batch_mean = (sum(it.reward for it in batch.items) / max(len(batch.items), 1))
-        for g_id, group_items in groups.items():
-            if len(group_items) != self.config.concurrency_g and self.config.drop_incomplete_groups:
-                continue
-            scored_groups += 1
+        baseline = self._reward_ema if self.config.use_cross_step_baseline else None
+        for group_items in groups.values():
 
             rewards = [it.reward for it in group_items]
             mean_r = sum(rewards) / len(rewards)
             var_r = sum((r - mean_r) ** 2 for r in rewards) / max(len(rewards), 1)
             std_r = math.sqrt(var_r)
+            group_stds.append(std_r)
 
             if std_r > 1e-6:
                 for it in group_items:
                     it.advantage = (it.reward - mean_r) / (std_r + 1e-6)
             else:
-                # Uniform group (judge scored every rollout identically): the
-                # group-centered advantage degenerates to zero and GRPO would
-                # learn nothing. Fall back to a running cross-step baseline so
-                # absolute-level signal (e.g. the WHOLE group improving or
-                # regressing) still trains the policy.
                 zero_var_groups += 1
-                baseline = self._reward_ema
+                if baseline is not None:
+                    baseline_groups += 1
                 for it in group_items:
                     if baseline is not None:
                         scale = math.sqrt(self._reward_ema_var) + 1e-6
@@ -1177,8 +1187,8 @@ class GRPOBridge:
                     else:
                         it.advantage = 0.0
 
-        # Track group reward means (EMA) ONLY from groups that actually produced
-        # a usable baseline signal (non-degenerate judged scores).
+        # Seed/update only after computing this batch's advantages, including
+        # uniform groups so later reward changes can be compared with history.
         group_means = [sum(it.reward for it in items) / len(items)
                        for g_id, items in groups.items()
                        if len(items) == self.config.concurrency_g or not self.config.drop_incomplete_groups]
@@ -1191,12 +1201,26 @@ class GRPOBridge:
                 diff = new - self._reward_ema
                 self._reward_ema += 0.1 * diff
                 self._reward_ema_var = 0.9 * self._reward_ema_var + 0.1 * max(diff * diff, 1e-6)
+        diagnostics = {
+            "zero_variance_groups": zero_var_groups,
+            "baseline_groups": baseline_groups,
+            "reward_std": sum(group_stds) / max(len(group_stds), 1),
+            "reward_min": min((it.reward for it in batch.items), default=0.0),
+            "reward_max": max((it.reward for it in batch.items), default=0.0),
+            "advantage_abs_max": max((abs(it.advantage) for it in batch.items), default=0.0),
+        }
         if zero_var_groups:
-            print(f"[GRPO] Reward degeneracy: {zero_var_groups}/{scored_groups} groups had zero "
-                  f"within-group reward variance (avg reward {batch_mean:.3f}); advantages "
-                  f"{'from running cross-step baseline' if self.config.use_cross_step_baseline and self._reward_ema is not None else 'forced to 0 -> no gradient this step'}",
-                  flush=True)
+            if diagnostics["advantage_abs_max"] == 0:
+                signal = "no reward signal; all advantages are zero"
+            elif baseline_groups:
+                signal = f"historical baseline used for {baseline_groups} groups"
+            else:
+                signal = "uniform groups have zero advantages; other groups retain reward signal"
+            print(f"[GRPO] Reward degeneracy: {zero_var_groups}/{len(groups)} groups had zero "
+                  f"within-group reward variance (avg reward {batch_mean:.3f}); {signal}", flush=True)
         self._zero_var_groups_last_step = zero_var_groups
+        self._reward_diagnostics = batch.reward_diagnostics = diagnostics
+        return diagnostics
 
     def train_step(
         self,
@@ -1301,10 +1325,18 @@ class GRPOBridge:
 
         # Adapter export is part of the update: a failed export must restore the
         # optimizer/policy rather than retry an already-applied update.
-        new_version = safe_optimizer_step(
-            optimizer, trainable_params,
-            after_step=lambda: self.weight_sync.sync_to_vllm(self.trainer_model, self.vllm_engine),
-        )
+        # Adam momentum and weight decay can mutate weights even with zero
+        # gradients. A stalled step must preserve both policy and optimizer.
+        optimizer_step_skipped = grad_norm_val == 0.0
+        old_version = self.weight_sync.policy_version
+        if optimizer_step_skipped:
+            new_version = self.weight_sync.policy_version
+            print("[GRPO] Optimizer update skipped: all gradients are zero.", flush=True)
+        else:
+            new_version = safe_optimizer_step(
+                optimizer, trainable_params,
+                after_step=lambda: self.weight_sync.sync_to_vllm(self.trainer_model, self.vllm_engine),
+            )
         # Do not carry gradient buffers into the next memory handoff.
         optimizer.zero_grad(set_to_none=True)
         self.global_step += 1
@@ -1314,7 +1346,10 @@ class GRPOBridge:
 
         accumulated_metrics["step"] = self.global_step
         accumulated_metrics["policy_version"] = new_version
-        accumulated_metrics["grad_norm"] = round(grad_norm_val, 5)
+        accumulated_metrics["policy_version_before_update"] = old_version
+        accumulated_metrics["grad_norm"] = grad_norm_val
+        accumulated_metrics["optimizer_step_skipped"] = optimizer_step_skipped
+        accumulated_metrics.update(batch.reward_diagnostics)
         accumulated_metrics["vram"] = self.vram_mgr.get_memory_info()
         return accumulated_metrics
 

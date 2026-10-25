@@ -9,7 +9,6 @@ import gc
 import re
 import json
 import time
-import math
 import hashlib
 from dataclasses import dataclass, field
 from typing import Dict, Any, List, Optional, Tuple, Union, Callable
@@ -312,6 +311,7 @@ def run_long_train(
         max_model_len=max_seq_len,
         max_new_tokens=max_new_tokens,
         micro_batch_size=micro_batch_size,
+        use_cross_step_baseline=bool(kwargs.get("use_cross_step_baseline", args.get("use_cross_step_baseline", True))),
         temperature=float(args.get("temperature", 0.7)),
         top_p=float(args.get("top_p", 0.9)),
         chunk_size=int(args.get("chunk_size", 512)),
@@ -370,6 +370,8 @@ def run_long_train(
     reward_history_logs: List[Dict[str, Any]] = []
     step_metrics: List[Dict[str, Any]] = []
     visited_row_hashes = set()
+    optimizer_steps = 0
+    skipped_optimizer_steps = 0
     current_step = start_step
     completed_successfully = False
 
@@ -386,6 +388,7 @@ def run_long_train(
             log_start_len = len(reward_history_logs)
 
             for attempt in range(2):
+                reward_baseline_state = (bridge._reward_ema, bridge._reward_ema_var)
                 # Clean up reward logs from previous failed attempt to avoid duplicates
                 if attempt > 0 and len(reward_history_logs) > log_start_len:
                     del reward_history_logs[log_start_len:]
@@ -466,29 +469,21 @@ def run_long_train(
                     if b_judge is not None:
                         b_judge.release_after_eval()
 
-                    # Calculate group-centered advantages
-                    if bridge.config.drop_incomplete_groups:
-                        batch.filter_valid_groups(batch.concurrency_g)
+                    # Share advantage calculation and degeneracy diagnostics with
+                    # the bridge; harness outcome rewards have already been assigned.
+                    bridge.compute_advantages(batch)
                     if not batch.items:
                         raise RuntimeError("No complete rollout groups available for training")
-                    groups: Dict[int, List[RolloutItem]] = {}
-                    for it in batch.items:
-                        groups.setdefault(it.group_id, []).append(it)
-
-                    for g_id, g_items in groups.items():
-                        r_vals = [it.reward for it in g_items]
-                        mean_r = sum(r_vals) / len(r_vals)
-                        var_r = sum((r - mean_r) ** 2 for r in r_vals) / max(len(r_vals), 1)
-                        std_r = math.sqrt(var_r)
-                        for it in g_items:
-                            it.advantage = (it.reward - mean_r) / (std_r + 1e-6) if std_r > 1e-6 else 0.0
 
                     # Execute training forward / backward step
                     metrics = bridge.train_step(batch, optimizer)
+                    metrics["judge_evaluation_source"] = b_judge.last_evaluation_source if b_judge else "disabled"
                     step_success = True
                     break
 
                 except (torch.cuda.OutOfMemoryError, RuntimeError) as e_oom:
+                    # A failed attempt must not become its retry's reward history.
+                    bridge._reward_ema, bridge._reward_ema_var = reward_baseline_state
                     is_oom = "out of memory" in str(e_oom).lower() or isinstance(e_oom, torch.cuda.OutOfMemoryError)
                     if is_oom and attempt == 0:
                         print(f"\n[Sword Alert] CUDA Out-of-Memory intercepted at step {step_idx} (attempt 1). Clearing cache and retrying...")
@@ -537,6 +532,10 @@ def run_long_train(
 
             visited_row_hashes.add(current_row.row_hash)
             current_step = step_idx
+            if metrics.get("optimizer_step_skipped", False):
+                skipped_optimizer_steps += 1
+            else:
+                optimizer_steps += 1
             if kwargs.get("return_step_metrics", False):
                 step_metrics.append(dict(metrics))
 
@@ -547,10 +546,13 @@ def run_long_train(
                 grad_norm_disp = metrics.get('grad_norm', 0.0)
                 print(
                     f"Step {step_idx:04d}/{start_step + steps:04d} | "
-                    f"Loss: {metrics.get('grpo_loss', 0.0):.4f} | "
-                    f"GradNorm: {grad_norm_disp:.4f} | "
+                    f"Loss: {metrics.get('grpo_loss', 0.0):.6g} | "
+                    f"GradNorm: {grad_norm_disp:.6g} | "
                     f"Avg Reward: {avg_reward:.3f} | "
+                    f"RewardStd: {metrics.get('reward_std', 0.0):.6g} | "
                     f"Truth: {avg_truth:.2f} | "
+                    f"Judge: {metrics['judge_evaluation_source']} | "
+                    f"Update: {'skipped' if metrics.get('optimizer_step_skipped') else 'applied'} | "
                     f"Harness: {current_row.harness or 'none'} | "
                     f"Diff: {current_row.difficulty}"
                 )
@@ -611,6 +613,8 @@ def run_long_train(
     return {
         "status": run_status,
         "final_step": current_step,
+        "optimizer_steps": optimizer_steps,
+        "skipped_optimizer_steps": skipped_optimizer_steps,
         "visited_rows": len(visited_row_hashes),
         "total_rows": len(records),
         "dataset_sha256": dataset_sha256,

@@ -276,10 +276,24 @@ def check_training_result(result: Dict[str, Any], steps: int, b_model: bool, moc
     for metric in metrics:
         if any(not math.isfinite(float(metric[key])) for key in ("grpo_loss", "grad_norm")):
             raise RuntimeError("GRPO loss or gradient norm is nonfinite.")
-    versions = [int(metric["policy_version"]) for metric in metrics]
-    if not versions or versions[0] < 1 or any(b <= a for a, b in zip(versions, versions[1:])):
-        raise RuntimeError("GRPO did not publish a new LoRA policy version after every update.")
+    first = metrics[0]
+    initial_version = first["policy_version"] if first.get("optimizer_step_skipped") else 0
+    previous_version = int(first.get("policy_version_before_update", initial_version))
+    for metric in metrics:
+        version = int(metric["policy_version"])
+        skipped = metric.get("optimizer_step_skipped", False)
+        invalid_skip = skipped and (float(metric["grad_norm"]) != 0 or version != previous_version)
+        invalid_update = not skipped and version <= previous_version
+        if invalid_skip or invalid_update:
+            raise RuntimeError("GRPO policy versions do not match optimizer updates.")
+        previous_version = version
     if not mock_test:
+        if not any(float(metric["grad_norm"]) > 0 for metric in metrics):
+            raise RuntimeError("GRPO produced no nonzero gradients; reward scoring may be degenerate.")
+        if all("advantage_abs_max" in metric for metric in metrics) and not any(
+            float(metric["advantage_abs_max"]) > 0 and float(metric["grad_norm"]) > 0 for metric in metrics
+        ):
+            raise RuntimeError("GRPO produced no reward-driven gradients; only regularization may be active.")
         if result.get("rollout_backend") != "vllm":
             raise RuntimeError(result.get("vllm_initialization_error") or "GRPO used the PyTorch fallback.")
         if b_model:
@@ -319,14 +333,16 @@ def diagnostic_dataset():
             "solution": "def is_prime(n):\n    return n > 1 and all(n % i for i in range(2, int(n**0.5) + 1))",
             "reasoning_rule": "Explain the algorithm inside <think> tags.",
             "answer_rule": "Provide the Python function in a code block.",
-            "can_be_verify": True, "difficulty": "medium", "category": "code", "harness": "opencode",
+            # Reference implementations require semantic judging, not numeric
+            # answer extraction from the candidate's source code.
+            "can_be_verify": False, "difficulty": "medium", "category": "code", "harness": "opencode",
         },
         {
             "problem": "Write reverse_words(s: str) -> str to reverse the order of words.",
             "solution": "def reverse_words(s):\n    return ' '.join(s.split()[::-1])",
             "reasoning_rule": "Explain whitespace handling.",
             "answer_rule": "Return one Python function.",
-            "can_be_verify": True, "difficulty": "easy", "category": "code", "harness": "codex",
+            "can_be_verify": False, "difficulty": "easy", "category": "code", "harness": "codex",
         },
         {
             "problem": "Solve for x: 3*x + 15 = 42.", "solution": "9",
