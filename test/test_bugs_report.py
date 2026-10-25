@@ -383,6 +383,34 @@ def test_peft_target_redirect_for_wrapped_projections():
     assert adapted[2] == "v_proj" and adapted[3] == "o_proj" and adapted[4] == "mlp"
 
 
+def test_peft_target_redirect_with_mixed_supported_and_wrapped_matches():
+    """
+    Heterogeneous models (observed on Gemma4): one target name matches BOTH a
+    plain Linear (dispatchable) and a wrapper module (not dispatchable). PEFT
+    raises on the wrapper, so the redirect must fire even when some matches
+    are already dispatchable.
+    """
+    torch = pytest.importorskip("torch")
+    from sword.grpo_bridge import peft_compatible_target_names
+
+    class InnerWrapper(torch.nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.linear = torch.nn.Linear(dim, dim, bias=False)
+
+    class Mixed(torch.nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.plain = torch.nn.Module()
+            self.plain.q_proj = torch.nn.Linear(dim, dim, bias=False)   # dispatchable
+            self.wrapped = torch.nn.Module()
+            self.wrapped.q_proj = InnerWrapper(dim)                     # not dispatchable
+
+    model = Mixed(4)
+    adapted = peft_compatible_target_names(model, ["q_proj"])
+    assert adapted == ["q_proj.linear"]
+
+
 def test_weight_sync_strips_linear_segment_for_vllm_mapping():
     from sword.grpo_bridge import WeightSynchronizer
     ws = WeightSynchronizer()

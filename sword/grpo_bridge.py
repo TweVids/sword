@@ -101,18 +101,31 @@ def peft_compatible_target_names(model: nn.Module, requested: List[str]) -> List
             adapted.append(target)
             continue
         classes = sorted({type(m).__name__ for m in matches})
-        dispatchable = any(isinstance(m, supported) for m in matches)
-        print(f"[GRPO] LoRA target scan: '{target}' -> {len(matches)} module(s), "
-              f"classes {classes}, {'dispatchable' if dispatchable else 'NOT dispatchable'}",
-              flush=True)
-        if not dispatchable:
-            inner = [m for key, m in named_modules
-                     if key.endswith("." + target + ".linear") and isinstance(m, supported)]
-            if inner:
-                adapted.append(target + ".linear")
-                changed = True
-                continue
-            print(f"[GRPO] LoRA target '{target}' has no supported inner '.linear' layer", flush=True)
+        classes = sorted({type(m).__name__ for m in matches})
+        unsupported = [m for m in matches if not isinstance(m, supported)]
+        if not unsupported:
+            print(f"[GRPO] LoRA target scan: '{target}' -> {len(matches)} module(s), "
+                  f"all classes dispatchable: {classes}", flush=True)
+            adapted.append(target)
+            continue
+        # Mixed matches are common on heterogeneous models (e.g. Gemma4 with
+        # plain Linear8bitLt projections alongside ClippableLinear-wrapped
+        # ones). "Some dispatchable" is NOT enough: PEFT raises when it reaches
+        # a wrapped one, so redirect to the wrapper's inner supported layer.
+        inner = [m for key, m in named_modules
+                 if key.endswith("." + target + ".linear") and isinstance(m, supported)]
+        if inner:
+            cover_note = (f" (PARTIAL coverage: {len(unsupported)} of {len(matches)} "
+                          f"matched modules are wrapper-only)" if len(unsupported) != len(matches) else "")
+            print(f"[GRPO] LoRA target scan: '{target}' -> {len(matches)} module(s), "
+                  f"classes {classes}, redirecting {len(unsupported)} non-dispatchable one(s) "
+                  f"to '{target}.linear'{cover_note}", flush=True)
+            adapted.append(target + ".linear")
+            changed = True
+            continue
+        print(f"[GRPO] LoRA target scan: '{target}' -> {len(matches)} module(s), classes "
+              f"{classes}: {len(unsupported)} NOT dispatchable and no supported inner "
+              f"'.linear' layer was found", flush=True)
         adapted.append(target)
     if changed:
         print(f"[GRPO] Adjusted LoRA targets for PEFT-compatible modules: {adapted}", flush=True)

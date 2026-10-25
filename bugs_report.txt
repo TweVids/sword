@@ -103,6 +103,15 @@ STATUS UPDATE (same day, follow-up pass):
   bulletproof option; hot-reload covers lazily imported modules (bridge,
   trainer tooling).
 
+[N7] FOUND & FIXED during grpo_training scan-debug run (2026-10-25):
+  Target scan revealed the real trigger: 'q_proj' matched modules of BOTH
+  Gemma4ClippableLinear (not dispatchable) and Linear8bitLt (dispatchable).
+  The helper treated "some matches dispatchable" as pass - then PEFT hit a
+  wrapped instance and raised. Heterogeneous models need the redirect to
+  fire whenever ANY matched module is unsupported: the target now becomes
+  "<name>.linear" (mixed cases get a partial-coverage note; wrapper-less
+  siblings keep other targets). Regression: mixed-support redirect test.
+
 [ENV-NOTE] (runtime environment, resolved 2026-10-25 — not a code bug):
   runtime had torch 2.14.1+cu130 while vllm==0.23.0 pins torch==2.11.0 ->
   vllm/_C.abi3.so ABI failure ("undefined symbol c10_cuda_check_...").
