@@ -159,6 +159,7 @@ class GRPOBridgeConfig:
     offload_trainer_during_rollout: bool = False
     drop_incomplete_groups: bool = True
     vllm_gpu_utilization: float = 0.33
+    use_cross_step_baseline: bool = True
     vllm_quantization: Optional[str] = None
     kv_cache_dtype: str = "auto"
     enforce_eager: bool = True
@@ -714,6 +715,9 @@ class GRPOBridge:
     def __init__(self, config: Optional[GRPOBridgeConfig] = None):
         self.config = config or GRPOBridgeConfig()
         self.device = self.config.device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self._reward_ema: Optional[float] = None
+        self._reward_ema_var: float = 1.0
+        self._zero_var_groups_last_step = 0
         self.vram_mgr = VRAMLifecycleManager(
             device=self.device,
             enable_sleep=self.config.enable_vllm_sleep,
@@ -1141,20 +1145,58 @@ class GRPOBridge:
         for item in batch.items:
             groups.setdefault(item.group_id, []).append(item)
 
+        zero_var_groups = 0
+        scored_groups = 0
+        batch_mean = (sum(it.reward for it in batch.items) / max(len(batch.items), 1))
         for g_id, group_items in groups.items():
             if len(group_items) != self.config.concurrency_g and self.config.drop_incomplete_groups:
                 continue
+            scored_groups += 1
 
             rewards = [it.reward for it in group_items]
             mean_r = sum(rewards) / len(rewards)
             var_r = sum((r - mean_r) ** 2 for r in rewards) / max(len(rewards), 1)
             std_r = math.sqrt(var_r)
 
-            for it in group_items:
-                if std_r > 1e-6:
+            if std_r > 1e-6:
+                for it in group_items:
                     it.advantage = (it.reward - mean_r) / (std_r + 1e-6)
-                else:
-                    it.advantage = 0.0
+            else:
+                # Uniform group (judge scored every rollout identically): the
+                # group-centered advantage degenerates to zero and GRPO would
+                # learn nothing. Fall back to a running cross-step baseline so
+                # absolute-level signal (e.g. the WHOLE group improving or
+                # regressing) still trains the policy.
+                zero_var_groups += 1
+                baseline = self._reward_ema
+                for it in group_items:
+                    if baseline is not None:
+                        scale = math.sqrt(self._reward_ema_var) + 1e-6
+                        adv = (it.reward - baseline) / scale
+                        it.advantage = max(-2.0, min(2.0, adv))
+                    else:
+                        it.advantage = 0.0
+
+        # Track group reward means (EMA) ONLY from groups that actually produced
+        # a usable baseline signal (non-degenerate judged scores).
+        group_means = [sum(it.reward for it in items) / len(items)
+                       for g_id, items in groups.items()
+                       if len(items) == self.config.concurrency_g or not self.config.drop_incomplete_groups]
+        if group_means and self.config.use_cross_step_baseline:
+            new = sum(group_means) / len(group_means)
+            if self._reward_ema is None:
+                self._reward_ema = new
+                self._reward_ema_var = 1.0
+            else:
+                diff = new - self._reward_ema
+                self._reward_ema += 0.1 * diff
+                self._reward_ema_var = 0.9 * self._reward_ema_var + 0.1 * max(diff * diff, 1e-6)
+        if zero_var_groups:
+            print(f"[GRPO] Reward degeneracy: {zero_var_groups}/{scored_groups} groups had zero "
+                  f"within-group reward variance (avg reward {batch_mean:.3f}); advantages "
+                  f"{'from running cross-step baseline' if self.config.use_cross_step_baseline and self._reward_ema is not None else 'forced to 0 -> no gradient this step'}",
+                  flush=True)
+        self._zero_var_groups_last_step = zero_var_groups
 
     def train_step(
         self,

@@ -438,6 +438,57 @@ def test_version_tuple_compares_like_numba_gate():
     assert _version_tuple("2.4.3") >= (2, 4)
 
 
+def test_zero_variance_group_uses_cross_step_baseline():
+    """
+    [N11] GRPO groups whose rollouts all score identically degenerate to
+    advantage=0 (zero loss/gradnorm, nothing learned). After the first step
+    establishes a running reward baseline, a fully-uniform group must produce
+    advantages from (reward - baseline) instead of being silently zeroed.
+    """
+    from sword.grpo_bridge import GRPOBridge, GRPOBridgeConfig, RolloutBatch, RolloutItem
+
+    cfg = GRPOBridgeConfig(concurrency_g=2, use_cross_step_baseline=True)
+    bridge = GRPOBridge(cfg)
+
+    def make_batch(reward: float, version: int) -> RolloutBatch:
+        items = [RolloutItem("p", [1], "r", [2], [-0.1]), RolloutItem("p", [1], "r2", [3], [-0.2])]
+        for it in items:
+            it.group_id = 0
+            it.policy_version = version
+        return RolloutBatch(items=items, policy_version=version, concurrency_g=2)
+
+    # Step 1: no baseline yet -> uniform group yields zero advantages, but the
+    # EMA baseline gets seeded.
+    batch1 = make_batch(0.3, 0)
+    bridge.score_rollouts(batch1, lambda p, r: 0.3)
+    assert bridge._reward_ema == pytest.approx(0.3)
+    assert all(it.advantage == 0.0 for it in batch1.items)
+
+    # Step 2: uniform group at a DIFFERENT level now gets signal from the
+    # cross-step baseline ((0.5 - 0.3) / sqrt(var) > 0, clamped to [-2, 2]).
+    bridge._reward_ema_var = 0.04
+    batch2 = make_batch(0.5, 0)
+    bridge.score_rollouts(batch2, lambda p, r: 0.5)
+    advantages = [it.advantage for it in batch2.items]
+    assert all(a > 0 for a in advantages), advantages
+
+
+def test_zero_variance_groups_strict_grpo_when_baseline_disabled():
+    """use_cross_step_baseline=False keeps strict GRPO semantics (advantage 0)."""
+    from sword.grpo_bridge import GRPOBridge, GRPOBridgeConfig, RolloutBatch, RolloutItem
+
+    cfg = GRPOBridgeConfig(concurrency_g=2, use_cross_step_baseline=False)
+    bridge = GRPOBridge(cfg)
+
+    items = [RolloutItem("p", [1], "r", [2], [-0.1]), RolloutItem("p", [1], "r2", [3], [-0.2])]
+    for it in items:
+        it.group_id = 0
+        it.policy_version = 0
+    batch = RolloutBatch(items=items, policy_version=0, concurrency_g=2)
+    bridge.score_rollouts(batch, lambda p, r: 0.9)
+    assert all(it.advantage == 0.0 for it in batch.items)
+
+
 def test_weight_sync_strips_linear_segment_for_vllm_mapping():
     from sword.grpo_bridge import WeightSynchronizer
     ws = WeightSynchronizer()

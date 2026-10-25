@@ -556,4 +556,27 @@ NOT covered anywhere:
           checkpointing single-management.
  7. M11 — implement checkpoint resume incl. optimizer state.
 --------------------------------------------------------------------------------
+[N11] LIVE-DIAGNOSED (runtime run, 2026-10-25): step 0001-0002 showed
+  Loss: 0.0000 | GradNorm: 0.0000 while Avg Reward: 0.225. Cause: reward
+  degeneracy, not a training bug — the ModelB judge scored every rollout in
+  a group identically, so within-group std = 0 and GRPO's group-centered
+  advantages all become 0 (no gradient exists). By design, but a silent
+  learning stall when the judge never discriminates. Fixed in
+  sword/grpo_bridge.py:
+  - GRPOBridgeConfig.use_cross_step_baseline (default True): when a group's
+    rewards have std <= 1e-6 AND a running EMA of group-mean rewards exists,
+    advantage = clamp((reward - EMA) / sqrt(EMA_var), -2, 2), giving
+    absolute-level signal (whole group improving vs earlier steps) instead
+    of a zeroed step. First step (no baseline) stays 0.
+  - use_cross_step_baseline=False preserves strict GRPO semantics.
+  - New diagnostic: "[GRPO] Reward degeneracy: N/M groups had zero
+    within-group reward variance (...)" replaces the silent stall.
+  - EMA: mean alpha 0.1, variance EMA alpha 0.1, seeded from non-degenerate
+    scored groups only. Regression tests added in test/test_bugs_report.py
+    (test_zero_variance_group_uses_cross_step_baseline,
+    test_zero_variance_groups_strict_grpo_when_baseline_disabled).
+  NOTE: if the judge keeps scoring uniformly across many steps, the
+  remaining lever is graded sub-scores in sword/b_model.py scoring
+  (Truth: 0.00 uniform ~0.225 suggests a partially-saturated rubric).
+
 End of report.  (Read-only audit; no source files were modified.)
