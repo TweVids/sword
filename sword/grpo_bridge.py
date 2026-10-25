@@ -158,7 +158,7 @@ class GRPOBridgeConfig:
     enable_vllm_sleep: bool = True
     offload_trainer_during_rollout: bool = False
     drop_incomplete_groups: bool = True
-    vllm_gpu_utilization: float = 0.40
+    vllm_gpu_utilization: float = 0.33
     vllm_quantization: Optional[str] = None
     kv_cache_dtype: str = "auto"
     enforce_eager: bool = True
@@ -273,6 +273,10 @@ class VRAMLifecycleManager:
             torch.cuda.empty_cache()
 
         if vllm_engine is not None and self.enable_sleep and hasattr(vllm_engine, "wake_up"):
+            info = self.get_memory_info()
+            print(f"[GRPO] VRAM before rollout: allocated {info['allocated_gb']:.1f} GB, "
+                  f"reserved {info['reserved_gb']:.1f} GB, free "
+                  f"{info.get('free_gb', 0.0):.1f}/{info['total_gb']:.1f} GB", flush=True)
             vllm_engine.wake_up()
             self._sleeping_engine = None
 
@@ -1021,10 +1025,21 @@ class GRPOBridge:
                     logprobs=1,
                 )
                 lora_req = self.weight_sync.get_current_lora_request()
-                if lora_req is not None:
-                    outputs = self.vllm_engine.generate(expanded_prompts, sp, lora_request=lora_req)
-                else:
-                    outputs = self.vllm_engine.generate(expanded_prompts, sp)
+                try:
+                    if lora_req is not None:
+                        outputs = self.vllm_engine.generate(expanded_prompts, sp, lora_request=lora_req)
+                    else:
+                        outputs = self.vllm_engine.generate(expanded_prompts, sp)
+                except torch.cuda.OutOfMemoryError:
+                    # Co-residency spike (trainer + awake engine). Drain, retry once;
+                    # persistent OOM surfaces to the fallback path below.
+                    print("[GRPO] CUDA OOM during rollout generation; draining caches and retrying once", flush=True)
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    if lora_req is not None:
+                        outputs = self.vllm_engine.generate(expanded_prompts, sp, lora_request=lora_req)
+                    else:
+                        outputs = self.vllm_engine.generate(expanded_prompts, sp)
 
                 if len(outputs) != len(expanded_prompts):
                     raise ValueError("vLLM returned an incomplete rollout batch")

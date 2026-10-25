@@ -131,6 +131,17 @@ STATUS UPDATE (same day, follow-up pass):
   time (Adjusted targets -> q_proj.linear ...); failure moved forward to
   vLLM init [N9]. Target-redirect fix verified live on Gemma4-31B 8-bit.
 
+[N10] LIVE (runtime run 07:5x, 2026-10-25): training actually ran - step
+  0002/0005 reached with real codex rollouts and ModelB scoring, then
+  VRAM bottomed out at ~2 GB free during the sleep/wake handoff ("almost
+  ooms on just 2gb vram left"). Cause: rollout-phase co-residency: 8-bit
+  trainer (~32-35 GB) + awake vLLM engine capped at 0.40*95 GB + activations
+  on one GPU. Fixed: GRPOBridgeConfig.vllm_gpu_utilization default 0.40 ->
+  0.33 (KV cache ceiling drops ~7 GB, fp8 KV cache compensates capacity);
+  enter_rollout_phase now logs VRAM telemetry before wake_up; the rollout
+  generate call retries once after draining caches on CUDA OOM instead of
+  dying mid-step.
+
 [ENV-NOTE] (runtime environment, resolved 2026-10-25 — not a code bug):
   runtime had torch 2.14.1+cu130 while vllm==0.23.0 pins torch==2.11.0 ->
   vllm/_C.abi3.so ABI failure ("undefined symbol c10_cuda_check_...").
