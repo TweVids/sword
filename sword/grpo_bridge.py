@@ -37,6 +37,56 @@ from .rl.policy import token_statistics, safe_optimizer_step
 from .defaults import DEFAULT_GRPO_MODEL
 
 
+def _peft_base_layer_types() -> tuple:
+    """Module classes PEFT's LoRA dispatchers can wrap directly."""
+    types = [nn.Linear, nn.Embedding, getattr(nn, "Conv1d", nn.Module),
+             getattr(nn, "Conv2d", nn.Module), getattr(nn, "Conv3d", nn.Module),
+             getattr(nn, "MultiheadAttention", nn.Module)]
+    try:
+        from transformers.pytorch_utils import Conv1D
+        types.append(Conv1D)
+    except Exception:
+        pass
+    try:
+        import bitsandbytes as bnb
+        types.extend(getattr(bnb.nn, attr) for attr in
+                     ("Linear8bitLt", "Linear4bit", "LinearNF4", "LinearFP4", "LinearFP8"))
+    except Exception:
+        pass
+    return tuple(types)
+
+
+def peft_compatible_target_names(model: nn.Module, requested: List[str]) -> List[str]:
+    """
+    Redirect target names that resolve only to PEFT-incompatible wrapper modules.
+
+    Gemma4 hides attention projections inside custom wrappers such as
+    Gemma4ClippableLinear (containing a bitsandbytes Linear8bitLt). PEFT matches
+    targets by module NAME and then dispatches replacements by module CLASS, so
+    the wrapper's name (e.g. "q_proj") resolves to an unsupported class even
+    though its inner layer is standard. In that case redirect the target to the
+    inner supported layer ("q_proj.linear"): the wrapper keeps its clipping and
+    forward logic, and the adapter is attached to the projection itself.
+    """
+    supported = _peft_base_layer_types()
+    named_modules = list(model.named_modules())
+    adapted = []
+    changed = False
+    for target in requested:
+        matches = [m for key, m in named_modules if key == target or key.endswith("." + target)]
+        if matches and not any(isinstance(m, supported) for m in matches):
+            inner = [m for key, m in named_modules
+                     if key.endswith("." + target + ".linear") and isinstance(m, supported)]
+            if inner:
+                adapted.append(target + ".linear")
+                changed = True
+                continue
+        adapted.append(target)
+    if changed:
+        print(f"[GRPO] Adjusted LoRA targets for PEFT-compatible modules: {adapted}", flush=True)
+    return adapted
+
+
 @dataclass
 class GRPOBridgeConfig:
     """
@@ -255,6 +305,16 @@ class WeightSynchronizer:
         self.temp_dir = tempfile.mkdtemp(prefix="sword_lora_sync_", dir=adapter_sync_dir)
         self.current_adapter_path: Optional[str] = None
 
+    def _normalize_adapter_key(self, name: str) -> str:
+        """
+        BUG (grpo_training / Gemma4) fix. Gemma4 attention targets get redirected
+        to the inner "<proj>.linear" module for PEFT compatibility, which puts a
+        ".linear" segment between the projection and the lora_A/lora_B tensors.
+        vLLM's LoRA loader maps weights by module stack name (q_proj, k_proj,
+        ...), so strip that segment for the exported adapter.
+        """
+        return name.replace(".linear.lora_", ".lora_")
+
     def extract_lora_state_dict(self, model: nn.Module) -> Dict[str, torch.Tensor]:
         """Extracts trainable LoRA parameters while preserving standard PEFT key hierarchy."""
         lora_sd: Dict[str, torch.Tensor] = {}
@@ -265,8 +325,28 @@ class WeightSynchronizer:
                     name += ".weight"
                 if not name.startswith("base_model.model."):
                     name = "base_model.model." + name
+                name = self._normalize_adapter_key(name)
                 lora_sd[name] = param.detach().cpu().contiguous().clone()
         return lora_sd
+
+    def _normalize_exported_adapter_keys(self, adapter_path: str):
+        """
+        BUG (grpo_training / Gemma4) fix, PEFT export path. save_pretrained is
+        the preferred sync route; rewrite keys with the ".linear.lora_" ->
+        ".lora_" normalization in place so vLLM can map the adapter onto its
+        module stacks. No-op when the model has no inner-wrapper targets.
+        """
+        weights_file = os.path.join(adapter_path, "adapter_model.safetensors")
+        if not os.path.exists(weights_file):
+            return
+        try:
+            from safetensors.torch import load_file, save_file
+            sd = load_file(weights_file)
+            normalized = {self._normalize_adapter_key(key): value for key, value in sd.items()}
+            if normalized != sd:
+                save_file(normalized, weights_file)
+        except ImportError:
+            return
 
     def sync_to_vllm(self, trainer_model: nn.Module, vllm_engine: Optional[Any] = None) -> int:
         """
@@ -280,6 +360,7 @@ class WeightSynchronizer:
         if hasattr(trainer_model, "save_pretrained") and hasattr(trainer_model, "peft_config"):
             try:
                 trainer_model.save_pretrained(adapter_path)
+                self._normalize_exported_adapter_keys(adapter_path)
                 cfg_file = os.path.join(adapter_path, "adapter_config.json")
                 if os.path.exists(cfg_file):
                     with open(cfg_file, "r", encoding="utf-8") as f:
@@ -649,7 +730,9 @@ class GRPOBridge:
                         r=self.config.lora_r,
                         lora_alpha=self.config.lora_alpha,
                         lora_dropout=self.config.lora_dropout,
-                        target_modules=self.config.target_modules or ["q_proj", "k_proj", "v_proj", "o_proj"],
+                        target_modules=peft_compatible_target_names(
+                            self.trainer_model,
+                            self.config.target_modules or ["q_proj", "k_proj", "v_proj", "o_proj"]),
                     )
                 except Exception:
                     self.trainer_model = None
@@ -707,14 +790,20 @@ class GRPOBridge:
                         raise RuntimeError(f"Failed to load requested trainer model {self.config.model_name}") from e_load
 
                 from peft import LoraConfig, get_peft_model
+                requested_targets = self.config.target_modules or ["q_proj", "k_proj", "v_proj", "o_proj"]
+                adapter_targets = peft_compatible_target_names(self.trainer_model, requested_targets)
                 adapter_config = LoraConfig(
                     r=self.config.lora_r,
                     lora_alpha=self.config.lora_alpha,
                     lora_dropout=self.config.lora_dropout,
-                    target_modules=self.config.target_modules or ["q_proj", "k_proj", "v_proj", "o_proj"],
+                    target_modules=adapter_targets,
                     bias="none", task_type="CAUSAL_LM",
                 )
                 self.trainer_model = get_peft_model(self.trainer_model, adapter_config)
+                # Keep the weight-sync config aligned with the module names PEFT
+                # actually wrapped, so exported adapter files name them correctly.
+                if adapter_targets != requested_targets:
+                    self.config.target_modules = adapter_targets
 
         if (self.trainer_model is not None and hasattr(self.trainer_model, "to")
                 and not getattr(self.trainer_model, "is_loaded_in_4bit", False)

@@ -70,6 +70,22 @@ STATUS UPDATE (same day, follow-up pass):
   reproduces the original failure before this fix. Tests also cover disabled
   thinking and models that do not support the option.
 
+[N5] FOUND & FIXED during first real grpo_training execution (2026-10-25):
+  Target module Gemma4ClippableLinear (containing a bitsandbytes Linear8bitLt)
+  is not supported by PEFT LoRA dispatch -> get_peft_model raises and
+  grpo_training fails after model load. Root cause: PEFT matches targets by
+  module NAME ("q_proj") but dispatches replacement by module CLASS, and
+  Gemma4 wraps its attention projections in custom ClippableLinear wrappers.
+  Fix in sword/grpo_bridge.py:
+    1) peft_compatible_target_names() redirects targets that resolve only to
+       unsupported wrappers to the inner supported layer ("q_proj.linear");
+       applied to both the Unsloth and transformers+PEFT attach paths.
+    2) WeightSynchronizer._normalize_adapter_key strips the ".linear" segment
+       from exported adapter keys (PEFT-save and manual paths) so vLLM's LoRA
+       loader can map weights onto its q_proj/k_proj module stacks.
+  Regression: target-redirect test with a wrapper-module tree + key
+  normalization test in test/test_bugs_report.py.
+
 [ENV-NOTE] (runtime environment, resolved 2026-10-25 — not a code bug):
   runtime had torch 2.14.1+cu130 while vllm==0.23.0 pins torch==2.11.0 ->
   vllm/_C.abi3.so ABI failure ("undefined symbol c10_cuda_check_...").

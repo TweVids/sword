@@ -354,6 +354,48 @@ def test_bmodel_thinking_budget_retries_without_think():
 
 
 # ===========================================================================
+# grpo_training (Gemma4 LoRA) — PEFT cannot attach to wrapper modules like
+# Gemma4ClippableLinear; targets must redirect to the inner supported layer.
+# ===========================================================================
+def test_peft_target_redirect_for_wrapped_projections():
+    torch = pytest.importorskip("torch")
+    from sword.grpo_bridge import peft_compatible_target_names
+
+    class InnerWrapper(torch.nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.linear = torch.nn.Linear(dim, dim, bias=False)
+
+    class Block(torch.nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.self_attn = torch.nn.Module()
+            self.self_attn.q_proj = InnerWrapper(dim)
+            self.self_attn.k_proj = InnerWrapper(dim)
+            self.mlp = torch.nn.Linear(dim, dim, bias=False)  # already supported
+
+    model = Block(4)
+    adapted = peft_compatible_target_names(
+        model, ["q_proj", "k_proj", "v_proj", "o_proj", "mlp"])
+    # Wrapped projections redirect to the inner ".linear" module...
+    assert adapted[0] == "q_proj.linear" and adapted[1] == "k_proj.linear"
+    # ...nonexistent targets pass through unchanged, and supported names remain.
+    assert adapted[2] == "v_proj" and adapted[3] == "o_proj" and adapted[4] == "mlp"
+
+
+def test_weight_sync_strips_linear_segment_for_vllm_mapping():
+    from sword.grpo_bridge import WeightSynchronizer
+    ws = WeightSynchronizer()
+    peft_key = ("base_model.model.model.layers.0.self_attn.q_proj.linear."
+                "lora_A.weight")
+    assert ws._normalize_adapter_key(peft_key) == (
+        "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight")
+    # Unaffected keys pass through byte-for-byte.
+    plain = "base_model.model.model.layers.1.self_attn.ov_proj.lora_B.weight"
+    assert ws._normalize_adapter_key(plain) == plain
+
+
+# ===========================================================================
 # H6 — regression guard: engine_vllm_bypass.py stays compilable
 # (the initial audit suspected truncation; verified false, kept as a guard)
 # ===========================================================================
