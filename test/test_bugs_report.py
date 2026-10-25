@@ -317,6 +317,39 @@ def test_bmodel_parser_still_rejects_no_scores():
         judge.parse_scores("I cannot evaluate this response, sorry.")
 
 
+def test_bmodel_thinking_budget_retries_without_think():
+    """
+    Qwen 3.5/3.6 thinking models burn num_predict inside ````; the final
+    JSON comes back empty. The scorer must re-request the same model with
+    think disabled before falling back / going deterministic.
+    """
+    ModelBJudge = _load_model_b_judge()
+    judge = ModelBJudge()
+    calls = []
+
+    def fake_request(payload):
+        calls.append(dict(payload))
+        if payload.get("think"):
+            # Budget exhausted during reasoning: empty answer, no JSON at all.
+            return {"message": {"thinking": "deep reasoning", "content": ""}}
+        return {"message": {"content": '{"truth": 0.5, "formatted": 1.0, '
+                                       '"rule_reasoning_follow": 1.0, "rule_answer_follow": 1.0, '
+                                       '"tools_success": 0.0, "cheating": false}'}}
+
+    judge._request_chat = fake_request
+    judge._memory_ready = True
+    judge.ensure_ready = lambda: True
+    judge._activate_fallback = lambda: False
+    result = judge.evaluate(problem="What is 2+2?", solution="4",
+                            reasoning_rule="explain", answer_rule="state it",
+                            candidate_response="openh4")
+    assert result.truth == 0.5 and result.formatted == 1.0
+    # First (think) request failed, second (no-think) request succeeded.
+    assert "think" in calls[0] and "think" not in calls[1]
+    # Parsed from the real model, not deterministic fallback.
+    assert judge.last_evaluation_source == judge.active_model_name
+
+
 # ===========================================================================
 # H6 — regression guard: engine_vllm_bypass.py stays compilable
 # (the initial audit suspected truncation; verified false, kept as a guard)

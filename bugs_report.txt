@@ -41,6 +41,23 @@ STATUS UPDATE (same day, follow-up pass):
   ({"scores": {...}, "cheating": false} now selects the nested score table).
   Regression-covered by 4 new tests in test/test_bugs_report.py.
 
+[N3] FOUND & FIXED during live rollout (2026-10-25, fourth run):
+  b_model.live_fallback FAILED again with the same error after [N2]. The
+  parser was now fine - the problem was upstream: qwen3.5:9b is a deep
+  thinking model, and with num_predict=1024 it burns the ENTIRE completion
+  budget inside its thinking block. Ollama's format:"json" only constrains
+  the FINAL answer, so the visible content came back empty/truncated with
+  no JSON at all - nothing to parse. Fix in sword/b_model.py evaluate():
+    1) when think is enabled, num_predict is bumped to num_predict_no_think
+       (thinking needs its own budget);
+    2) per-model spec queue: think=True first, then a think=False re-request
+       that competes for tokens only with the JSON answer;
+    3) parse failures (ValueError) advance to the next spec; transport/load
+       failures (timeout/OOM/server error) escalate to the fallback model
+       immediately, as before.
+  Regression: test_bmodel_thinking_budget_retries_without_think + updated
+  test_reward_retries_smaller_judge_and_unloads_active_model[parse].
+
 [ENV-NOTE] (runtime environment, resolved 2026-10-25 — not a code bug):
   runtime had torch 2.14.1+cu130 while vllm==0.23.0 pins torch==2.11.0 ->
   vllm/_C.abi3.so ABI failure ("undefined symbol c10_cuda_check_...").

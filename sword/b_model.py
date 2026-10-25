@@ -71,6 +71,11 @@ class ModelBJudgeConfig:
     num_ctx: int = 8192
     num_predict: int = 1024
     reasoning: Optional[Union[str, bool]] = True
+    # Fallback-model failure mode (2026-10-25): Qwen 3.5/3.6 thinking models burn
+    # the num_predict budget inside <think> when reasoning is enabled, leaving the
+    # final JSON answer empty/truncated. This is the budget used for a NO-THINK
+    # re-request that competes for budget only with the JSON answer.
+    num_predict_no_think: int = 2048
     force_gpu: bool = True
     use_mmap: bool = False
     auto_unload: bool = True
@@ -102,6 +107,7 @@ def model_b_config(port: int = 11343, *, mock_test: bool = False,
         timeout=float(options.get("B_model_timeout", 180)),
         num_ctx=int(options.get("B_model_num_ctx", 8192)),
         num_predict=int(options.get("B_model_num_predict", 1024)),
+        num_predict_no_think=int(options.get("B_model_num_predict_no_think", 2048)),
         force_gpu=bool(options.get("B_model_force_gpu", True)),
         use_mmap=bool(options.get("B_model_use_mmap", False)),
     )
@@ -566,42 +572,75 @@ class ModelBJudge:
             tools_succeeded=tools_succeeded,
         )
 
-        payload: Dict[str, Any] = {
-            "model": self.active_model_name,
+        # THINKING-BUDGET failures (qwen3.5/3.6): with reasoning enabled the
+        # model burns the num_predict budget inside its thinking block and the
+        # final JSON answer comes back empty/truncated. Strategy per model:
+        #   spec 1: as configured (think=True, num_predict bumped for thinking)
+        #   spec 2: same model, think=False, dedicated no-think budget -
+        #           competes for tokens only with the JSON answer
+        # If every spec fails for the current model, escalate once to the
+        # fallback model; if that also fails, deterministic scoring.
+        base_options = self._inference_options()
+        no_think_options = dict(base_options)
+        no_think_options["num_predict"] = max(base_options.get("num_predict", 0),
+                                              self.config.num_predict_no_think)
+
+        base_payload: Dict[str, Any] = {
             "messages": [
                 {"role": "system", "content": self.SYSTEM_PROMPT},
                 {"role": "user", "content": user_content},
             ],
             "stream": False,
             "keep_alive": self.config.keep_alive_during_eval,
-            "options": self._inference_options(),
             "format": "json",
         }
-        if self.config.reasoning is not None:
-            payload["think"] = self.config.reasoning
+        specs: List[Dict[str, Any]] = []
+        if self.config.reasoning:
+            think_options = dict(base_options)
+            # Thinking consumes tokens from the same budget as the answer.
+            if base_options.get("num_predict", 0) < self.config.num_predict_no_think:
+                think_options["num_predict"] = self.config.num_predict_no_think
+            specs.append({"options": think_options, "payload": dict(base_payload, think=self.config.reasoning)})
+            no_think_payload = dict(base_payload)
+            no_think_payload.pop("think", None)
+            specs.append({"options": no_think_options, "payload": no_think_payload})
+        else:
+            specs.append({"options": base_options, "payload": dict(base_payload)})
 
-        for attempt in range(2):
-            payload["model"] = self.active_model_name
-            try:
-                data = self._request_chat(dict(payload))
-                message_obj = data.get("message", {})
-                thinking = message_obj.get("thinking") or ""
-                self.last_thinking_received = bool(thinking)
-                content = message_obj.get("content", "") or ""
-                if thinking and self.config.show_thinking:
-                    print(f"[ModelB Thinking]\n{thinking}\n" + "-" * 60)
-                result = self.parse_scores(content, fallback_tools_success=fallback_tool_ratio)
-                self.last_evaluation_source = self.active_model_name
-                self.evaluation_counts[self.active_model_name] = self.evaluation_counts.get(self.active_model_name, 0) + 1
-                return result
-            except Exception as exc:
-                self.last_error = str(exc)
-                # Inference timeout/OOM/load failure: retry the same reward on the smaller model.
-                if attempt == 0 and self._activate_fallback():
-                    continue
-                print(f"[ModelB] Evaluation failed: {self.last_error}; using deterministic scoring", flush=True)
-                self._setup_retry_at = time.monotonic() + 60
-                break
+        while True:
+            current = self.active_model_name
+            for spec in specs:
+                payload = dict(spec["payload"])
+                payload["model"] = current
+                payload["options"] = dict(spec["options"])
+                try:
+                    data = self._request_chat(payload)
+                    message_obj = data.get("message", {})
+                    thinking = message_obj.get("thinking") or ""
+                    self.last_thinking_received = bool(thinking)
+                    content = message_obj.get("content", "") or ""
+                    if thinking and self.config.show_thinking:
+                        print(f"[ModelB Thinking]\n{thinking}\n" + "-" * 60)
+
+                    result = self.parse_scores(content, fallback_tools_success=fallback_tool_ratio)
+                    self.last_evaluation_source = current
+                    self.evaluation_counts[current] = self.evaluation_counts.get(current, 0) + 1
+                    return result
+                except Exception as exc:
+                    self.last_error = f"{exc} (model={current}, think={'think' in payload})"
+                    # Parse failure: try the next spec (no-think) on this model first.
+                    if isinstance(exc, ValueError):
+                        continue
+                    # Transport/load failure (timeout, OOM, server error): do not
+                    # wait again on this model; escalate to the fallback now.
+                    break
+            # Every spec failed for this model: escalate to the fallback model
+            # (transport/load/parse failures all qualify).
+            if self._activate_fallback():
+                continue
+            print(f"[ModelB] Evaluation failed: {self.last_error}; using deterministic scoring", flush=True)
+            self._setup_retry_at = time.monotonic() + 60
+            break
         return self._deterministic_fallback(candidate_response, solution, tools_called, tools_succeeded)
 
     def _deterministic_fallback(

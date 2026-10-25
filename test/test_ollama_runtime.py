@@ -180,6 +180,8 @@ def test_reward_retries_smaller_judge_and_unloads_active_model(failure):
     def post(url, json, **kwargs):
         calls.append((url, copy.deepcopy(json)))
         if url.endswith("/api/chat") and json["model"] == PRIMARY:
+            # failure2 (unparseable content) must also fail for the no-think
+            # re-request of the same model before escalation to the fallback.
             if isinstance(failure, Exception):
                 raise failure
             return failure
@@ -197,7 +199,14 @@ def test_reward_retries_smaller_judge_and_unloads_active_model(failure):
         judge.evaluate("p", "4", "", "", "4")
         judge.release_after_eval()
     chat_models = [payload["model"] for url, payload in calls if url.endswith("/api/chat")]
-    assert chat_models == [PRIMARY, FALLBACK, FALLBACK]
+    parse_failure = isinstance(failure, requests.Response) and \
+        "error" not in failure.json()  # unparseable content, not an HTTP/API error
+    if not parse_failure:
+        # Transport/load failures escalate to the fallback immediately.
+        assert chat_models == [PRIMARY, FALLBACK, FALLBACK]
+    else:
+        # Parse failure: the primary gets a think + no-think chance first.
+        assert chat_models == [PRIMARY, PRIMARY, FALLBACK, FALLBACK]
     assert calls[-1][1] == {"model": FALLBACK, "keep_alive": 0}
     assert judge.evaluation_counts == {FALLBACK: 2}
 
