@@ -797,15 +797,14 @@ class PrimaryScorer:
         ref_clean = reference.strip().lower()
         ans_clean = answer.strip().lower()
 
-        # Direct exact or substring match
-        if ref_clean in ans_clean:
+        # Substring matching rewarded 14 when the expected answer was 4.
+        if ref_clean and ref_clean == ans_clean:
             return 0.35, {"matched": True, "exact": True}
 
         # Numerical comparison if answer is numbers
-        ref_nums = re.findall(r"[-+]?\d*\.\d+|\d+", ref_clean)
-        ans_nums = re.findall(r"[-+]?\d*\.\d+|\d+", ans_clean)
-        if ref_nums and ans_nums and ref_nums[-1] == ans_nums[-1]:
-            return 0.35, {"matched": True, "numerical_match": ref_nums[-1]}
+        from sword.reward import MathVerifier
+        if ref_clean and MathVerifier.verify_answer(ans_clean, ref_clean):
+            return 0.35, {"matched": True, "numerical_match": ref_clean}
 
         return -0.40, {"matched": False}
 

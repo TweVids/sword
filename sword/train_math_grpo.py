@@ -282,6 +282,7 @@ class InProcessRolloutEngine:
             )
 
         response_ids = outputs[:, prompt_len:]
+        self.last_rollout_tokens = (input_ids[0].tolist(), response_ids[0].tolist())
         decoded_response = self.tokenizer.decode(response_ids[0], skip_special_tokens=True)
 
         del inputs, outputs, response_ids, input_ids, attention_mask
@@ -1219,10 +1220,7 @@ def compute_gdpo_advantages(
 # 📉  MEMORY-EFFICIENT CHUNKED GRPO SURROGATE LOSS
 # =====================================================================
 class ChunkedGRPOLoss(nn.Module):
-    """
-    Unsloth-style sequence chunking cross-entropy.
-    Prevents materializing the massive [Batch, SeqLen, Vocab] tensor in VRAM.
-    """
+    """Standalone GRPO using the shared checkpointed token statistics."""
 
     def __init__(self, clip_eps: float = 0.2, kl_coeff: float = 0.04, chunk_size: int = 512):
         super().__init__()
@@ -1230,134 +1228,24 @@ class ChunkedGRPOLoss(nn.Module):
         self.kl_coeff = kl_coeff
         self.chunk_size = chunk_size
 
-    def forward(
-        self,
-        model: nn.Module,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        prompt_lengths: List[int],
-        advantages: torch.Tensor,
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        batch_size, seq_len = input_ids.shape
-        device = input_ids.device
+    def forward(self, model, input_ids, attention_mask, prompt_lengths, advantages):
+        from sword.rl.loss import ChunkedGRPOLoss as PolicyLoss
+        return PolicyLoss(self.clip_eps, self.kl_coeff, self.chunk_size).forward_chunked(
+            model, input_ids, attention_mask, prompt_lengths, advantages)
 
-        # Mask response tokens only
-        response_mask = torch.zeros_like(input_ids, dtype=torch.bool)
-        for i, p_len in enumerate(prompt_lengths):
-            response_mask[i, p_len:] = attention_mask[i, p_len:].bool()
-
-        outputs = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            use_cache=False,
-            return_dict=True,
-        )
-        logits = outputs.logits
-
-        targets = input_ids[:, 1:]
-        target_mask = response_mask[:, 1:]
-        shift_logits = logits[:, :-1, :]
-
-        num_tokens = shift_logits.size(1)
-        policy_logprobs_list = []
-
-        # Iterate over sequence in chunks (chunk_size=512)
-        for start_idx in range(0, num_tokens, self.chunk_size):
-            end_idx = min(start_idx + self.chunk_size, num_tokens)
-            chunk_logits = shift_logits[:, start_idx:end_idx, :].reshape(-1, shift_logits.size(-1))
-            chunk_targets = targets[:, start_idx:end_idx].reshape(-1)
-
-            token_logprobs = -F.cross_entropy(
-                chunk_logits.float(),
-                chunk_targets,
-                reduction="none",
-            ).reshape(batch_size, end_idx - start_idx)
-            policy_logprobs_list.append(token_logprobs)
-
-        policy_logprobs = torch.cat(policy_logprobs_list, dim=1)
-        old_logprobs = policy_logprobs.detach()
-
-        # Clipped surrogate objective
-        log_ratio = policy_logprobs - old_logprobs
-        ratio = torch.exp(log_ratio)
-        adv = advantages.unsqueeze(-1).to(ratio.device)
-
-        surr1 = ratio * adv
-        surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * adv
-        policy_loss_per_token = -torch.min(surr1, surr2)
-
-        valid_tokens = target_mask.float().sum().clamp(min=1.0)
-        policy_loss = (policy_loss_per_token * target_mask.float()).sum() / valid_tokens
-
-        metrics = {
-            "grpo_loss": round(policy_loss.item(), 5),
-            "mean_ratio": round(ratio.mean().item(), 4),
-            "mean_advantage": round(advantages.mean().item(), 4),
-        }
-        return policy_loss, metrics
-
-    def forward_single(
-        self,
-        model: nn.Module,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        prompt_length: int,
-        advantage: float,
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """
-        Micro-batch loss for a single rollout sequence (batch_size=1).
-        Disables use_cache and only computes cross entropy on the response tokens
-        in chunks, keeping activation VRAM minimal (< 1.5 GB).
-        """
-        outputs = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            use_cache=False,
-            return_dict=True,
-        )
-        logits = outputs.logits  # [1, seq_len, vocab_size]
-
-        targets = input_ids[:, 1:]
-        shift_logits = logits[:, :-1, :]
-
-        resp_start = max(0, prompt_length - 1)
-        resp_logits = shift_logits[:, resp_start:, :]
-        resp_targets = targets[:, resp_start:]
-
-        if resp_targets.numel() == 0:
-            return torch.tensor(0.0, device=input_ids.device, requires_grad=True), {"grpo_loss": 0.0}
-
-        resp_logits_flat = resp_logits.reshape(-1, resp_logits.size(-1))
-        resp_targets_flat = resp_targets.reshape(-1)
-        num_tokens = resp_targets_flat.size(0)
-
-        token_logprobs_list = []
-        for s_idx in range(0, num_tokens, self.chunk_size):
-            e_idx = min(s_idx + self.chunk_size, num_tokens)
-            c_logits = resp_logits_flat[s_idx:e_idx].float()
-            c_targets = resp_targets_flat[s_idx:e_idx]
-            c_logprobs = -F.cross_entropy(c_logits, c_targets, reduction="none")
-            token_logprobs_list.append(c_logprobs)
-
-        policy_logprobs = torch.cat(token_logprobs_list, dim=0)
-        old_logprobs = policy_logprobs.detach()
-
-        log_ratio = policy_logprobs - old_logprobs
-        ratio = torch.exp(log_ratio)
-        adv_tensor = torch.tensor(advantage, dtype=torch.float32, device=input_ids.device)
-
-        surr1 = ratio * adv_tensor
-        surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * adv_tensor
-        policy_loss = -torch.min(surr1, surr2).mean()
-
-        token_nll = -policy_logprobs.mean().item()
-        pg_loss = -(policy_logprobs * adv_tensor).mean().item()
-
-        return policy_loss, {
-            "grpo_loss": round(policy_loss.item(), 5),
-            "nll": round(token_nll, 4),
-            "pg_loss": round(pg_loss, 4),
-        }
+    def forward_single(self, model, input_ids, attention_mask, prompt_length, advantage):
+        from sword.rl.policy import token_statistics
+        from sword.rl.loss import ChunkedGRPOLoss as PolicyLoss
+        logprobs, _ = token_statistics(model, input_ids, attention_mask, self.chunk_size)
+        mask = attention_mask[:, 1:].bool().clone()
+        mask[:, :max(0, prompt_length - 1)] = False
+        advantages = torch.tensor([advantage], dtype=torch.float32, device=input_ids.device)
+        loss, metrics = PolicyLoss(self.clip_eps, self.kl_coeff, self.chunk_size)._compute_surrogate_loss(
+            logprobs, mask, advantages)
+        valid_lp = logprobs.masked_select(mask)
+        metrics["nll"] = -valid_lp.mean().item() if valid_lp.numel() else 0.0
+        metrics["pg_loss"] = metrics["nll"] * advantage
+        return loss, metrics
 
 
 # =====================================================================
@@ -2815,6 +2703,7 @@ def run_standalone_math_grpo(
 
         rollout_results = []
         raw_rollouts = []
+        rollout_token_ids = []
 
         for r_idx in range(num_rollouts):
             t_ro_start = time.perf_counter()
@@ -2827,6 +2716,7 @@ def run_standalone_math_grpo(
                 temperature=0.8,
             )
             raw_rollouts.append(text)
+            rollout_token_ids.append(getattr(engine, "last_rollout_tokens", None))
             t_ro_elapsed = time.perf_counter() - t_ro_start
             token_count = len(tokenizer.encode(text, add_special_tokens=False))
 
@@ -2911,11 +2801,15 @@ def run_standalone_math_grpo(
                 model.config.use_cache = False
             optimizer.zero_grad()
 
-            p_ids = tokenizer.encode(problem_text, add_special_tokens=False)
+            p_ids = tokenizer.encode(formatted_prompt, add_special_tokens=False)
             p_len = len(p_ids)
 
             for i, res in enumerate(rollout_results):
-                r_ids = tokenizer.encode(res["full_text"], add_special_tokens=False)
+                sampled_ids = rollout_token_ids[i]
+                if sampled_ids is None:
+                    raise RuntimeError("GRPO requires exact prompt and response token IDs from the rollout engine")
+                p_ids, r_ids = sampled_ids
+                p_len = len(p_ids)
                 combo = p_ids + r_ids
                 cur_input = torch.tensor([combo], dtype=torch.long, device=device)
                 cur_mask = torch.ones_like(cur_input)
@@ -2938,7 +2832,8 @@ def run_standalone_math_grpo(
 
             grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             grad_norm_val = float(grad_norm)
-            optimizer.step()
+            from sword.rl.policy import safe_optimizer_step
+            safe_optimizer_step(optimizer, trainable_params)
             print(" done")
         else:
             print(f"[Step {step:03d}/{steps:03d} | {step_effort.upper():<6}] 🔍 Study Mode: Evaluated {num_rollouts} rollouts (Backprop skipped)")

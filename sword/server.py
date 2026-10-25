@@ -530,6 +530,7 @@ class FastServer:
         use_speculative: Optional[bool] = None,
         speculative_k: int = 3,
         return_logprobs: bool = False,
+        return_token_ids: bool = False,
         **kwargs,
     ) -> Any:
         """
@@ -550,12 +551,14 @@ class FastServer:
             max_new_tokens=max_new_tokens,
             temperature=temperature,
             top_k=top_k,
-            use_speculative=use_speculative,
+            use_speculative=use_speculative and not return_logprobs,
             speculative_k=speculative_k,
             return_logprobs=return_logprobs,
         )
 
-        all_res = results.get("generated_texts", results["responses"])
+        all_res = results.get("generated_texts")
+        if all_res is None:
+            all_res = results["responses"]
         grouped = []
         for i in range(len(prompts)):
             start_i = i * num_rollouts_per_prompt
@@ -570,6 +573,17 @@ class FastServer:
                     grouped_lps.append([all_lps[start_i + j] for j in range(num_rollouts_per_prompt)])
                 else:
                     grouped_lps.append([None] * num_rollouts_per_prompt)
+            if return_token_ids:
+                if "prompt_token_ids" not in results or "generated_tokens" not in results:
+                    raise ValueError("Rollout backend must return exact token IDs for GRPO training")
+                metadata = []
+                for i in range(len(prompts)):
+                    rows = []
+                    for j in range(num_rollouts_per_prompt):
+                        index = i * num_rollouts_per_prompt + j
+                        rows.append((results["prompt_token_ids"][index], results["generated_tokens"][index].tolist()))
+                    metadata.append(rows)
+                return grouped, grouped_lps, metadata
             return grouped, grouped_lps
 
         return grouped
@@ -877,6 +891,7 @@ class FastServer:
                 prompt_lens=[prompt_len],
             )
             input_ids = in_ids_single.expand(bsz, -1)
+            attention_mask = attn_mask_single.expand(bsz, -1) if attn_mask_single is not None else None
             logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
             next_token_logits = logits[:, -1, :].repeat(bsz, 1)
         else:
@@ -1054,6 +1069,7 @@ class FastServer:
             "generated_texts": gen_responses,
             "full_responses": full_responses,
             "generated_tokens": gen_tokens,
+            "prompt_token_ids": [input_ids[i][attention_mask[i].bool()].tolist() if attention_mask is not None else input_ids[i].tolist() for i in range(bsz)],
             "latency_s": total_time,
             "total_tokens": total_generated_tokens,
             "tokens_per_stream": [len(generated)] * bsz,

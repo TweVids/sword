@@ -1,5 +1,8 @@
 sword grpo training engine: refactoring and architecture notes
 
+2026-10-25: GRPO/bridge/Model B/scorer/vLLM bug audit and fixes are recorded in GRPO_AUDIT.md.
+It includes verified regressions, OOM rollback handling, and remaining hardware-validation limits.
+
 1. overview and requirements
 - goal: build a clean, unified, robust grpo training architecture for sword.
 - single entry point: sword.train(long_train=True, test=False, ...) with all specified parameters.

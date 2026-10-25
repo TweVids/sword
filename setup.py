@@ -23,6 +23,7 @@ setup(
         "datasets",
         "huggingface_hub",
         "peft",
+        "requests>=2.31.0",
     ],
     python_requires=">=3.10",
 )

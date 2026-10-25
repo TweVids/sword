@@ -1,0 +1,428 @@
+================================================================================
+SWORD REPO AUDIT — GRPO + vLLM BRIDGE, MATH TRAINER, UNSLOTH/8-BIT PATHS
+Date: 2026-10-25
+Scope: read-only audit. NO source code was modified.
+Verified against: sword/grpo_bridge.py, sword/vllm_patch.py, sword/rl/*,
+train_math_grpo.py, local_trainer/*, sword/reward.py, test/*, GRPO_AUDIT.md
+
+STATUS UPDATE (same day, follow-up pass):
+  The 9 canary-verified bugs marked [FIX] below have been FIXED, and the
+  canaries in test/test_bugs_report.py were converted into permanent
+  regression guards (12/12 passing). Fixed files:
+    train_math_grpo.py, sword/rl/loss.py, sword/reward.py,
+    sword/grpo_bridge.py, local_trainer/train_grpo.py,
+    local_trainer/engine_vllm_bypass.py
+  Untouched (cannot be fixed in a quick pass without an unsloth/vllm/GPU run):
+  H3, H5, M3-M8, M9, M11-M16, L1-L15 — see sections 3/4 below, they remain
+  documented for a later pass. Known pre-existing, unrelated failure:
+  test_grpo_audit.py::test_bridge_microbatching_preserves_parameter_updates_
+  and_loss_metrics fails identically on the pre-fix baseline (CPU float
+  tolerance too tight in that test, values differ ~6e-4).
+================================================================================
+
+────────────────────────────────────────────────────────────────────────────────
+1. WHAT THE SYSTEM IS (SUMMARY OF UNDERSTANDING)
+────────────────────────────────────────────────────────────────────────────────
+
+1.1 Two parallel GRPO stacks exist:
+
+  (a) sword/grpo_bridge.py — the "GRPOBridge": a LoRA-training <-> vLLM
+      co-location bridge. It:
+        * loads a trainer (Unsloth FastLanguageModel / PEFT LoRA, or a mock),
+        * builds a co-located vLLM LLM engine (gpu_utilization=0.40) with
+          enable_lora, or falls back to an in-process sequential sampling
+          engine (FallbackRolloutEngine) on any failure,
+        * syncs LoRA weights to vLLM via WeightSynchronizer (temp-dir adapter
+          export -> LoRARequest + pool/queue of adapter versions, pruned),
+        * a VRAMLifecycleManager sleeps/wakes vLLM and offloads the trainer
+          model to CPU between rollout and training phases,
+        * computes GRPO loss (DualCorrectionGRPOLoss) with TIS (truncated
+          importance sampling) weights against vLLM-sampled "old" logprobs,
+          chunked logprob recomputation, micro-batching, safe_optimizer_step
+          (OOM/rollback via sword/rl/policy.py).
+
+  (b) train_math_grpo.py + local_trainer/standalone_math_grpo.py — standalone
+      math GRPO script (Qwen3-30B-A3B MoE, Unsloth LoRA, "FP8 MoE" cast,
+      ChunkedGRPOLoss/GDPO advantages, MathScorer rewards) plus a "vLLM
+      bypass" variant (local_trainer/train_grpo.py + engine_vllm_bypass.py)
+      that uses FastQwen3MoeServer in-process for rollouts with an FP8 KV
+      cache and streams BigMath2 from disk.
+
+1.2 sword/rl/loss.py: ChunkedGRPOLoss — surrogate PPO-clip loss with
+    old_logprobs (defaults to detached current logprobs => ratio ≡ 1),
+    optional ref_logprobs KL, GDPO column advantages (accuracy/formatting/
+    efficiency/safety) normalized per group. sword/rl/policy.py:
+    token_statistics (chunked logprob gathering) + safe_optimizer_step
+    (CPU weight/state snapshot rollback).
+
+1.3 Known gaps already admitted in GRPO_AUDIT.md: ratio ≡ 1 (single update
+    per rollout batch = REINFORCE-with-gate), full-sequence forward before
+    chunking (memory claim partially broken), adapter export/rollback
+    semantics, floating-point reward matching caveats.
+
+────────────────────────────────────────────────────────────────────────────────
+2. BUGS — HIGH SEVERITY
+────────────────────────────────────────────────────────────────────────────────
+
+[H1] [FIXED 2026-10-25] REWARD HACKING — accuracy matched by ANY number in the whole output
+     train_math_grpo.py:516-535 (MathScorer.score)
+         ans_numbers = [float(x) for x in re.findall(r"[-+]?(?:\d*\.\d+|\d+)", answer)]
+         if any(abs(n - ref_num) < 1e-4 for n in ans_numbers): is_match = True
+         ...
+         or (norm_ref and norm_ref in norm_full)          # whole text incl. trace
+         or (reference_answer.strip().lower() in answer.lower())
+     * The number regex runs over `answer` (and over the FULL text in the
+       fallback), so any intermediate value / year / "step 3" that happens to
+       be within 1e-4 of the reference grants the +0.35 accuracy reward even
+       when the final answer is wrong. Since `norm_ref in norm_full` matches
+       against the reasoning trace, a wrong answer whose trace contains the
+       reference number scores full credit. This is the single biggest
+       learnable hacking loophole in the pipeline.
+     FIX DIRECTION (not applied): compare only the LAST \boxed{} / final-answer
+       extraction (like sword/reward.py:extract_final_answer does), never the
+       raw trace or the raw reference substring.
+
+[H2] [FIXED 2026-10-25] local_trainer/train_grpo.py trains on tokens the policy never sampled
+     local_trainer/train_grpo.py:327-333
+         p_ids = tokenizer.encode(prob.user_problem, add_special_tokens=False)
+         r_ids = tokenizer.encode(scored.trajectory.full_text, add_special_tokens=False)
+         combo = p_ids + r_ids
+     * The rollout engine generates a chat-template-formatted prompt (system
+       message, effort tier, etc. via FastQwen3MoeServer), but training
+       re-encodes the RAW user_problem — no system prompt, no chat template.
+       The response is also RE-ENCODED from the decoded text (special tokens,
+       EOS dropped) instead of using the sampled token ids.
+       The policy gradient is therefore applied to a different distribution
+       than the one the rewards were earned on. Combined with [H4] (ratio ≡ 1)
+       there is no importance correction to absorb this mismatch — the
+       surrogate is genuinely off-policy and wrong.
+     NOTE: train_math_grpo.py (the root sibling) does this correctly: it
+       records the engine's exact sampled prompt/response token ids.
+
+[H3] PeftModel load failure silently discarded -> checkpoint-2200 lost
+     local_trainer/train_grpo.py:139-167
+         try:  model = PeftModel.from_pretrained(model, ckpt_dir, is_trainable=True)
+         except Exception as e:
+             print("Attaching fresh LoRA adapter...")
+     * If the adapter load fails (wrong shape, corrupted file, key mismatch —
+       note FP8-cast base weights can break strict loading), the run continues
+       with a FRESH random LoRA (unsloth or apply_lora_to_model) and its later
+       outputs/audit log get uploaded to the HF repo as if they came from
+       checkpoint-2200. Only a print marks the failure. Same tolerated fallback
+       exists in train_math_grpo.py:2502-2531 (strict=False + key-rename
+       guesswork), where most adapter weights can be silently dropped.
+
+[H4] [FIXED 2026-10-25] PPO clip is decorative: old_logprobs never supplied anywhere
+     sword/rl/loss.py:275-277 (`if old_logprobs is None: old_logprobs =
+     policy_logprobs.detach()`), hit from three call sites:
+       * train_math_grpo.py:1236-1248 (kl_coeff=0.04 set, ref_logprobs never
+         passed either => the KL term is always 0),
+       * local_trainer/train_grpo.py:342-348,
+       * local_trainer engine — skeleton placeholder file, `import torch`
+         truncated at col 1, parse_rollout_to_trajectory is INCOMPLETE/
+         INERT (see [M-x] below).
+     * consequence: importance ratio ≡ 1 every step, clip_eps dead code,
+       and kl_coeff is a no-op. For 200 steps at lr 5e-6 with no KL anchor
+       and no drift control, the run can drift unbounded. It also means any
+       future multi-epoch reuse of the loss silently keeps ratio=1.
+       (GRPO_AUDIT.md admits this for the bridge; it actually applies to
+       every trainer in the repo, incl. local_trainer's off-policy variant.)
+
+[H5] grpo_bridge.initialize_vllm can throw away a fully built vLLM engine
+     sword/grpo_bridge.py:748-773
+         try:
+             self.vllm_engine = LLM(**llm_kwargs)
+             ...
+             if has_adapter and self.weight_sync.policy_version == 0:
+                 self.weight_sync.sync_to_vllm(self.trainer_model)   # INSIDE try
+             return True
+         except Exception as e:
+             print("... vLLM initialization deferred ... fallback engine.")
+             self.vllm_engine = None
+     * The initial adapter export is inside the SAME try as LLM(...). If the
+       engine is built (≈40% GPU memory consumed) but sync_to_vllm fails
+       (disk full, PEFT config quirk), the broad except discards the engine
+       object without destroy()/shutdown, leaks the worker procs/GPU memory,
+       and silently downgrades the run to the slow fallback engine that now
+       has to coexist with a dead resident vLLM.
+
+[H6] WITHDRAWN during test-canary verification.
+     The initial audit read appeared to show local_trainer/engine_vllm_bypass.py
+     truncated mid-source (FileCtrl artifact at the "import torch.nn as nn" line).
+     A compile()+import canary test (test/test_bugs_report.py::H6) proves the
+     file is syntactically complete and importable — the earlier reading was
+     an artifact of the read tool wrapping, not the file. No bug. Kept here
+     only to document the false positive and prevent re-flagging.
+
+────────────────────────────────────────────────────────────────────────────────
+3. BUGS — MEDIUM SEVERITY
+────────────────────────────────────────────────────────────────────────────────
+
+[M1] [FIXED 2026-10-25] TIS weight not self-normalized unless an experimental flag is set
+     sword/grpo_bridge.py:438-457
+         log_is_weight = policy_logprobs_ref - vllm_old_logprobs
+         is_weight = torch.exp(log_is_weight.clamp(max=math.log(self.tis_bound_c)))
+         if self.use_score_centering and target_mask.any(): # default OFF
+             is_weight = is_weight / mean_is_weight.clamp(min=1e-8)
+     * With the default (use_score_centering=False), the loss scale silently
+       inflates by E[min(ρ, C)] as π_θ and π_vllm drift during training.
+       With tis_bound_c=2.0 the effective learning rate can double without
+       any config change. Standard truncated-IS estimators normalize by
+       E[min(ρ, C)]; the code tends to that only behind a non-default flag.
+
+[M2] [FIXED 2026-10-25] tis_bound_c < 1.0 is accepted and INVERTS the bound
+     sword/grpo_bridge.py:373-374 + 440
+         if chunk_size < 1 or tis_bound_c <= 0: raise ValueError
+         is_weight = torch.exp(log_is_weight.clamp(max=math.log(self.tis_bound_c)))
+     * tis_bound_c=0.5 (plausible typo) yields clamp(max=ln 0.5), shrinking
+       every IS weight to ≤0.5 uniformly — silently halving the gradient.
+       Should require tis_bound_c >= 1.0 (or at least warn).
+
+[M3] Fallback path truncates the prompt used for reward vs prompt used for loss
+     sword/grpo_bridge.py:505-515 (+ GRPOBridgeConfig.__post_init__ only
+     checks max_model_len > max_new_tokens, not prompt fit)
+     * Fallback engine tokenizes with truncation=True,
+       max_length = max_model_len - max_new_tokens; RolloutItem.prompt_token_ids
+       then holds the TRUNCATED prompt while RolloutItem.prompt_text holds the
+       FULL one. The reward_fn (score_rollouts, ~line 901) sees the full text,
+       the training sequence sees the truncated ids, and there is no
+       mechanism to detect or correct the mismatch. Same shape of issue on
+       the vLLM path when the prompt overflows (vLLM silently truncates).
+
+[M4] Any vLLM error -> silent permanent fallback, incl. logic errors
+     sword/grpo_bridge.py:841-844
+         except Exception as e:
+             use_fallback = True; batch.items.clear()
+     * One broad except catches both transient OOM (intended) and permanent
+       logic errors (e.g. the deterministic "vLLM omitted the sampled token
+       logprob" ValueError raised at ~825). There is no counter, backoff or
+       escalation: a misconfigured bridge can run an entire training run at
+       fallback (no-KV-cache, O(n²)) speed with one print per attempt.
+
+[M5] generate_single mutates the SHARED config -> race condition
+     sword/grpo_bridge.py:877-885
+         self.config.concurrency_g = 1 ... finally: self.config.concurrency_g = saved
+     * A non-thread-safe config attribute is temporarily mutated. Docs say
+       generate_single backs a multi-turn harness, i.e. it WILL be called
+       concurrently with other generate_rollouts/step() calls, which then
+       inherit group size 1, changing downstream advantage normalization.
+       Should pass the override as an argument instead of mutating config.
+
+[M6] vllm_patch.patch_head_dim_source patches only the FIRST occurrence
+     sword/vllm_patch.py:61-71
+         source = source.replace(target, "homogeneous_head_dim(...)", 1)
+     * Any further occurrence of that expression in the same source keeps
+       crashing with the transformers heterogeneous attribute error at
+       runtime; compile() only checks syntax so the check can't catch it.
+       Should replace all occurrences (or validate count).
+
+[M7] FP8 MoE cast has no scales and can't represent real quantization
+     train_math_grpo.py:166-171 (convert_to_fp8): weights cast straight to
+     torch.float8_e4m3fn, requires_grad force-disabled, no per-tensor scale.
+     * Every rollout AND every training logprob pass through this lossy cast.
+       It is not a valid quantization scheme (no scaling factors), so the
+       "reference/old policy" is itself arbitrary — on top of [H4] there is
+       no way to reproduce it. Memory claim ("saves 27 GB") is real, but the
+       numerics are not a controlled approximation.
+
+[M8] Gradient "checkpointing" only covers the LM-head chunk
+     sword/rl/policy.py (token_statistics / project_chunk path): the full
+     decoder/transformer forward for the WHOLE sequence runs outside the
+     chunked part; only per-512-chunk projection is checkpointed.
+     * Prompt activations (up to 32k) are retained for backward even though
+       the target mask zeroes every prompt-token gradient. The "no vocab-
+       sized tensor, fully chunked" claim is only partially met; recomputing
+       losses from features[:, prompt_len-1:] would reclaim most of it.
+       (Also noted in GRPO_AUDIT.md's "memory limits" section, further detail
+       added here.)
+
+[M9] local_trainer data loader: NO SHUFFLING + partial-file acceptance
+     local_trainer/data_loader.py
+       * stream_math_batches_from_disk yields in dataset order, loop=True
+         replays the identical order every epoch — no shuffle => correlated
+         gradient steps, same problems re-ordered identically.
+       * download_and_prepare_bigmath2 validates a JSONL file by "first line
+         is non-empty"; a file truncated by an interrupted streaming download
+         passes validation, and the partial local_file is never cleaned up
+         on write errors.
+
+[M10] [FIXED 2026-10-25] local_trainer batch_size > 1 silently drops prompts
+     local_trainer/train_grpo.py:292-293
+         batch = next(batch_iterator); prob = batch[0]
+     * With batch_size>1 in config, all rows except the first are consumed
+       by the iterator and discarded. Only batch_size=1 is safe; nothing
+       enforces it.
+
+[M11] No checkpoint resume / no optimizer state
+     train_math_grpo.py: 材料 - `for step in range(1, steps+1)` with no
+     resume; checkpoint-N dirs are written from `model.save_pretrained`
+     (adapter + tokenizer) but AdamW optimizer state is never saved and
+     never restored. After crash/resume, training restarts at step 1 with
+     fresh optimizer state over the same deterministic dataset order.
+     (Same in local_trainer/train_grpo.py — save at save_steps, no load.)
+
+[M12] GrpoBridge-uploaded metric weighting bug (diagnostics)
+     sword/grpo_bridge.py:1003-1005: `mean_advantage` (item-level mean) is
+     aggregated with TOKEN-count weights across micro-batches, so long-
+     response groups dominate the reported mean — misleading for tuning.
+     (Token-weighted mean_entropy / mean_ratio is correct; mean_advantage
+     is not.)
+
+[M13] WeightSynchronizer.prune_old_adapters can delete an adapter vLLM may
+      still reference (grpo_bridge.py:321-333 + ~1036). vLLM keeps adapters
+      registered by int_id until eviction; the prune threshold deletes the
+      directory on disk at the exact boundary — latent failure in async /
+      multi-request modes.
+
+[M14] Unsloth double-management of gradient checkpointing
+      train_math_grpo.py:2577-2601 calls FastLanguageModel.for_training(...)
+      and then a vanilla model.gradient_checkpointing_enable(use_reentrant=
+      False); local_trainer/train_grpo.py:150-175 attaches unsloth's
+      get_peft_model(use_gradient_checkpointing="unsloth") AND then calls
+      model.gradient_checkpointing_enable() again. Unsloth's cached flag
+      settings can conflict with the HF re-enabling; the generic HF path is
+      the known slow knob combination. Also enable_input_require_grads is
+      required for PEFT+checkpointing callers — only some paths call it.
+
+[M15] train_math_grpo sampling temperature mismatch: rollouts are sampled at
+      temperature 0.8 (line ~2716) but token_statistics computes training
+      logprobs at temperature 1.0 (sword/rl/policy.py default). The recorded
+      logprobs are not the sampling policy's logprobs; with ratio ≡ 1 and
+      no KL this is not corrected anywhere.
+
+[M16] [FIXED 2026-10-25 (single-value path)] sword/reward.py numeric verification is brittle & order-sensitive
+      reward.py:88-97: requires len(cand_nums) == len(exp_nums) AND ordered
+      elementwise 1e-4 closeness; ONE extra number (units, step index,
+      exponent digits of "1e5") makes the counts differ => automatic FALSE
+      for a mathematically correct answer. The sorted-set fallback rescues
+      ordering only, not count mismatch. Note this scorer is NOT the one
+      actually used by the math trainer (MathScorer in train_math_grpo.py
+      is), so the two verification paths in the repo disagree with each
+      other (each false-positives or false-negatives in different ways).
+
+────────────────────────────────────────────────────────────────────────────────
+4. BUGS — LOW SEVERITY / COSMETIC
+────────────────────────────────────────────────────────────────────────────────
+
+[L1] Dead/error-swallowing init excepts: grpo_bridge.py:625-626 & 677-696 —
+     `except Exception: self.trainer_model = None` (a failed unsloth load
+     silently degrades to the plain path with no message); also
+     `for_training` / gradient_checkpointing_enable blocks swallow errors.
+
+[L2] grpo_bridge.py:752-754 — llm_kwargs.pop("speculative_model", ...) etc.
+     pop keys never set by this code path (dead code from an older API).
+     Also `temperature_scale` config knob + DualCorrectionGRPOLoss.temperature
+     are unreachable/dead (post_init forbids the conditions using them).
+
+[L3] RolloutItem.is_truncated is collected but never used — truncated
+     rollouts get trained on with zero reward adjustment, which typically
+     gives them unfair negative advantages.
+
+[L4] grpo_bridge.py:323 — `max_kept or self.max_kept_adapters` treats an
+     explicit max_kept=0 as falsy. Also WeightSynchronizer creates a mkdtemp
+     dir eagerly in __init__ but cleanup() is never called by the bridge
+     itself — temp-dir leak on failed runs.
+
+[L5] grpo_bridge.py:426-428 — per-row CPU tensor construction + H2D copy
+     inside the loss hot loop (`torch.tensor(r_lps[:valid_resp_len])`) —
+     perf bug (implicit sync per sequence), not a correctness bug.
+
+[L6] sword/rotary_fallback.py:60-66 — `getattr(config, "head_dim", 0)` inside
+     a try/except AttributeError; the default makes AttributeError impossible,
+     so heterogeneous configs silently fall through to head_dim=0 (then feed
+     a wrong-but-valid head dim into model construction) instead of failing
+     loudly. The ValueError/RuntimeError catches work as intended.
+
+[L7] sword/vllm_patch.py:17-27 — write_python_patch overwrites installed
+     vllm files in site-packages via os.replace after only a compile() syntax
+     check; a runtime-valid-but-broken patch permanently corrupts the
+     install with no backup/rollback/hash check. bootstrap_environment also
+     keys `uv sync` off Path.cwd(), so results depend on the caller's cwd.
+
+[L8] train_math_grpo.py:728 vs ~2686-2692 — effort budget table "medium":
+     4024 (typo for 4096) diverges from the generation cap table (2048), so
+     the medium-tier over-budget penalty branch is unreachable. Also
+     token_count is computed by re-encoding the DECODED text
+     (add_special_tokens=False, ~line 2721), undercounting EOS/special
+     tokens versus the budget topic.
+
+[L9] train_math_grpo.py:267-270 & 2468-2471 — convert_tokens_to_ids fallback
+     may return unk_token_id or 0 for unmapped stop strings, admitted through
+     a `sid > 0` filter and truncating rollouts; pad_token is set to eos
+     which is fine only because all training paths assume batch size 1.
+
+[L10] train_math_grpo.py:2637-2647 — empty study_records falls through to
+     `(step-1) % len(study_records)` -> ZeroDivision/IndexError; the audit
+     doc claims "both math entry-point files remain identical" which is
+     FALSE (the local_trainer copy has diverged, see [H2]/[H4]).
+
+[L11] train_math_grpo.py:2804-2812 — `p_ids = tokenizer.encode(formatted_...)`
+      and its p_len are computed then UNCONDITIONALLY overwritten by the
+      engine-sampled ids inside each loop iteration; dead but hazardous if
+      the raise at ~2810 is ever relaxed to a fallback.
+
+[L12] train_math_grpo.py:2826-2827 — mean-of-means gradient weighting: each
+      per-rollout loss is a per-token mean then divided by num_rollouts, so
+      long (higher-effort, more-tokens) rollouts contribute less per token
+      than short ones. Not wrong per se, but inconsistent with the bridge's
+      global-valid-token normalization in the same repo.
+
+[L13] GRPO result: when all G rollouts have identical rewards (e.g. all
+      correct), std<eps => advantages all 0 => the whole rollout group is
+      wasted with zero gradient. Expected GRPO behavior, but there is no
+      variance floor / metric so at 200 steps a run can silently waste
+      many groups. (Also true for the bridge's group filtering.)
+
+[L14] sword/reward.py:117-118 — mismatched thinking-tag literals
+      ('<|channel>thought' vs '<channel|>') make the balanced-tag check
+      fail to recognize valid mirrored output. reward.py:162 hardcodes
+      math truth=0.5 vs the model-B truth scale — inconsistent ranges
+      feeding the same /4 denominator.
+
+[L15] grpo_bridge.py VRAMLifecycleManager.enter_score_phase is effectively
+      dead (only called via enter_train_phase); vLLM stays awake during
+      reward scoring, contradicting the docstring.
+
+────────────────────────────────────────────────────────────────────────────────
+5. TEST-COVERAGE GAPS FOUND (no tests written yet, listed for completeness)
+────────────────────────────────────────────────────────────────────────────────
+Existing: test/test_grpo_bridge.py + test/test_grpo_audit.py cover sleep/wake
+orchestration, adapter pruning semantics, group validation, TIS direction and
+only the loose upper-bound (0 < mean ≤ 2.0, not exact alignment), mocked-LLM
+LoRA dispatch + initial sync, one CPU end-to-end step(), fallback nucleus
+sampling, entropy-floor gradient, missing-rollout-logprob rejection, chunked
+decoder vs full logits, offload-before-wake ordering, rotary fallback,
+patch idempotency + syntax-guard no-overwrite, micro-batching preservation,
+failed-export rollback, OOM restore, EOS-retention metadata.
+NOT covered anywhere:
+  - exact resp_start = p_len-1 logprob alignment vs a real vLLM-shaped
+    logprobs payload (a plausible off-by-one would pass the current band).
+  - optimizer-offload residency (H2 / bridge optimizer state on GPU).
+  - tis_bound_c < 1.0 inversion (M2).
+  - fallback prompt-truncation vs prompt_text mismatch (M3).
+  - only-first-occurrence head-dim patch (M6).
+  - reward-hacking properties of MathScorer in train_math_grpo.py (a test
+    asserting that a wrong-answer trace containing the reference gets
+    NEGATIVE accuracy would fail today, exposing [H1]).
+  - anything about the local_trainer diverged path [H2],[M9],[M10].
+  - FP8-cast numerics/scale invariants (M7).
+
+────────────────────────────────────────────────────────────────────────────────
+6. SUGGESTED FIX PRIORITY (NOT APPLIED — read-only audit)
+────────────────────────────────────────────────────────────────────────────────
+ 1. H1  — stop rewarding numbers found in the trace/raw text; compare the
+          last \boxed{}/final answer only.
+ 2. H2/H4 — make local_trainer reuse the engine's exact sampled token ids
+          and the shared ChunkedGRPOLoss/token_statistics path (or remove
+          the diverged copy), and wire ref logprobs if KL is intended.
+ 3. H3  — fail loudly (raise) instead of falling back to a fresh LoRA,
+          when a named checkpoint was requested.
+ 4. H5/H6 — move the adapter export out of the LLM-construction try, and
+          finish/repair local_trainer/engine_vllm_bypass.py.
+ 5. M1/M2/M4/M5 — TIS normalization + bound validation + error routing +
+          config immutability in grpo_bridge.
+ 6. M7/M8/M14 — FP8 scale handling, decoder-side chunking, unsloth
+          checkpointing single-management.
+ 7. M11 — implement checkpoint resume incl. optimizer state.
+--------------------------------------------------------------------------------
+End of report.  (Read-only audit; no source files were modified.)

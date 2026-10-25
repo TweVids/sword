@@ -121,7 +121,7 @@ class TestNewTrainerArchitecture(unittest.TestCase):
             sandbox.close()
 
     def test_b_model_parser_and_lifecycle(self):
-        config = ModelBJudgeConfig(num_predict=1024, auto_unload=True)
+        config = ModelBJudgeConfig(num_predict=1024, auto_unload=True, auto_setup=False)
         self.assertEqual(config.num_predict, 1024)
         self.assertTrue(config.auto_unload)
         judge = ModelBJudge(config=config)
@@ -269,7 +269,7 @@ class TestNewTrainerArchitecture(unittest.TestCase):
         self.assertFalse(MathVerifier.verify_answer("41", "42"))
 
     def test_multi_metric_reward_scoring(self):
-        scorer = MultiMetricRewardScorer()
+        scorer = MultiMetricRewardScorer(ModelBJudge(ModelBJudgeConfig(auto_setup=False)))
 
         # Non-agentic verifiable math task
         breakdown = scorer.score(
@@ -626,12 +626,26 @@ class TestNewTrainerArchitecture(unittest.TestCase):
 
     def test_prep_and_logs_execution(self):
         import sword
-        res = sword.train(
-            prep_and_logs=True,
-            B_model_port=11343,
-            test=True,
-            mock_test=True,
-        )
+        with patch("sword.b_model.start_ollama_server") as start, \
+             patch("sword.b_model.pull_ollama_model") as pull, \
+             patch("sword.long_trainer.run_long_train", wraps=sword.run_long_train) as run:
+            res = sword.train(
+                prep_and_logs=True,
+                model="Qwen/Qwen3.5-0.8B",
+                B_model_port=11343,
+                B_model_name="qwen3.5:9b",
+                B_model_num_ctx=1024,
+                B_model_keep_alive="2m",
+                auto_unload_B_model=True,
+                test=True,
+                mock_test=True,
+            )
+            start.assert_not_called()
+            pull.assert_not_called()
+            self.assertEqual(run.call_args.kwargs["model"], "Qwen/Qwen3.5-0.8B")
+            self.assertEqual(run.call_args.kwargs["B_model_name"], "qwen3.5:9b")
+            self.assertEqual(run.call_args.kwargs["B_model_keep_alive"], "2m")
+            self.assertTrue(run.call_args.kwargs["auto_unload_B_model"])
         self.assertTrue(res.get("ok"))
         self.assertIn("patch_result", res)
         self.assertIn("harness_status", res)

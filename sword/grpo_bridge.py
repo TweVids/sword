@@ -33,6 +33,8 @@ except Exception:
     HAS_UNSLOTH = False
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from .rl.policy import token_statistics, safe_optimizer_step
+from .defaults import DEFAULT_GRPO_MODEL
 
 
 @dataclass
@@ -41,7 +43,7 @@ class GRPOBridgeConfig:
     Configuration for the Unsloth-vLLM GRPO Bridge.
     All parameters are tuned to prevent OOM, numerical divergence, and reward collapse.
     """
-    model_name: str = "Qwen/Qwen3.5-0.8B"
+    model_name: str = DEFAULT_GRPO_MODEL
     concurrency_g: int = 4
     max_model_len: int = 2048
     max_new_tokens: int = 512
@@ -78,6 +80,27 @@ class GRPOBridgeConfig:
     learning_rate: float = 5e-6
     weight_decay: float = 0.01
     device: Optional[str] = None
+    adapter_sync_dir: Optional[str] = None
+    load_in_4bit: bool = False
+    load_in_8bit: bool = False
+    hf_token: Optional[str] = field(default=None, repr=False)
+    model_cache_dir: Optional[str] = None
+    model_revision: Optional[str] = None
+    local_files_only: bool = False
+    require_vllm: bool = False
+
+    def __post_init__(self):
+        if self.load_in_4bit and self.load_in_8bit:
+            raise ValueError("Choose either load_in_4bit or load_in_8bit.")
+        if self.concurrency_g < 1 or self.micro_batch_size < 1 or self.chunk_size < 1:
+            raise ValueError("rollout count, microbatch size, and chunk size must be positive")
+        if self.max_new_tokens < 1 or self.max_model_len <= self.max_new_tokens:
+            raise ValueError("max_model_len must leave room for prompt and response tokens")
+        if not math.isfinite(self.temperature) or self.temperature <= 0 or not 0 < self.top_p <= 1:
+            raise ValueError("temperature must be positive and top_p must be in (0, 1]")
+        # Both backends report raw model probabilities, independent of sampling warpers.
+        if self.logprobs_mode != "raw_logprobs" or self.temperature_scale:
+            raise ValueError("bridge importance correction requires raw_logprobs and temperature_scale=False")
 
 
 @dataclass
@@ -136,6 +159,7 @@ class VRAMLifecycleManager:
         self.device = device
         self.enable_sleep = enable_sleep
         self.offload_trainer = offload_trainer
+        self._sleeping_engine = None
 
     def enter_rollout_phase(
         self,
@@ -143,22 +167,26 @@ class VRAMLifecycleManager:
         vllm_engine: Optional[Any] = None,
     ):
         """Prepares environment for vLLM rollout generation."""
-        # 1. Wake up vLLM engine if sleeping
-        if vllm_engine is not None and self.enable_sleep and hasattr(vllm_engine, "wake_up"):
-            try:
-                vllm_engine.wake_up()
-            except Exception:
-                pass
-
-        # 2. Put trainer model in dormant eval mode (and optionally offload to CPU)
+        # Release trainer allocations before acquiring rollout memory.
         if trainer_model is not None:
             trainer_model.eval()
             if self.offload_trainer and hasattr(trainer_model, "to"):
-                try:
-                    trainer_model.to("cpu")
-                except Exception:
-                    pass
+                trainer_model.to("cpu")
 
+        gc.collect()
+        if torch.cuda.is_available() and "cuda" in self.device:
+            torch.cuda.empty_cache()
+
+        if vllm_engine is not None and self.enable_sleep and hasattr(vllm_engine, "wake_up"):
+            vllm_engine.wake_up()
+            self._sleeping_engine = None
+
+    def enter_score_phase(self, vllm_engine: Optional[Any] = None):
+        """Release rollout allocations before starting the external judge."""
+        if vllm_engine is not None and self.enable_sleep and hasattr(vllm_engine, "sleep"):
+            if self._sleeping_engine is not vllm_engine:
+                vllm_engine.sleep()
+                self._sleeping_engine = vllm_engine
         gc.collect()
         if torch.cuda.is_available() and "cuda" in self.device:
             torch.cuda.empty_cache()
@@ -170,19 +198,12 @@ class VRAMLifecycleManager:
     ):
         """Puts vLLM to sleep and prepares trainer for forward and backward passes."""
         # 1. Sleep vLLM engine to free KV cache blocks and execution memory
-        if vllm_engine is not None and self.enable_sleep and hasattr(vllm_engine, "sleep"):
-            try:
-                vllm_engine.sleep()
-            except Exception:
-                pass
+        self.enter_score_phase(vllm_engine)
 
         # 2. Return trainer model to training device
         if trainer_model is not None:
             if self.offload_trainer and hasattr(trainer_model, "to"):
-                try:
-                    trainer_model.to(self.device)
-                except Exception:
-                    pass
+                trainer_model.to(self.device)
             trainer_model.train()
 
         gc.collect()
@@ -193,7 +214,10 @@ class VRAMLifecycleManager:
         """Returns allocated, reserved, and available GPU memory in gigabytes."""
         if not torch.cuda.is_available() or "cuda" not in self.device:
             return {"allocated_gb": 0.0, "reserved_gb": 0.0, "total_gb": 0.0}
-        dev_idx = torch.cuda.current_device()
+        dev_idx = torch.device(self.device).index
+        if dev_idx is None:
+            dev_idx = torch.cuda.current_device()
+        free_bytes, _ = torch.cuda.mem_get_info(dev_idx)
         total_gb = torch.cuda.get_device_properties(dev_idx).total_memory / (1024 ** 3)
         alloc_gb = torch.cuda.memory_allocated(dev_idx) / (1024 ** 3)
         res_gb = torch.cuda.memory_reserved(dev_idx) / (1024 ** 3)
@@ -201,7 +225,7 @@ class VRAMLifecycleManager:
             "allocated_gb": round(alloc_gb, 3),
             "reserved_gb": round(res_gb, 3),
             "total_gb": round(total_gb, 3),
-            "free_gb": round(total_gb - res_gb, 3),
+            "free_gb": round(free_bytes / (1024 ** 3), 3),
         }
 
 
@@ -218,6 +242,7 @@ class WeightSynchronizer:
         lora_alpha: int = 32,
         target_modules: Optional[List[str]] = None,
         max_kept_adapters: int = 2,
+        adapter_sync_dir: Optional[str] = None,
     ):
         self.base_model_name = base_model_name
         self.lora_r = lora_r
@@ -225,15 +250,22 @@ class WeightSynchronizer:
         self.target_modules = target_modules or ["q_proj", "k_proj", "v_proj", "o_proj"]
         self.max_kept_adapters = max(1, max_kept_adapters)
         self.policy_version = 0
-        self.temp_dir = tempfile.mkdtemp(prefix="sword_lora_sync_")
+        if adapter_sync_dir is not None:
+            os.makedirs(adapter_sync_dir, exist_ok=True)
+        self.temp_dir = tempfile.mkdtemp(prefix="sword_lora_sync_", dir=adapter_sync_dir)
         self.current_adapter_path: Optional[str] = None
 
     def extract_lora_state_dict(self, model: nn.Module) -> Dict[str, torch.Tensor]:
         """Extracts trainable LoRA parameters while preserving standard PEFT key hierarchy."""
         lora_sd: Dict[str, torch.Tensor] = {}
         for name, param in model.named_parameters():
-            if "lora_" in name and param.requires_grad:
-                lora_sd[name] = param.detach().cpu()
+            if "lora_" in name:
+                name = name.replace(".lora_A.default.", ".lora_A.").replace(".lora_B.default.", ".lora_B.")
+                if name.endswith((".lora_A", ".lora_B")):
+                    name += ".weight"
+                if not name.startswith("base_model.model."):
+                    name = "base_model.model." + name
+                lora_sd[name] = param.detach().cpu().contiguous().clone()
         return lora_sd
 
     def sync_to_vllm(self, trainer_model: nn.Module, vllm_engine: Optional[Any] = None) -> int:
@@ -241,8 +273,8 @@ class WeightSynchronizer:
         Exports LoRA state dict and adapter_config.json in standard PEFT format.
         Updates active policy version stamp for dynamic LoRARequest dispatch.
         """
-        self.policy_version += 1
-        adapter_path = os.path.join(self.temp_dir, f"adapter_v{self.policy_version}")
+        next_version = self.policy_version + 1
+        adapter_path = os.path.join(self.temp_dir, f"adapter_v{next_version}")
         os.makedirs(adapter_path, exist_ok=True)
 
         if hasattr(trainer_model, "save_pretrained") and hasattr(trainer_model, "peft_config"):
@@ -257,11 +289,19 @@ class WeightSynchronizer:
                         with open(cfg_file, "w", encoding="utf-8") as f:
                             json.dump(cfg_data, f, indent=2)
                 self.current_adapter_path = adapter_path
+                self.policy_version = next_version
                 return self.policy_version
             except Exception:
-                pass
+                # A PEFT export failure must not fall through to an incomplete manual adapter.
+                raise
 
         lora_sd = self.extract_lora_state_dict(trainer_model)
+        if not lora_sd:
+            if vllm_engine is not None:
+                raise ValueError("Cannot synchronize full-weight training as a LoRA adapter")
+            # In-process fallback already shares the trainer's full parameters.
+            self.policy_version = next_version
+            return self.policy_version
 
         # Write standard PEFT adapter_config.json
         peft_config = {
@@ -281,10 +321,11 @@ class WeightSynchronizer:
         try:
             from safetensors.torch import save_file
             save_file(lora_sd, os.path.join(adapter_path, "adapter_model.safetensors"))
-        except Exception:
+        except ImportError:
             torch.save(lora_sd, os.path.join(adapter_path, "adapter_model.bin"))
 
         self.current_adapter_path = adapter_path
+        self.policy_version = next_version
         return self.policy_version
 
     def prune_old_adapters(self, max_kept: Optional[int] = None):
@@ -317,14 +358,14 @@ class WeightSynchronizer:
                 lora_int_id=self.policy_version,
                 lora_path=self.current_adapter_path,
             )
-        except Exception:
-            return None
+        except Exception as exc:
+            raise RuntimeError("Cannot construct LoRA request for synchronized trainer policy") from exc
 
 
 class DualCorrectionGRPOLoss(nn.Module):
     """
     Sequence-chunked GRPO loss with detached Truncated Importance Sampling (TIS),
-    upper-bound truncation, no-grad entropy monitoring, and exact global token reduction.
+    upper-bound truncation, differentiable entropy floors, and global token reduction.
     """
     def __init__(
         self,
@@ -339,6 +380,11 @@ class DualCorrectionGRPOLoss(nn.Module):
         chunk_size: int = 512,
     ):
         super().__init__()
+        if chunk_size < 1 or tis_bound_c < 1.0 or not math.isfinite(tis_bound_c):
+            raise ValueError(
+                "chunk_size must be positive and tis_bound_c must be finite and >= 1.0 "
+                "(bound < 1.0 would clamp every importance weight below 1 and silently shrink the gradient)"
+            )
         self.clip_eps = clip_eps
         self.tis_bound_c = tis_bound_c
         self.temperature = max(temperature, 1e-5)
@@ -367,61 +413,28 @@ class DualCorrectionGRPOLoss(nn.Module):
         for i, p_len in enumerate(prompt_lengths):
             response_mask[i, p_len:] = attention_mask[i, p_len:].bool()
 
-        # Training forward pass in bfloat16
-        outputs = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            use_cache=False,
-            return_dict=True,
-        )
-        logits = outputs.logits
-
-        targets = input_ids[:, 1:]
         target_mask = response_mask[:, 1:]
-        shift_logits = logits[:, :-1, :]
-
-        num_tokens = shift_logits.size(1)
-        policy_logprobs_list = []
-        token_entropy_list = []
-
-        # Sequence chunking: computes cross-entropy in 512-token chunks
-        for start_idx in range(0, num_tokens, self.chunk_size):
-            end_idx = min(start_idx + self.chunk_size, num_tokens)
-            curr_chunk = shift_logits[:, start_idx:end_idx, :].reshape(-1, shift_logits.size(-1))
-            if self.temperature_scale:
-                chunk_logits = (curr_chunk / self.temperature).float()
-            else:
-                chunk_logits = curr_chunk.float()
-
-            chunk_targets = targets[:, start_idx:end_idx].reshape(-1)
-
-            token_logprobs = -F.cross_entropy(
-                chunk_logits,
-                chunk_targets,
-                reduction="none",
-            ).reshape(batch_size, end_idx - start_idx)
-            policy_logprobs_list.append(token_logprobs)
-
-            # Entropy calculation under no_grad to avoid retaining autograd graph
-            with torch.no_grad():
-                probs = F.softmax(chunk_logits, dim=-1)
-                chunk_entropy = -(probs * torch.log(probs.clamp(min=1e-9))).sum(dim=-1)
-                token_entropy_list.append(chunk_entropy.reshape(batch_size, end_idx - start_idx))
-
-        policy_logprobs = torch.cat(policy_logprobs_list, dim=1)
-        policy_entropy = torch.cat(token_entropy_list, dim=1)
+        policy_logprobs, policy_entropy = token_statistics(
+            model, input_ids, attention_mask, self.chunk_size,
+            temperature=self.temperature if self.temperature_scale else 1.0,
+            with_entropy=True,
+        )
 
         # Baseline detached logprobs under current training policy
         policy_logprobs_ref = policy_logprobs.detach()
 
         # Build baseline old logprobs tensor from vLLM rollout
         if rollout_logprobs is not None:
-            flat_rollout_lp = torch.zeros_like(policy_logprobs)
+            if len(rollout_logprobs) != batch_size:
+                raise ValueError("rollout logprobs must contain one list per sequence")
+            flat_rollout_lp = policy_logprobs_ref.clone()
             for i in range(batch_size):
                 p_len = prompt_lengths[i]
                 resp_start = max(0, p_len - 1)
-                r_lps = rollout_logprobs[i] if i < len(rollout_logprobs) else []
-                valid_resp_len = min(len(r_lps), policy_logprobs.size(1) - resp_start)
+                r_lps = rollout_logprobs[i]
+                valid_resp_len = int(target_mask[i].sum().item())
+                if len(r_lps) != valid_resp_len or not all(math.isfinite(lp) for lp in r_lps):
+                    raise ValueError("rollout logprobs must be finite and match every response token")
                 if valid_resp_len > 0:
                     flat_rollout_lp[i, resp_start : resp_start + valid_resp_len] = torch.tensor(
                         r_lps[:valid_resp_len], dtype=torch.float32, device=device
@@ -434,21 +447,25 @@ class DualCorrectionGRPOLoss(nn.Module):
         log_ratio_on_policy = policy_logprobs - policy_logprobs_ref
         ratio_on_policy = torch.exp(log_ratio_on_policy)
 
-        # Detached Truncated Importance Sampling (TIS): standard upper-bound truncation only
+        # Detached Truncated Importance Sampling (TIS): standard upper-bound truncation,
+        # BUG M1 fix: self-normalization by E[min(rho, C)] is now applied
+        # unconditionally so the loss scale is invariant to the rollout/policy
+        # mismatch. Previously the normalization lived behind the
+        # use_score_centering flag (default OFF), letting the effective
+        # learning rate silently ride E[min(rho, C)] as the policies drifted.
         with torch.no_grad():
             log_is_weight = policy_logprobs_ref - vllm_old_logprobs
-            raw_is_weight = torch.exp(log_is_weight)
-            is_weight = torch.clamp(raw_is_weight, max=self.tis_bound_c)
-            if self.use_score_centering and target_mask.any():
+            is_weight = torch.exp(log_is_weight.clamp(max=math.log(self.tis_bound_c)))
+            if target_mask.any():
                 valid_mask_float = target_mask.float()
                 mean_is_weight = (is_weight * valid_mask_float).sum() / valid_mask_float.sum().clamp(min=1.0)
-                is_weight = is_weight - (mean_is_weight - 1.0)
+                is_weight = is_weight / mean_is_weight.clamp(min=1e-8)
 
         # Calibrated clipping: adapt clip_eps based on rolling variance if enabled
         effective_clip_eps = self.clip_eps
         if self.use_calibrated_clipping and target_mask.any():
             with torch.no_grad():
-                log_ratio_std = log_ratio_on_policy.masked_select(target_mask).std().item()
+                log_ratio_std = log_ratio_on_policy.masked_select(target_mask).std(unbiased=False).item()
                 if not math.isnan(log_ratio_std):
                     effective_clip_eps = min(self.clip_eps, max(0.05, self.clip_eps / (1.0 + log_ratio_std)))
 
@@ -464,8 +481,9 @@ class DualCorrectionGRPOLoss(nn.Module):
 
         # Policy entropy regularization
         mean_entropy = (policy_entropy * target_mask.float()).sum() / valid_tokens
-        entropy_penalty = torch.clamp(self.entropy_floor - mean_entropy, min=0.0)
-        total_loss = policy_loss + (self.entropy_coeff * entropy_penalty)
+        entropy_penalty = torch.clamp(self.entropy_floor - policy_entropy, min=0.0)
+        entropy_loss = (entropy_penalty * target_mask.float()).sum() / max(1.0, norm_factor)
+        total_loss = policy_loss + self.entropy_coeff * entropy_loss
 
         metrics = {
             "grpo_loss": round(total_loss.item(), 5),
@@ -495,11 +513,17 @@ class FallbackRolloutEngine:
         max_new_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
+        max_model_len: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         device = next(self.model.parameters()).device
         results = []
+        eos_ids = getattr(self.tokenizer, "eos_token_id", None)
+        eos_ids = set(eos_ids if isinstance(eos_ids, (list, tuple)) else [eos_ids])
         for prompt in prompts:
-            raw_inputs = self.tokenizer(prompt, return_tensors="pt")
+            tokenization_args = {"return_tensors": "pt"}
+            if max_model_len is not None:
+                tokenization_args.update(truncation=True, max_length=max_model_len - max_new_tokens)
+            raw_inputs = self.tokenizer(prompt, **tokenization_args)
             if hasattr(raw_inputs, "to"):
                 inputs = raw_inputs.to(device)
             elif isinstance(raw_inputs, dict):
@@ -527,13 +551,16 @@ class FallbackRolloutEngine:
                     probs = sorted_probs / sorted_probs.sum(dim=-1, keepdim=True)
 
                 next_token = torch.multinomial(probs, num_samples=1)
+                if top_p < 1.0:
+                    next_token = sorted_indices.gather(-1, next_token)
                 token_val = next_token.item()
-                token_lp = torch.log(probs[0, token_val].clamp(min=1e-12)).item()
+                # Match vLLM raw_logprobs, before temperature and top-p processing.
+                token_lp = F.log_softmax(next_logits, dim=-1)[0, token_val].item()
 
                 gen_tokens.append(token_val)
                 gen_logprobs.append(token_lp)
 
-                if token_val == getattr(self.tokenizer, "eos_token_id", None):
+                if token_val in eos_ids:
                     break
                 curr_input = torch.cat([curr_input, next_token], dim=1)
 
@@ -543,7 +570,7 @@ class FallbackRolloutEngine:
                 "response_token_ids": gen_tokens,
                 "response_text": resp_text,
                 "rollout_logprobs": gen_logprobs,
-                "is_truncated": len(gen_tokens) >= max_new_tokens,
+                "is_truncated": len(gen_tokens) >= max_new_tokens and gen_tokens[-1] not in eos_ids,
             })
         return results
 
@@ -568,6 +595,7 @@ class GRPOBridge:
             lora_alpha=self.config.lora_alpha,
             target_modules=self.config.target_modules,
             max_kept_adapters=self.config.max_kept_adapters,
+            adapter_sync_dir=self.config.adapter_sync_dir,
         )
         self.loss_fn = DualCorrectionGRPOLoss(
             clip_eps=self.config.clip_eps,
@@ -585,6 +613,8 @@ class GRPOBridge:
         self.vllm_engine: Optional[Any] = None
         self.fallback_engine: Optional[FallbackRolloutEngine] = None
         self.global_step: int = 0
+        self.mock_test = False
+        self.vllm_initialization_error = None
 
     def initialize_trainer(
         self,
@@ -594,16 +624,25 @@ class GRPOBridge:
         **kwargs,
     ):
         """Initializes the Unsloth or PEFT trainer model with LoRA adapters and checkpointing."""
+        self.mock_test = bool(mock_test or kwargs.get("mock_test", False))
+        load_options = {
+            "token": self.config.hf_token, "cache_dir": self.config.model_cache_dir,
+            "revision": self.config.model_revision, "local_files_only": self.config.local_files_only,
+        }
         if model is not None and tokenizer is not None:
             self.trainer_model = model
             self.tokenizer = tokenizer
         else:
-            if HAS_UNSLOTH and "cuda" in self.device:
+            is_mock = self.mock_test or self.config.model_name in ("dummy", "test_model", "mock")
+            self.mock_test = is_mock
+            if HAS_UNSLOTH and "cuda" in self.device and not is_mock:
                 try:
                     self.trainer_model, self.tokenizer = FastLanguageModel.from_pretrained(
                         model_name=self.config.model_name,
                         max_seq_length=self.config.max_model_len,
-                        load_in_4bit=False,
+                        load_in_4bit=self.config.load_in_4bit,
+                        load_in_8bit=self.config.load_in_8bit,
+                        **load_options,
                     )
                     self.trainer_model = FastLanguageModel.get_peft_model(
                         self.trainer_model,
@@ -616,7 +655,6 @@ class GRPOBridge:
                     self.trainer_model = None
 
             if self.trainer_model is None:
-                is_mock = mock_test or kwargs.get("mock_test", False) or self.config.model_name in ("dummy", "test_model", "mock")
                 if is_mock:
                     from transformers import AutoConfig
                     cfg = AutoConfig.for_model(
@@ -641,48 +679,46 @@ class GRPOBridge:
                     self.tokenizer = MockTokenizer()
                 else:
                     try:
-                        self.tokenizer = AutoTokenizer.from_pretrained(self.config.model_name, trust_remote_code=True)
+                        self.tokenizer = AutoTokenizer.from_pretrained(
+                            self.config.model_name, trust_remote_code=True, **load_options,
+                        )
+                        model_options = dict(load_options)
+                        if self.config.load_in_4bit or self.config.load_in_8bit:
+                            from transformers import BitsAndBytesConfig
+                            model_options.update(
+                                quantization_config=BitsAndBytesConfig(
+                                    load_in_4bit=self.config.load_in_4bit,
+                                    load_in_8bit=self.config.load_in_8bit,
+                                    bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True,
+                                    bnb_4bit_compute_dtype=torch.bfloat16,
+                                ),
+                                device_map={"": self.device},
+                            )
                         self.trainer_model = AutoModelForCausalLM.from_pretrained(
                             self.config.model_name,
                             trust_remote_code=True,
                             torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+                            **model_options,
                         )
+                        if self.config.load_in_4bit or self.config.load_in_8bit:
+                            from peft import prepare_model_for_kbit_training
+                            self.trainer_model = prepare_model_for_kbit_training(self.trainer_model)
                     except Exception as e_load:
-                        if "401" in str(e_load) or "not found" in str(e_load).lower() or "not enough space" in str(e_load).lower():
-                            from transformers import AutoConfig
-                            cfg = AutoConfig.for_model(
-                                "qwen2",
-                                vocab_size=500,
-                                hidden_size=64,
-                                intermediate_size=128,
-                                num_hidden_layers=2,
-                                num_attention_heads=2,
-                                num_key_value_heads=2,
-                                max_position_embeddings=256,
-                            )
-                            self.trainer_model = AutoModelForCausalLM.from_config(cfg)
-                            class MockTokenizer:
-                                vocab_size = 500
-                                pad_token_id = 0
-                                eos_token_id = 1
-                                def __call__(self, text, return_tensors="pt", **_kw):
-                                    return {"input_ids": torch.tensor([[2, 10, 20, 30]], dtype=torch.long)}
-                                def decode(self, token_ids, skip_special_tokens=True):
-                                    return f"mock output ({len(token_ids)} tokens)"
-                            self.tokenizer = MockTokenizer()
-                        else:
-                            raise e_load
+                        raise RuntimeError(f"Failed to load requested trainer model {self.config.model_name}") from e_load
 
-                from sword.finetune import apply_lora_to_model
-                self.trainer_model = apply_lora_to_model(
-                    self.trainer_model,
+                from peft import LoraConfig, get_peft_model
+                adapter_config = LoraConfig(
                     r=self.config.lora_r,
                     lora_alpha=self.config.lora_alpha,
                     lora_dropout=self.config.lora_dropout,
-                    target_moe=False,
+                    target_modules=self.config.target_modules or ["q_proj", "k_proj", "v_proj", "o_proj"],
+                    bias="none", task_type="CAUSAL_LM",
                 )
+                self.trainer_model = get_peft_model(self.trainer_model, adapter_config)
 
-        if self.trainer_model is not None and hasattr(self.trainer_model, "to"):
+        if (self.trainer_model is not None and hasattr(self.trainer_model, "to")
+                and not getattr(self.trainer_model, "is_loaded_in_4bit", False)
+                and not getattr(self.trainer_model, "is_loaded_in_8bit", False)):
             self.trainer_model = self.trainer_model.to(self.device)
 
         # Configure fast training mode and gradient checkpointing
@@ -711,19 +747,27 @@ class GRPOBridge:
 
     def initialize_vllm(self) -> bool:
         """Spins up the vLLM engine with safe headless, multi-processing, sleep, and LoRA support."""
+        if self.mock_test:
+            return False
         try:
+            has_adapter = any("lora_" in name for name, _ in self.trainer_model.named_parameters())
+            if has_adapter and not self.config.enable_lora:
+                raise ValueError("trainer has LoRA adapters but vLLM LoRA is disabled")
+            if any(p.requires_grad and "lora_" not in name for name, p in self.trainer_model.named_parameters()):
+                raise ValueError("full-weight training requires the in-process rollout engine")
             os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
             os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
             os.environ["VLLM_USE_FLASHINFER"] = "0"
 
             hf_over = dict(self.config.hf_overrides or {})
-            hf_over.setdefault("allow_global_per_layer_attribute_access", True)
-            if "text_config" not in hf_over or not isinstance(hf_over["text_config"], dict):
-                hf_over["text_config"] = {"allow_global_per_layer_attribute_access": True}
-            else:
-                hf_over["text_config"].setdefault("allow_global_per_layer_attribute_access", True)
 
             from vllm import LLM
+            if self.config.offload_trainer_during_rollout:
+                self.trainer_model.eval()
+                self.trainer_model.to("cpu")
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             llm_kwargs = {
                 "model": self.config.model_name,
                 "trust_remote_code": True,
@@ -735,6 +779,12 @@ class GRPOBridge:
                 "max_loras": 1,
                 "hf_overrides": hf_over,
             }
+            if self.config.hf_token:
+                llm_kwargs["hf_token"] = self.config.hf_token
+            if self.config.model_cache_dir:
+                llm_kwargs["download_dir"] = self.config.model_cache_dir
+            if self.config.model_revision:
+                llm_kwargs["revision"] = self.config.model_revision
             if self.config.vllm_quantization:
                 llm_kwargs["quantization"] = self.config.vllm_quantization
             if self.config.kv_cache_dtype != "auto":
@@ -744,11 +794,12 @@ class GRPOBridge:
             if self.config.logprobs_mode:
                 llm_kwargs["logprobs_mode"] = self.config.logprobs_mode
 
-            # Fast ngram speculative decoding to speed up generation phase
+            # Current vLLM config uses one structured speculative configuration.
             if self.config.speculative_ngram:
-                llm_kwargs["speculative_model"] = "[ngram]"
-                llm_kwargs["num_speculative_tokens"] = self.config.num_speculative_tokens
-                llm_kwargs["ngram_prompt_lookup_max"] = self.config.ngram_prompt_lookup_max
+                llm_kwargs["speculative_config"] = {
+                    "method": "ngram", "num_speculative_tokens": self.config.num_speculative_tokens,
+                    "prompt_lookup_max": self.config.ngram_prompt_lookup_max,
+                }
 
             try:
                 self.vllm_engine = LLM(**llm_kwargs)
@@ -757,6 +808,7 @@ class GRPOBridge:
                 llm_kwargs.pop("speculative_model", None)
                 llm_kwargs.pop("num_speculative_tokens", None)
                 llm_kwargs.pop("ngram_prompt_lookup_max", None)
+                llm_kwargs.pop("speculative_config", None)
                 llm_kwargs.pop("enable_sleep_mode", None)
                 llm_kwargs.pop("logprobs_mode", None)
                 try:
@@ -765,10 +817,18 @@ class GRPOBridge:
                     llm_kwargs.pop("hf_overrides", None)
                     self.vllm_engine = LLM(**llm_kwargs)
 
+            # Export the initial (or resumed) adapter before first inference.
+            if has_adapter and self.weight_sync.policy_version == 0:
+                self.weight_sync.sync_to_vllm(self.trainer_model)
             return True
         except Exception as e:
+            self.vllm_initialization_error = str(e)
             print(f"[GRPOBridge] Note: vLLM initialization deferred ({e}). Operating with fallback engine.")
             self.vllm_engine = None
+            if self.config.offload_trainer_during_rollout:
+                self.trainer_model.to(self.device)
+            if self.config.require_vllm:
+                raise RuntimeError(f"Target-environment vLLM check failed: {e}") from e
             return False
 
     def generate_rollouts(self, prompts: List[str]) -> RolloutBatch:
@@ -776,7 +836,6 @@ class GRPOBridge:
         Generates concurrency_g rollouts per prompt using vLLM or the fallback engine.
         Extracts token log probabilities and uses versioned LoRARequest.
         """
-        self.vram_mgr.enter_rollout_phase(self.trainer_model, self.vllm_engine)
         batch = RolloutBatch(
             policy_version=self.weight_sync.policy_version,
             concurrency_g=self.config.concurrency_g,
@@ -792,6 +851,7 @@ class GRPOBridge:
         use_fallback = self.vllm_engine is None
         if not use_fallback:
             try:
+                self.vram_mgr.enter_rollout_phase(self.trainer_model, self.vllm_engine)
                 from vllm import SamplingParams
                 sp = SamplingParams(
                     temperature=self.config.temperature,
@@ -805,6 +865,9 @@ class GRPOBridge:
                 else:
                     outputs = self.vllm_engine.generate(expanded_prompts, sp)
 
+                if len(outputs) != len(expanded_prompts):
+                    raise ValueError("vLLM returned an incomplete rollout batch")
+
                 for idx, out in enumerate(outputs):
                     p_text = expanded_prompts[idx]
                     p_ids = list(out.prompt_token_ids)
@@ -813,14 +876,16 @@ class GRPOBridge:
                     r_ids = list(resp.token_ids)
 
                     r_logprobs = []
-                    if resp.logprobs:
+                    if resp.logprobs is not None and len(resp.logprobs) == len(r_ids):
                         for token_id, lp_dict in zip(r_ids, resp.logprobs):
                             if token_id in lp_dict:
                                 r_logprobs.append(float(lp_dict[token_id].logprob))
                             else:
-                                r_logprobs.append(0.0)
+                                raise ValueError("vLLM omitted the sampled token logprob")
                     else:
-                        r_logprobs = [0.0] * len(r_ids)
+                        raise ValueError("vLLM did not return complete token logprobs")
+                    if not all(math.isfinite(lp) for lp in r_logprobs):
+                        raise ValueError("vLLM returned nonfinite token logprobs")
 
                     batch.items.append(RolloutItem(
                         prompt_text=p_text,
@@ -830,7 +895,7 @@ class GRPOBridge:
                         rollout_logprobs=r_logprobs,
                         group_id=prompt_group_map[idx],
                         policy_version=self.weight_sync.policy_version,
-                        is_truncated=len(r_ids) >= self.config.max_new_tokens,
+                        is_truncated=getattr(resp, "finish_reason", None) == "length",
                     ))
             except Exception as e:
                 print(f"[GRPOBridge] Rollout generation note ({e}). Routing to fallback engine.")
@@ -838,11 +903,16 @@ class GRPOBridge:
                 batch.items.clear()
 
         if use_fallback:
+            # Failed rollout may have left vLLM resident and trainer offloaded.
+            self.vram_mgr.enter_train_phase(self.trainer_model, self.vllm_engine)
+            self.trainer_model.eval()
+            self.fallback_engine.model = self.trainer_model
             fb_results = self.fallback_engine.generate(
                 expanded_prompts,
                 max_new_tokens=self.config.max_new_tokens,
                 temperature=self.config.temperature,
                 top_p=self.config.top_p,
+                max_model_len=self.config.max_model_len,
             )
             for idx, res in enumerate(fb_results):
                 batch.items.append(RolloutItem(
@@ -888,6 +958,8 @@ class GRPOBridge:
 
         for item in batch.items:
             item.reward = float(reward_fn(item.prompt_text, item.response_text))
+            if not math.isfinite(item.reward):
+                raise ValueError("GRPO rewards must be finite")
 
         groups: Dict[int, List[RolloutItem]] = {}
         for item in batch.items:
@@ -917,14 +989,25 @@ class GRPOBridge:
         Executes micro-batched GRPO training step with detached TIS, global token normalization,
         gradient accumulation, gradient norm clipping, and automated adapter directory pruning.
         """
-        self.vram_mgr.enter_train_phase(self.trainer_model, self.vllm_engine)
-
         if len(batch.items) == 0:
             return {"loss": 0.0, "step": self.global_step}
+        if batch.policy_version != self.weight_sync.policy_version or any(
+            it.policy_version != batch.policy_version for it in batch.items
+        ):
+            raise ValueError("stale or mixed policy versions in rollout batch")
+        if any(not it.prompt_token_ids for it in batch.items):
+            raise ValueError("each rollout needs at least one prompt token for causal prediction")
+        if self.config.drop_incomplete_groups:
+            batch.filter_valid_groups(batch.concurrency_g)
+            if not batch.items:
+                return {"loss": 0.0, "step": self.global_step}
+        self.vram_mgr.enter_train_phase(self.trainer_model, self.vllm_engine)
 
         pad_id = getattr(self.tokenizer, "pad_token_id", 0) or 0
         micro_bs = max(1, self.config.micro_batch_size)
         num_items = len(batch.items)
+        if self.config.use_score_centering and micro_bs < num_items:
+            raise ValueError("importance-weight score centering requires a single microbatch")
         num_micro_batches = math.ceil(num_items / micro_bs)
 
         # Global response token count for exact token-level loss reduction
@@ -969,12 +1052,16 @@ class GRPOBridge:
                 rollout_logprobs=rollout_lps,
                 global_valid_tokens=global_valid_tokens,
             )
+            if not torch.isfinite(mb_loss):
+                optimizer.zero_grad(set_to_none=True)
+                raise RuntimeError("Nonfinite GRPO loss; optimizer update cancelled")
 
             # mb_loss is already scaled by global_valid_tokens
             mb_loss.backward()
 
             for k, v in mb_metrics.items():
-                accumulated_metrics[k] = accumulated_metrics.get(k, 0.0) + (v / num_micro_batches)
+                weight = 1.0 if k in ("grpo_loss", "policy_loss") else sum(len(it.response_token_ids) for it in mb_items) / global_valid_tokens
+                accumulated_metrics[k] = accumulated_metrics.get(k, 0.0) + v * weight
 
         # Gradient norm clipping and gradient norm tracking
         grad_norm_val = 0.0
@@ -984,17 +1071,27 @@ class GRPOBridge:
                 total_norm = torch.nn.utils.clip_grad_norm_(
                     trainable_params,
                     max_norm=self.config.max_grad_norm,
+                    error_if_nonfinite=True,
                 )
                 grad_norm_val = float(total_norm.item() if hasattr(total_norm, "item") else total_norm)
             else:
                 total_sq = sum(p.grad.data.norm(2).item() ** 2 for p in trainable_params if p.grad is not None)
                 grad_norm_val = math.sqrt(total_sq)
+                if not math.isfinite(grad_norm_val):
+                    optimizer.zero_grad(set_to_none=True)
+                    raise RuntimeError("Nonfinite GRPO gradient; optimizer update cancelled")
 
-        optimizer.step()
+        # Adapter export is part of the update: a failed export must restore the
+        # optimizer/policy rather than retry an already-applied update.
+        new_version = safe_optimizer_step(
+            optimizer, trainable_params,
+            after_step=lambda: self.weight_sync.sync_to_vllm(self.trainer_model, self.vllm_engine),
+        )
+        # Do not carry gradient buffers into the next memory handoff.
+        optimizer.zero_grad(set_to_none=True)
         self.global_step += 1
 
         # Synchronize updated LoRA weights into standard PEFT layout and prune old directories
-        new_version = self.weight_sync.sync_to_vllm(self.trainer_model, self.vllm_engine)
         self.weight_sync.prune_old_adapters(max_kept=self.config.max_kept_adapters)
 
         accumulated_metrics["step"] = self.global_step

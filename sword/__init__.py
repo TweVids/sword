@@ -394,6 +394,8 @@ from .grpo_bridge import (
     VRAMLifecycleManager,
 )
 from .b_model import ModelBJudge, ModelBJudgeConfig, ModelBEvaluationResult
+from .ollama_runtime import test_ollama_binary, start_ollama_server, pull_ollama_model
+from .runtime_setup import setup_environment
 from .harness import (
     get_harness,
     BaseHarness,
@@ -433,6 +435,7 @@ def get_grpo_bridge(config=None, **kwargs):
 __all__ = [
     "bootstrap_environment",
     "vllm_patcher",
+    "setup_environment",
     "train",
     "run_standalone_math_grpo",
     "run_long_train",

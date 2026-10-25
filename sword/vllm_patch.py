@@ -1,24 +1,149 @@
 import os
+import ast
 import sys
 import re
 import subprocess
 import importlib
 import importlib.util
+import inspect
+import tempfile
+import shutil
+from importlib import metadata
+
+from .rotary_fallback import apply_rotary_fallback, homogeneous_head_dim
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, List
 
 
-def bootstrap_environment(version: str = "vllm==0.23.0") -> Dict[str, Any]:
+
+def write_python_patch(path: Path, source: str):
+    """Validate syntax and atomically replace a patched Python file."""
+    compile(source, str(path), "exec")
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                     suffix=".tmp", delete=False) as stream:
+        temporary = Path(stream.name)
+        stream.write(source)
+    try:
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def patch_rotary_source(source: str) -> str:
+    marker = "# sword-rotary-fallback-v2"
+    if marker in source:
+        compile(source, "<vllm rotary patch>", "exec")
+        return source
+    old = re.search(r"(?m)^([ \t]*)# marimo-rtx6000-rotary-fallback[ \t]*$", source)
+    if old:
+        indent = old.group(1)
+        start = old.start()
+        marker_line = source[:old.start()].count("\n") + 1
+        tree = ast.parse(source)
+        legacy_try = next((node for node in ast.walk(tree)
+                           if isinstance(node, ast.Try) and node.lineno == marker_line + 1), None)
+        if legacy_try is None:
+            raise ValueError("Unsupported legacy rotary patch layout")
+        end = sum(len(line) for line in source.splitlines(keepends=True)[:legacy_try.end_lineno])
+    else:
+        match = re.search(r"(?m)^([ \t]*)from flash_attn\.ops\.triton\.rotary import apply_rotary[ \t]*$", source)
+        if not match:
+            raise ValueError("Unsupported vLLM rotary source: flash-attn import not found")
+        indent, start, end = match.group(1), match.start(), match.end()
+    function = inspect.getsource(apply_rotary_fallback).replace("def apply_rotary_fallback(", "def apply_rotary(", 1).rstrip()
+    lines = [marker, "try:", "    from flash_attn.ops.triton.rotary import apply_rotary",
+             "except (ImportError, ModuleNotFoundError):"]
+    lines += ["    " + line if line else "" for line in function.splitlines()]
+    replacement = "\n".join(indent + line if line else line for line in lines) + "\n"
+    patched = source[:start] + replacement + source[end:]
+    compile(patched, "<vllm rotary patch>", "exec")
+    return patched
+
+
+def patch_head_dim_source(source: str) -> str:
+    if "# sword-homogeneous-head-dim" in source:
+        compile(source, "<vllm head-dimension patch>", "exec")
+        return source
+    target = 'getattr(self.hf_text_config, "head_dim", 0)'
+    if target not in source:
+        return source
+    source = source.replace(target, "homogeneous_head_dim(self.hf_text_config)", 1)
+    source += "\n# sword-homogeneous-head-dim\n" + inspect.getsource(homogeneous_head_dim)
+    compile(source, "<vllm head-dimension patch>", "exec")
+    return source
+
+
+def loaded_package_versions() -> Dict[str, str]:
+    """Record versions already imported by a notebook before package installation."""
+    names = ("torch", "transformers", "numpy", "vllm", "peft", "accelerate",
+             "huggingface_hub", "tokenizers", "triton", "safetensors")
+    return {name: mod.__version__ for name in names
+            if (mod := sys.modules.get(name)) is not None
+            and isinstance(getattr(mod, "__version__", None), str)}
+
+
+def changed_loaded_packages(before: Dict[str, str]) -> List[str]:
+    changed = []
+    for name, version in before.items():
+        try:
+            if metadata.version(name) != version:
+                changed.append(name)
+        except metadata.PackageNotFoundError:
+            changed.append(name)
+    return changed
+
+
+def inspect_vllm_installation() -> Dict[str, Any]:
+    """Validate installed patch files without installing or modifying packages."""
+    steps = []
+    try:
+        spec = importlib.util.find_spec("vllm")
+        if not spec or not spec.origin:
+            raise RuntimeError("vLLM is not installed; run sword.train(setup=True, ...).")
+        root = Path(spec.origin).parent
+        for relative, marker in (
+            ("model_executor/layers/rotary_embedding/common.py", "# sword-rotary-fallback-v2"),
+            ("transformers_utils/model_arch_config_convertor.py", "# sword-homogeneous-head-dim"),
+        ):
+            path = root / relative
+            if not path.exists():
+                if relative.startswith("transformers_utils/"):
+                    continue
+                raise RuntimeError(f"Unsupported vLLM rotary layout: {path}")
+            source = path.read_text(encoding="utf-8")
+            compile(source, str(path), "exec")
+            # A convertor without the old scalar head_dim lookup needs no patch.
+            patched = marker in source or (
+                relative.startswith("transformers_utils/")
+                and 'getattr(self.hf_text_config, "head_dim", 0)' not in source
+                and "# marimo-safe-heterogeneous-head-dim" not in source
+            )
+            steps.append({"patch_file": str(path), "patched": patched})
+            if not patched:
+                raise RuntimeError(f"vLLM patch missing in {path}; run setup=True.")
+        return {"ok": True, "restart_kernel_required": False, "steps": steps}
+    except (OSError, ValueError, RuntimeError, SyntaxError) as exc:
+        return {"ok": False, "error": str(exc), "steps": steps}
+
+
+def bootstrap_environment(
+    version: str = "vllm==0.23.0", *, install: bool = True, sync_project: bool = False,
+) -> Dict[str, Any]:
     """
     Bootstraps the local python environment:
-    - Runs uv sync if pyproject.toml or uv.lock exists
-    - Installs vllm via uv pip (defaults to vllm==0.23.0, or custom/latest)
+    - Optionally syncs a uv project when sync_project=True
+    - Installs missing/mismatched vllm via uv or this interpreter's pip
     - Patches vllm rotary embedding common.py with pure-PyTorch fallback
     """
     results = []
+    before = loaded_package_versions()
+    patched_loaded_modules = []
     cwd = Path.cwd()
-    if (cwd / "pyproject.toml").exists() or (cwd / "uv.lock").exists():
-        run = subprocess.run(["uv", "sync", "--exact", "--active"], text=True, capture_output=True)
+    if install and sync_project and ((cwd / "pyproject.toml").exists() or (cwd / "uv.lock").exists()):
+        try:
+            run = subprocess.run(["uv", "sync", "--exact", "--active"], text=True, capture_output=True)
+        except OSError as exc:
+            return {"ok": False, "steps": results, "error": str(exc)}
         results.append({
             "command": "uv sync --exact --active",
             "returncode": run.returncode,
@@ -29,118 +154,72 @@ def bootstrap_environment(version: str = "vllm==0.23.0") -> Dict[str, Any]:
     else:
         results.append({
             "command": "uv sync --exact --active",
-            "skipped": "No pyproject.toml/uv.lock in current directory",
+            "skipped": "Project sync is opt-in; existing runtime packages are retained",
         })
     pkg = "vllm" if version in ("latest", "vllm") else version
-    run = subprocess.run(["uv", "pip", "install", pkg], text=True, capture_output=True)
-    results.append({
-        "command": f"uv pip install {pkg}",
-        "returncode": run.returncode,
-        "tail": (run.stdout + run.stderr)[-4000:],
-    })
-    if run.returncode:
-        return {"ok": False, "steps": results}
+    try:
+        installed = metadata.version("vllm")
+    except metadata.PackageNotFoundError:
+        installed = None
+    needs_install = installed is None or version in ("latest", "vllm") or pkg != f"vllm=={installed}"
+    try:
+        if install and needs_install:
+            command = (["uv", "pip", "install", "--python", sys.executable]
+                       if shutil.which("uv") else [sys.executable, "-m", "pip", "install"])
+            if version in ("latest", "vllm"):
+                command.append("--upgrade")
+            run = subprocess.run([*command, pkg], text=True, capture_output=True)
+            results.append({
+                "command": " ".join([*command, pkg]), "returncode": run.returncode,
+                "tail": (run.stdout + run.stderr)[-4000:],
+            })
+            if run.returncode:
+                return {"ok": False, "steps": results}
+        else:
+            results.append({"command": f"install {pkg}", "skipped": (
+                f"Already installed: vllm=={installed}" if installed else "Installation disabled"
+            )})
+    except OSError as exc:
+        return {"ok": False, "steps": results, "error": str(exc)}
     importlib.invalidate_caches()
     spec = importlib.util.find_spec("vllm")
     if not spec or not spec.origin:
         return {"ok": False, "steps": results, "error": "vLLM installed but not importable"}
     common = Path(spec.origin).parent / "model_executor/layers/rotary_embedding/common.py"
-    source = common.read_text()
-    needle = "from flash_attn.ops.triton.rotary import apply_rotary"
-    marker = "# marimo-rtx6000-rotary-fallback"
-    if needle in source and marker not in source:
-        match = re.search(r"(?m)^([ \t]*)from flash_attn\.ops\.triton\.rotary import apply_rotary\s*$", source)
-        if not match:
-            return {"ok": False, "steps": results, "error": f"Could not locate import line in {common}"}
-        indent = match.group(1)
-        body = [
-            marker,
-            "try:",
-            "    from flash_attn.ops.triton.rotary import apply_rotary",
-            "except (ImportError, ModuleNotFoundError):",
-            "    import torch as _torch",
-            "    def apply_rotary(x, cos, sin, seqlen_offsets=0, cu_seqlens=None,",
-            "                     max_seqlen=None, interleaved=False, inplace=False, conjugate=False):",
-            "        d = x.shape[-1]",
-            "        x1, x2 = x[..., :d//2], x[..., d//2:]",
-            "        c = cos[..., :d//2] if cos.shape[-1] >= d//2 else cos",
-            "        s = sin[..., :d//2] if sin.shape[-1] >= d//2 else sin",
-            "        if conjugate: s = -s",
-            "        out = _torch.cat([x1*c - x2*s, x1*s + x2*c], dim=-1).to(x.dtype)",
-            "        if inplace: x.copy_(out); return x",
-            "        return out",
-        ]
-        replacement = "\n".join(indent + line if line else line for line in body)
-        common.write_text(source[:match.start()] + replacement + source[match.end():])
-    results.append({"patch_file": str(common), "patched": marker in common.read_text()})
+    if not common.exists():
+        return {"ok": False, "steps": results, "error": f"Unsupported vLLM rotary layout: {common}"}
+    try:
+        source = common.read_text(encoding="utf-8")
+        patched = patch_rotary_source(source)
+        if patched != source:
+            write_python_patch(common, patched)
+            if "vllm.model_executor.layers.rotary_embedding.common" in sys.modules:
+                patched_loaded_modules.append("vllm.model_executor.layers.rotary_embedding.common")
+        results.append({"patch_file": str(common), "patched": "# sword-rotary-fallback-v2" in patched})
 
-    # Patch vLLM model_arch_config_convertor for heterogeneous head_dim access
-    convertor_file = Path(spec.origin).parent / "transformers_utils/model_arch_config_convertor.py"
-    if convertor_file.exists():
-        c_source = convertor_file.read_text()
-        c_marker = "# marimo-safe-heterogeneous-head-dim"
-        if c_marker not in c_source:
-            target_str = 'head_dim = getattr(self.hf_text_config, "head_dim", 0)'
-            if target_str in c_source:
-                replacement_str = (
-                    c_marker + "\n"
-                    "        try:\n"
-                    "            head_dim = getattr(self.hf_text_config, 'head_dim', 0)\n"
-                    "        except Exception:\n"
-                    "            head_dim = getattr(getattr(self.hf_text_config, 'per_layer_config', [{}])[0], 'head_dim', 0) if getattr(self.hf_text_config, 'per_layer_config', None) else 0"
-                )
-                c_source = c_source.replace(target_str, replacement_str, 1)
-                convertor_file.write_text(c_source)
-                results.append({"patch_file": str(convertor_file), "patched": True})
+        convertor = Path(spec.origin).parent / "transformers_utils/model_arch_config_convertor.py"
+        if convertor.exists():
+            source = convertor.read_text(encoding="utf-8")
+            if "# marimo-safe-heterogeneous-head-dim" in source:
+                raise ValueError("Legacy head-dimension patch detected; restore this vLLM file before patching")
+            patched = patch_head_dim_source(source)
+            if patched != source:
+                write_python_patch(convertor, patched)
+                if "vllm.transformers_utils.model_arch_config_convertor" in sys.modules:
+                    patched_loaded_modules.append("vllm.transformers_utils.model_arch_config_convertor")
+            results.append({"patch_file": str(convertor), "patched": "# sword-homogeneous-head-dim" in patched})
+    except (OSError, ValueError, SyntaxError) as exc:
+        return {"ok": False, "steps": results, "error": str(exc)}
 
-    # Patch Transformers heterogeneity configuration_utils to suppress AmbiguousGlobalPerLayerAttributeError
-    t_spec = importlib.util.find_spec("transformers")
-    if t_spec and t_spec.origin:
-        t_root = Path(t_spec.origin).parent
-        utils_file = t_root / "utils/__init__.py"
-        if utils_file.exists():
-            u_source = utils_file.read_text()
-            u_marker = "# marimo-download-url-compat"
-            if u_marker not in u_source:
-                compat_snippet = (
-                    f"\n{u_marker}\n"
-                    "try:\n"
-                    "    from urllib.request import urlretrieve as download_url\n"
-                    "except Exception:\n"
-                    "    def download_url(url, **kw): return None\n"
-                )
-                utils_file.write_text(u_source + compat_snippet)
-                results.append({"patch_file": str(utils_file), "patched": True})
-
-        het_file = t_root / "integrations/heterogeneity/configuration_utils.py"
-        if het_file.exists():
-            h_source = het_file.read_text()
-            h_marker = "# marimo-suppress-heterogeneity-error"
-            if h_marker not in h_source:
-                # Bypass AmbiguousGlobalPerLayerAttributeError by forcing allow_global_per_layer_attribute_access to True
-                patched_h = re.sub(
-                    r'if\s+not\s+getattr\(self,\s*["\']allow_global_per_layer_attribute_access["\'],\s*False\):',
-                    f"{h_marker}\n        if False:",
-                    h_source,
-                )
-                if patched_h != h_source:
-                    het_file.write_text(patched_h)
-                    results.append({"patch_file": str(het_file), "patched": True})
-                else:
-                    patched_h2 = re.sub(
-                        r"raise\s+AmbiguousGlobalPerLayerAttributeError\(.*?\)",
-                        f"{h_marker}\n        return super().__getattribute__(key)",
-                        h_source,
-                        flags=re.DOTALL,
-                    )
-                    if patched_h2 != h_source:
-                        het_file.write_text(patched_h2)
-                        results.append({"patch_file": str(het_file), "patched": True})
-
-    return {"ok": True, "restart_kernel_required": True, "steps": results}
+    changed = changed_loaded_packages(before) + patched_loaded_modules
+    return {"ok": True, "restart_kernel_required": bool(changed),
+            "changed_loaded_packages": changed, "steps": results}
 
 
-def vllm_patcher(verbose: bool = True, version: str = "vllm==0.23.0") -> Dict[str, Any]:
+def vllm_patcher(
+    verbose: bool = True, version: str = "vllm==0.23.0", *,
+    install: bool = True, sync_project: bool = False,
+) -> Dict[str, Any]:
     """
     Executes bootstrap_environment() and prints detailed step execution logs.
     Can be imported and called via:
@@ -150,7 +229,7 @@ def vllm_patcher(verbose: bool = True, version: str = "vllm==0.23.0") -> Dict[st
     """
     if verbose:
         print(f"[Sword] Starting vLLM patcher and environment bootstrap ({version})...")
-    outcome = bootstrap_environment(version=version)
+    outcome = bootstrap_environment(version=version, install=install, sync_project=sync_project)
 
     if verbose:
         print(f"[Sword] Bootstrap overall status: ok={outcome.get('ok')}")

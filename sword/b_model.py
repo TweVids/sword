@@ -7,9 +7,13 @@ formatting, and cheating detection with sequential VRAM management and memory gu
 import re
 import gc
 import json
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Dict, Any, Tuple, Optional, List, Union
+
+from sword.ollama_runtime import api_url, start_ollama_server, pull_ollama_model
+from sword.defaults import DEFAULT_B_MODEL, DEFAULT_B_MODEL_FALLBACK
 
 try:
     import requests
@@ -33,6 +37,18 @@ class ModelBEvaluationResult:
     cheating: bool = False
     raw_response: str = ""
 
+    def __post_init__(self):
+        for name in ("truth", "formatted", "rule_reasoning_follow", "rule_answer_follow", "tools_success"):
+            value = float(getattr(self, name))
+            setattr(self, name, max(0.0, min(1.0, value)) if math.isfinite(value) else 0.0)
+        if isinstance(self.cheating, str):
+            value = self.cheating.strip().lower()
+            if value not in ("true", "false", "1", "0"):
+                raise ValueError("invalid cheating boolean")
+            self.cheating = value in ("true", "1")
+        else:
+            self.cheating = bool(self.cheating)
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "truth": round(self.truth, 4),
@@ -49,8 +65,8 @@ class ModelBJudgeConfig:
     """Configuration for Model B Ollama Judge."""
     host: str = "127.0.0.1"
     port: int = 11343
-    model_name: str = "gpt-oss:120b"
-    timeout: float = 60.0
+    model_name: str = DEFAULT_B_MODEL
+    timeout: float = 180.0
     temperature: float = 0.1
     num_ctx: int = 8192
     num_predict: int = 1024
@@ -60,6 +76,35 @@ class ModelBJudgeConfig:
     auto_unload: bool = True
     keep_alive_during_eval: str = "5m"
     show_thinking: bool = False
+    auto_setup: bool = True
+    fallback_model_name: Optional[str] = DEFAULT_B_MODEL_FALLBACK
+    models_dir: Optional[str] = None
+    startup_timeout: float = 60.0
+    pull_stall_s: float = 120.0
+    log_path: Optional[str] = None
+
+
+def model_b_config(port: int = 11343, *, mock_test: bool = False,
+                   auto_unload: bool = True, keep_alive: str = "5m", **options) -> ModelBJudgeConfig:
+    """Use the same judge settings for setup, diagnostics, and training."""
+    return ModelBJudgeConfig(
+        host=options.get("B_model_host", "127.0.0.1"), port=port,
+        model_name=options.get("B_model_name", DEFAULT_B_MODEL),
+        fallback_model_name=options.get("B_model_fallback_name", DEFAULT_B_MODEL_FALLBACK),
+        reasoning=options.get("B_model_thinking", options.get("B_model_reasoning", True)),
+        show_thinking=bool(options.get("B_model_show_thinking", False)),
+        auto_unload=auto_unload, keep_alive_during_eval=keep_alive,
+        auto_setup=bool(options.get("B_model_auto_setup", not mock_test)) and not mock_test,
+        models_dir=options.get("B_model_models_dir"),
+        startup_timeout=float(options.get("B_model_startup_timeout", 60)),
+        pull_stall_s=float(options.get("B_model_pull_stall_s", 120)),
+        log_path=options.get("B_model_log_path"),
+        timeout=float(options.get("B_model_timeout", 180)),
+        num_ctx=int(options.get("B_model_num_ctx", 8192)),
+        num_predict=int(options.get("B_model_num_predict", 1024)),
+        force_gpu=bool(options.get("B_model_force_gpu", True)),
+        use_mmap=bool(options.get("B_model_use_mmap", False)),
+    )
 
 
 class ModelBJudge:
@@ -93,7 +138,102 @@ class ModelBJudge:
 
     def __init__(self, config: Optional[ModelBJudgeConfig] = None):
         self.config = config or ModelBJudgeConfig()
-        self.url = f"http://{self.config.host}:{self.config.port}"
+        host = self.config.host
+        self.url = api_url(f"[{host}]:{self.config.port}" if host == "::1" else f"{host}:{self.config.port}")
+        self._memory_ready = True
+        self.active_model_name = self.config.model_name
+        self.last_error = None
+        self.last_evaluation_source = None
+        self.evaluation_counts = {}
+        self._installed_models = set()
+        self._setup_retry_at = 0.0
+        self.last_thinking_received = False
+
+    def ensure_ready(self, load_model: bool = False) -> bool:
+        """Provision the server/model; optionally preload after training VRAM is released."""
+        if requests is None or not self._memory_ready:
+            return False
+        if time.monotonic() < self._setup_retry_at:
+            return False
+        try:
+            if not self.is_available():
+                if not self.config.auto_setup or not start_ollama_server(
+                    models_dir=self.config.models_dir, host=self.url,
+                    wait_s=self.config.startup_timeout, log_path=self.config.log_path,
+                ):
+                    raise RuntimeError(f"Ollama unavailable at {self.url}")
+            if not self._ensure_model(self.active_model_name):
+                raise RuntimeError(f"Model unavailable: {self.active_model_name}")
+            if load_model:
+                try:
+                    self._load_model(self.active_model_name)
+                except Exception as exc:
+                    self.last_error = str(exc)
+                    if not self._activate_fallback():
+                        raise
+                    self._load_model(self.active_model_name)
+            return True
+        except Exception as exc:
+            self.last_error = str(exc)
+            # A missing primary model should also try the configured smaller judge.
+            if self.is_available() and self._activate_fallback():
+                try:
+                    if load_model:
+                        self._load_model(self.active_model_name)
+                    return True
+                except Exception as fallback_exc:
+                    self.last_error = str(fallback_exc)
+            self._setup_retry_at = time.monotonic() + 60
+            print(f"[ModelB] Setup failed: {self.last_error}", flush=True)
+            return False
+
+    def _ensure_model(self, model_name: str) -> bool:
+        target = model_name if ":" in model_name.rsplit("/", 1)[-1] else f"{model_name}:latest"
+        if target in self._installed_models:
+            return True
+        if target in self.list_models():
+            self._installed_models.add(target)
+            return True
+        if self.config.auto_setup and pull_ollama_model(
+            model_name, host=self.url, models_dir=self.config.models_dir, stall_s=self.config.pull_stall_s,
+        ):
+            self._installed_models.add(target)
+            return True
+        return False
+
+    def _inference_options(self):
+        options = {"temperature": self.config.temperature, "num_predict": self.config.num_predict,
+                   "num_ctx": self.config.num_ctx, "use_mmap": self.config.use_mmap}
+        if self.config.force_gpu:
+            options["num_gpu"] = 999
+        return options
+
+    def _load_model(self, model_name: str):
+        response = requests.post(f"{self.url}/api/generate", json={
+            "model": model_name, "stream": False, "keep_alive": self.config.keep_alive_during_eval,
+            "options": self._inference_options(),
+        }, timeout=self.config.timeout)
+        response.raise_for_status()
+        if response.json().get("error"):
+            raise RuntimeError(response.json()["error"])
+
+    def _activate_fallback(self) -> bool:
+        fallback = self.config.fallback_model_name
+        if not fallback or fallback == self.active_model_name:
+            return False
+        # Free any partially loaded primary model before loading the fallback.
+        self.unload()
+        if not self.is_available():
+            if not self.config.auto_setup or not start_ollama_server(
+                models_dir=self.config.models_dir, host=self.url,
+                wait_s=self.config.startup_timeout, log_path=self.config.log_path,
+            ):
+                return False
+        if not self._ensure_model(fallback):
+            return False
+        print(f"[ModelB] Switching {self.active_model_name} -> {fallback}: {self.last_error}", flush=True)
+        self.active_model_name = fallback
+        return True
 
     def is_available(self) -> bool:
         """Checks if the Ollama server on B_model_port is reachable."""
@@ -126,6 +266,13 @@ class ModelBJudge:
             "port": self.config.port,
             "host": self.config.host,
             "model_name": self.config.model_name,
+            "active_model_name": self.active_model_name,
+            "fallback_used": self.active_model_name != self.config.model_name,
+            "last_error": self.last_error,
+            "evaluation_source": self.last_evaluation_source,
+            "evaluation_counts": dict(self.evaluation_counts),
+            "thinking_requested": self.config.reasoning,
+            "thinking_received": self.last_thinking_received,
             "reachable": False,
             "installed_models": [],
             "model_found": False,
@@ -142,8 +289,10 @@ class ModelBJudge:
                 models = resp.json().get("models", [])
                 model_names = [m.get("name", "") for m in models if m.get("name")]
                 out["installed_models"] = model_names
-                target_base = self.config.model_name.split(":")[0]
-                out["model_found"] = any(self.config.model_name == name or target_base in name for name in model_names)
+                target_name = self.active_model_name
+                if ":" not in target_name:
+                    target_name += ":latest"
+                out["model_found"] = target_name in model_names
             else:
                 out["error"] = f"HTTP {resp.status_code}: {resp.text}"
         except Exception as e:
@@ -159,7 +308,7 @@ class ModelBJudge:
             return False
         try:
             payload = {
-                "model": self.config.model_name,
+                "model": self.active_model_name,
                 "keep_alive": 0,
             }
             resp = requests.post(f"{self.url}/api/generate", json=payload, timeout=5.0)
@@ -180,10 +329,12 @@ class ModelBJudge:
 
     def prepare_for_eval(self):
         """Clears PyTorch CUDA allocations and verifies memory guard before running Model B."""
-        self.check_memory_guard()
         gc.collect()
         if torch is not None and torch.cuda.is_available():
             torch.cuda.empty_cache()
+        is_local = self.config.host in ("127.0.0.1", "localhost", "::1")
+        self._memory_ready = self.check_memory_guard() if self.config.force_gpu and is_local else True
+        return self._memory_ready
 
     def release_after_eval(self):
         """Unloads Model B and clears CUDA allocations before the training step."""
@@ -229,14 +380,14 @@ class ModelBJudge:
             match = re.search(r"\{[^{}]*\}", cleaned, re.DOTALL)
             if match:
                 data = json.loads(match.group(0))
-                if isinstance(data, dict):
+                if isinstance(data, dict) and any(k in data for k in ("truth", "formatted", "rule_reasoning_follow", "rule_answer_follow", "tools_success", "cheating")):
                     return ModelBEvaluationResult(
-                        truth=float(data.get("truth", 0.5)),
-                        formatted=float(data.get("formatted", 1.0)),
-                        rule_reasoning_follow=float(data.get("rule_reasoning_follow", 1.0)),
-                        rule_answer_follow=float(data.get("rule_answer_follow", 1.0)),
+                        truth=float(data.get("truth", 0.0)),
+                        formatted=float(data.get("formatted", 0.0)),
+                        rule_reasoning_follow=float(data.get("rule_reasoning_follow", 0.0)),
+                        rule_answer_follow=float(data.get("rule_answer_follow", 0.0)),
                         tools_success=float(data.get("tools_success", fallback_tools_success)),
-                        cheating=bool(data.get("cheating", False)),
+                        cheating=data.get("cheating", False),
                         raw_response=text,
                     )
         except Exception:
@@ -254,7 +405,7 @@ class ModelBJudge:
                         rule_reasoning_follow=float(arr[2]),
                         rule_answer_follow=float(arr[3]),
                         tools_success=float(arr[4]),
-                        cheating=bool(arr[5]),
+                        cheating=arr[5],
                         raw_response=text,
                     )
         except Exception:
@@ -270,10 +421,12 @@ class ModelBJudge:
                     pass
             return default
 
-        truth_val = extract_val(r'"?truth"?\s*:\s*([0-9.]+)', 0.5)
-        fmt_val = extract_val(r'"?formatted"?\s*:\s*([0-9.]+)', 1.0)
-        reas_val = extract_val(r'"?rule_reasoning_follow"?\s*:\s*([0-9.]+)', 1.0)
-        ans_val = extract_val(r'"?rule_answer_follow"?\s*:\s*([0-9.]+)', 1.0)
+        if not re.search(r'\b(?:truth|formatted|rule_reasoning_follow|rule_answer_follow|tools_success|cheating)\b"?\s*:', cleaned):
+            raise ValueError("Model B returned no recognized scores")
+        truth_val = extract_val(r'"?truth"?\s*:\s*([-+0-9.eE]+)', 0.0)
+        fmt_val = extract_val(r'"?formatted"?\s*:\s*([-+0-9.eE]+)', 0.0)
+        reas_val = extract_val(r'"?rule_reasoning_follow"?\s*:\s*([-+0-9.eE]+)', 0.0)
+        ans_val = extract_val(r'"?rule_answer_follow"?\s*:\s*([-+0-9.eE]+)', 0.0)
         tool_val = extract_val(r'"?tools_success"?\s*:\s*([0-9.]+)', fallback_tools_success)
         cheat_match = re.search(r'"?cheating"?\s*:\s*(true|false|1|0)', cleaned, re.IGNORECASE)
         is_cheat = cheat_match.group(1).lower() in ("true", "1") if cheat_match else False
@@ -287,6 +440,19 @@ class ModelBJudge:
             cheating=is_cheat,
             raw_response=text,
         )
+
+    def _request_chat(self, payload: Dict[str, Any]):
+        """Request one model's scores; tolerate models without a thinking option."""
+        resp = requests.post(f"{self.url}/api/chat", json=payload, timeout=self.config.timeout)
+        if resp.status_code == 400 and "think" in resp.text.lower() and "think" in payload:
+            payload = dict(payload)
+            payload.pop("think")
+            resp = requests.post(f"{self.url}/api/chat", json=payload, timeout=self.config.timeout)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("error"):
+            raise RuntimeError(data["error"])
+        return data
 
     def evaluate(
         self,
@@ -303,7 +469,7 @@ class ModelBJudge:
         """Sends candidate response to Model B via Ollama /api/chat and parses result."""
         fallback_tool_ratio = tools_succeeded / max(1, tools_called) if tools_called > 0 else 0.0
 
-        if not self.is_available():
+        if not self._memory_ready or not self.ensure_ready():
             # Graceful deterministic fallback when Ollama is offline
             return self._deterministic_fallback(
                 candidate_response=candidate_response,
@@ -324,52 +490,43 @@ class ModelBJudge:
             tools_succeeded=tools_succeeded,
         )
 
-        options = {
-            "temperature": self.config.temperature,
-            "num_predict": self.config.num_predict,
-            "num_ctx": self.config.num_ctx,
-            "use_mmap": self.config.use_mmap,
-        }
-        if self.config.force_gpu:
-            options["num_gpu"] = 999
-
         payload: Dict[str, Any] = {
-            "model": self.config.model_name,
+            "model": self.active_model_name,
             "messages": [
                 {"role": "system", "content": self.SYSTEM_PROMPT},
                 {"role": "user", "content": user_content},
             ],
             "stream": False,
             "keep_alive": self.config.keep_alive_during_eval,
-            "options": options,
+            "options": self._inference_options(),
+            "format": "json",
         }
         if self.config.reasoning is not None:
             payload["think"] = self.config.reasoning
 
-        try:
-            resp = requests.post(
-                f"{self.url}/api/chat",
-                json=payload,
-                timeout=self.config.timeout,
-            )
-            if resp.status_code == 400 and "think" in resp.text.lower() and "think" in payload:
-                payload.pop("think")
-                resp = requests.post(f"{self.url}/api/chat", json=payload, timeout=self.config.timeout)
-
-            resp.raise_for_status()
-            message_obj = resp.json().get("message", {})
-            thinking = message_obj.get("thinking") or ""
-            content = message_obj.get("content", "") or ""
-            if thinking and getattr(self.config, "show_thinking", False):
-                print(f"[ModelB Thinking]\n{thinking}\n" + "-" * 60)
-            return self.parse_scores(content, fallback_tools_success=fallback_tool_ratio)
-        except Exception:
-            return self._deterministic_fallback(
-                candidate_response=candidate_response,
-                solution=solution,
-                tools_called=tools_called,
-                tools_succeeded=tools_succeeded,
-            )
+        for attempt in range(2):
+            payload["model"] = self.active_model_name
+            try:
+                data = self._request_chat(dict(payload))
+                message_obj = data.get("message", {})
+                thinking = message_obj.get("thinking") or ""
+                self.last_thinking_received = bool(thinking)
+                content = message_obj.get("content", "") or ""
+                if thinking and self.config.show_thinking:
+                    print(f"[ModelB Thinking]\n{thinking}\n" + "-" * 60)
+                result = self.parse_scores(content, fallback_tools_success=fallback_tool_ratio)
+                self.last_evaluation_source = self.active_model_name
+                self.evaluation_counts[self.active_model_name] = self.evaluation_counts.get(self.active_model_name, 0) + 1
+                return result
+            except Exception as exc:
+                self.last_error = str(exc)
+                # Inference timeout/OOM/load failure: retry the same reward on the smaller model.
+                if attempt == 0 and self._activate_fallback():
+                    continue
+                print(f"[ModelB] Evaluation failed: {self.last_error}; using deterministic scoring", flush=True)
+                self._setup_retry_at = time.monotonic() + 60
+                break
+        return self._deterministic_fallback(candidate_response, solution, tools_called, tools_succeeded)
 
     def _deterministic_fallback(
         self,
@@ -379,12 +536,15 @@ class ModelBJudge:
         tools_succeeded: int,
     ) -> ModelBEvaluationResult:
         """Lightweight deterministic scoring when Model B server is unavailable."""
+        self.last_evaluation_source = "deterministic"
+        self.evaluation_counts["deterministic"] = self.evaluation_counts.get("deterministic", 0) + 1
         resp = candidate_response.strip().lower()
         sol = solution.strip().lower()
 
         # Simple truth check
         truth = 0.5
-        if sol and (sol in resp):
+        from sword.reward import MathVerifier
+        if sol and MathVerifier.verify_answer(candidate_response, solution):
             truth = 1.0
 
         # Formatted check: check tags

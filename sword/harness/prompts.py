@@ -11,10 +11,11 @@ Automatically clones any missing repository shallowly on first load.
 import os
 import re
 import warnings
+from contextlib import contextmanager
 from typing import Dict, List, Optional
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-THIRD_PARTY_DIR = os.path.join(REPO_ROOT, "third_party")
+THIRD_PARTY_DIR = os.environ.get("SWORD_HARNESS_DIR") or os.path.join(REPO_ROOT, "third_party")
 
 HARNESS_GIT_REPOS: Dict[str, str] = {
     "opencode": "https://github.com/anomalyco/opencode.git",
@@ -38,7 +39,22 @@ def clear_prompt_cache() -> None:
     _PROMPT_CACHE.clear()
 
 
-def ensure_harness_repo(harness_key: str) -> bool:
+@contextmanager
+def harness_repo_policy(auto_clone: bool):
+    """Keep validation and mock runs from downloading repositories."""
+    previous = os.environ.get("SWORD_AUTO_CLONE_HARNESS")
+    if not auto_clone:
+        os.environ["SWORD_AUTO_CLONE_HARNESS"] = "0"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("SWORD_AUTO_CLONE_HARNESS", None)
+        else:
+            os.environ["SWORD_AUTO_CLONE_HARNESS"] = previous
+
+
+def ensure_harness_repo(harness_key: str, verify: bool = False, update: bool = False) -> bool:
     """Clones the authentic harness repo into third_party and checks out the pinned commit if not present."""
     import subprocess
     repo_url = HARNESS_GIT_REPOS.get(harness_key)
@@ -46,7 +62,26 @@ def ensure_harness_repo(harness_key: str) -> bool:
         return False
     dest_dir = os.path.join(THIRD_PARTY_DIR, harness_key)
     if os.path.isdir(dest_dir):
-        return True
+        if not verify and not update:
+            return True
+        try:
+            head = subprocess.run(
+                ["git", "-C", dest_dir, "rev-parse", "HEAD"], check=True,
+                capture_output=True, text=True, timeout=15,
+            ).stdout.strip()
+            pinned_sha = HARNESS_GIT_COMMITS.get(harness_key)
+            if not pinned_sha or head == pinned_sha:
+                return True
+            if not update or os.environ.get("SWORD_AUTO_CLONE_HARNESS", "1") == "0":
+                return False
+            subprocess.run(["git", "-C", dest_dir, "fetch", "--depth", "1", "origin", pinned_sha],
+                           check=True, timeout=60)
+            # A normal checkout preserves local edits or fails on conflicts.
+            subprocess.run(["git", "-C", dest_dir, "checkout", pinned_sha], check=True, timeout=30)
+            clear_prompt_cache()
+            return ensure_harness_repo(harness_key, verify=True)
+        except (OSError, subprocess.SubprocessError):
+            return False
     if os.environ.get("SWORD_AUTO_CLONE_HARNESS", "1") == "0":
         return False
     os.makedirs(THIRD_PARTY_DIR, exist_ok=True)
@@ -55,9 +90,10 @@ def ensure_harness_repo(harness_key: str) -> bool:
         print(f"[HarnessLoader] Cloning harness {harness_key} from {repo_url}...")
         subprocess.run(["git", "clone", "--depth", "1", repo_url, dest_dir], check=True, timeout=120)
         if pinned_sha:
-            subprocess.run(["git", "-C", dest_dir, "fetch", "--depth", "1", "origin", pinned_sha], check=False, timeout=60)
-            subprocess.run(["git", "-C", dest_dir, "checkout", pinned_sha], check=False, timeout=30)
-        return os.path.isdir(dest_dir)
+            subprocess.run(["git", "-C", dest_dir, "fetch", "--depth", "1", "origin", pinned_sha], check=True, timeout=60)
+            subprocess.run(["git", "-C", dest_dir, "checkout", pinned_sha], check=True, timeout=30)
+        clear_prompt_cache()
+        return ensure_harness_repo(harness_key, verify=True)
     except Exception as e:
         warnings.warn(f"[HarnessLoader] Unable to clone {harness_key}: {e}. Falling back to built-in prompt.", RuntimeWarning)
         return False

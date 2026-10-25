@@ -176,7 +176,8 @@ class TestGRPOBridge(unittest.TestCase):
     def test_mock_vllm_lora_request_dispatch(self):
         mock_output = MagicMock()
         mock_output.prompt_token_ids = [2, 10]
-        mock_resp = MagicMock(text="vllm generated", token_ids=[20, 30], logprobs=None)
+        mock_resp = MagicMock(text="vllm generated", token_ids=[20, 30],
+                              logprobs=[{20: MagicMock(logprob=-0.5)}, {30: MagicMock(logprob=-0.6)}])
         mock_output.outputs = [mock_resp]
 
         mock_llm_instance = MagicMock()
@@ -200,12 +201,13 @@ class TestGRPOBridge(unittest.TestCase):
                 enable_lora=True,
                 device="cpu",
             )
-            bridge.initialize_trainer(model=self.model, tokenizer=self.tokenizer)
+            from sword.finetune import apply_lora_to_model
+            adapter_model = apply_lora_to_model(self.model, r=8, lora_alpha=16, target_moe=False)
+            bridge.initialize_trainer(model=adapter_model, tokenizer=self.tokenizer)
             self.assertTrue(bridge.initialize_vllm())
             self.assertIsNotNone(bridge.vllm_engine)
 
-            # Manually trigger weight sync
-            bridge.weight_sync.sync_to_vllm(bridge.trainer_model)
+            # Initial adapter must be synchronized before the first rollout.
             self.assertEqual(bridge.weight_sync.policy_version, 1)
 
             # Generate rollouts and verify LoRARequest was passed

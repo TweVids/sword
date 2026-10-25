@@ -26,7 +26,9 @@ except Exception:
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-from sword.b_model import ModelBJudge, ModelBJudgeConfig
+from sword.b_model import ModelBJudge, model_b_config
+from sword.defaults import DEFAULT_GRPO_MODEL
+from sword.harness.prompts import harness_repo_policy
 from sword.harness import get_harness, HarnessResult, WorkspaceSandbox
 from sword.reward import MultiMetricRewardScorer, RewardBreakdown
 from sword.checkpoint import CheckpointManager
@@ -65,7 +67,8 @@ class DatasetProblemRow:
 def parse_dataset_row(raw: Dict[str, Any], index: int = 0) -> DatasetProblemRow:
     """Defensively parses any dataset dictionary into a standardized DatasetProblemRow."""
     problem = str(raw.get("problem") or raw.get("question") or raw.get("user") or raw.get("prompt") or "").strip()
-    solution = str(raw.get("solution") or raw.get("answer") or raw.get("assistant") or raw.get("model") or "").strip()
+    solution = next((str(raw[key]).strip() for key in ("solution", "answer", "assistant", "model")
+                     if key in raw and raw[key] is not None and str(raw[key]).strip()), "")
     reasoning_rule = str(raw.get("reasoning_rule") or raw.get("reasoning") or "").strip()
     answer_rule = str(raw.get("answer_rule") or "").strip()
 
@@ -197,7 +200,7 @@ def load_dataset_records(dataset_spec: Union[str, List[Any], Dict[str, Any]], hf
 
 def run_long_train(
     dataset: Union[str, List[Any], Dict[str, Any]] = "math-ai/TemplateGSM",
-    model: str = "Qwen/Qwen3.5-0.8B",
+    model: str = DEFAULT_GRPO_MODEL,
     B_model_port: int = 11343,
     custom_checkpoint_save: bool = True,
     is_save_and_upload_checkpoint: bool = True,
@@ -211,6 +214,7 @@ def run_long_train(
     score_logs: bool = True,
     auto_unload_B_model: bool = True,
     B_model_keep_alive: str = "5m",
+    b_model: bool = True,
     **kwargs,
 ) -> Dict[str, Any]:
     """
@@ -220,6 +224,7 @@ def run_long_train(
     """
     args = Argument or {}
     lora_conf = lora_cfg or {}
+    effective_mock = bool(kwargs.get("mock_test", False) or model in ("dummy", "test_model", "mock"))
 
     steps = int(args.get("steps") or args.get("max_steps") or 200)
     lr = float(args.get("lr") or args.get("learning_rate") or 5e-6)
@@ -287,17 +292,17 @@ def run_long_train(
             records = uncompleted_records
 
     # 3. Model B Judge & Scorer Initialization
-    b_judge_config = ModelBJudgeConfig(
-        port=B_model_port,
-        host=kwargs.get("B_model_host", "127.0.0.1"),
-        model_name=kwargs.get("B_model_name", "gpt-oss:120b"),
-        num_predict=int(kwargs.get("B_model_num_predict", 1024)),
-        reasoning=kwargs.get("B_model_thinking", kwargs.get("B_model_reasoning", True)),
-        show_thinking=bool(kwargs.get("B_model_show_thinking", False)),
-        auto_unload=auto_unload_B_model,
-        keep_alive_during_eval=B_model_keep_alive,
+    judge_options = {**kwargs, "mock_test": effective_mock}
+    b_judge_config = model_b_config(
+        B_model_port, auto_unload=auto_unload_B_model, keep_alive=B_model_keep_alive, **judge_options,
     )
-    b_judge = ModelBJudge(config=b_judge_config)
+    b_judge = ModelBJudge(config=b_judge_config) if b_model else None
+    if b_judge is not None and effective_mock:
+        b_judge._memory_ready = False
+        b_judge.config.auto_unload = False
+    if b_judge is not None and b_judge_config.auto_setup:
+        # Download before allocating trainer VRAM; inference loads only in the score phase.
+        b_judge.ensure_ready()
     reward_scorer = MultiMetricRewardScorer(b_model_judge=b_judge)
 
     # 4. GRPO Bridge Setup
@@ -307,6 +312,13 @@ def run_long_train(
         max_model_len=max_seq_len,
         max_new_tokens=max_new_tokens,
         micro_batch_size=micro_batch_size,
+        temperature=float(args.get("temperature", 0.7)),
+        top_p=float(args.get("top_p", 0.9)),
+        chunk_size=int(args.get("chunk_size", 512)),
+        enable_vllm_sleep=bool(kwargs.get("enable_vllm_sleep", True)),
+        offload_trainer_during_rollout=bool(kwargs.get("offload_trainer_during_rollout", False)),
+        vllm_gpu_utilization=float(kwargs.get("vllm_gpu_utilization", 0.40)),
+        adapter_sync_dir=os.path.join(output_dir, "rollout_adapters"),
         lora_r=int(lora_conf.get("r", 16)),
         lora_alpha=int(lora_conf.get("lora_alpha", 32)),
         lora_dropout=float(lora_conf.get("lora_dropout", 0.0)),
@@ -317,13 +329,19 @@ def run_long_train(
         num_speculative_tokens=int(kwargs.get("num_speculative_tokens", 4)),
         ngram_prompt_lookup_max=int(kwargs.get("ngram_prompt_lookup_max", 4)),
         hf_overrides=kwargs.get("hf_overrides"),
+        load_in_4bit=bool(kwargs.get("load_in_4bit", False)),
+        load_in_8bit=bool(kwargs.get("load_in_8bit", False)),
+        hf_token=HF_TOKEN, model_cache_dir=kwargs.get("model_cache_dir"),
+        model_revision=kwargs.get("model_revision"),
+        local_files_only=bool(kwargs.get("local_files_only", False)),
+        require_vllm=bool(kwargs.get("require_vllm", False)),
         device=device,
     )
     bridge = GRPOBridge(config=bridge_config)
     bridge.initialize_trainer(
         model=kwargs.get("trainer_model"),
         tokenizer=kwargs.get("tokenizer"),
-        mock_test=bool(kwargs.get("mock_test", False)),
+        mock_test=effective_mock,
     )
 
     trainable_params = [p for p in bridge.trainer_model.parameters() if p.requires_grad]
@@ -341,6 +359,7 @@ def run_long_train(
                 optimizer=optimizer,
             )
             start_step = res_info["step"]
+            bridge.global_step = start_step
             print(f"[*] Resumed at step {start_step} ({res_info['matched_keys']} adapter keys matched).")
         except Exception as e_res:
             print(f"[Sword] Resume notice: {e_res}. Continuing with fresh state.")
@@ -349,6 +368,7 @@ def run_long_train(
     bridge.initialize_vllm()
 
     reward_history_logs: List[Dict[str, Any]] = []
+    step_metrics: List[Dict[str, Any]] = []
     visited_row_hashes = set()
     current_step = start_step
     completed_successfully = False
@@ -372,22 +392,22 @@ def run_long_train(
 
                 try:
                     # Rollout Phase with authentic harness prompt injection and token-budget guard
-                    prompt_token_budget = max(128, max_seq_len - max_new_tokens)
-                    rollout_prompt = (
-                        harness.format_prompt(
-                            current_row.problem,
-                            max_tokens=prompt_token_budget,
-                            tokenizer=getattr(bridge, "tokenizer", None),
+                    prompt_token_budget = max(1, max_seq_len - max_new_tokens)
+                    with harness_repo_policy(auto_clone=not effective_mock):
+                        rollout_prompt = (
+                            harness.format_prompt(
+                                current_row.problem,
+                                max_tokens=prompt_token_budget,
+                                tokenizer=getattr(bridge, "tokenizer", None),
+                            )
+                            if harness is not None else current_row.problem
                         )
-                        if harness is not None
-                        else current_row.problem
-                    )
                     prompts = [rollout_prompt]
                     batch = bridge.generate_rollouts(prompts)
 
-                    # Scoring Phase with Model B memory preparation
-                    b_judge.prepare_for_eval()
+                    # Complete all harness generation before loading the judge.
                     step_scores = []
+                    scoring_inputs = []
 
                     for item in batch.items:
                         tools_called = 0
@@ -408,29 +428,21 @@ def run_long_train(
                             tools_called = h_res.tools_called
                             tools_succeeded = h_res.tools_succeeded
 
-                            # Synchronize tokens and logprobs with updated multi-turn response text
-                            if h_res.final_text and h_res.final_text != item.response_text:
-                                item.response_text = h_res.final_text
-                                if hasattr(bridge, "tokenizer") and bridge.tokenizer is not None:
-                                    try:
-                                        tok_out = bridge.tokenizer(item.response_text, add_special_tokens=False)
-                                        r_ids = tok_out.get("input_ids", []) if isinstance(tok_out, dict) else getattr(tok_out, "input_ids", [])
-                                        if isinstance(r_ids, torch.Tensor):
-                                            r_ids = r_ids.squeeze().tolist()
-                                        if isinstance(r_ids, int):
-                                            r_ids = [r_ids]
-                                        item.response_token_ids = list(r_ids)
-                                        if len(item.rollout_logprobs) < len(item.response_token_ids):
-                                            item.rollout_logprobs.extend([0.0] * (len(item.response_token_ids) - len(item.rollout_logprobs)))
-                                        elif len(item.rollout_logprobs) > len(item.response_token_ids):
-                                            item.rollout_logprobs = item.rollout_logprobs[:len(item.response_token_ids)]
-                                    except Exception:
-                                        pass
+                            # Use final harness text as the outcome reward while keeping
+                            # the exact sampled first-turn tokens for policy gradients.
+                            candidate_response = h_res.final_text or item.response_text
+                        else:
+                            candidate_response = item.response_text
+                        scoring_inputs.append((item, candidate_response, tools_called, tools_succeeded))
 
+                    bridge.vram_mgr.enter_score_phase(bridge.vllm_engine)
+                    if b_judge is not None and not effective_mock:
+                        b_judge.prepare_for_eval()
+                    for item, candidate_response, tools_called, tools_succeeded in scoring_inputs:
                         score_breakdown = reward_scorer.score(
                             problem=current_row.problem,
                             solution=current_row.solution,
-                            candidate_response=item.response_text,
+                            candidate_response=candidate_response,
                             reasoning_rule=current_row.reasoning_rule,
                             answer_rule=current_row.answer_rule,
                             can_be_verify=current_row.can_be_verify,
@@ -451,9 +463,14 @@ def run_long_train(
                             })
 
                     # Release Model B VRAM before training forward / backward pass
-                    b_judge.release_after_eval()
+                    if b_judge is not None:
+                        b_judge.release_after_eval()
 
                     # Calculate group-centered advantages
+                    if bridge.config.drop_incomplete_groups:
+                        batch.filter_valid_groups(batch.concurrency_g)
+                    if not batch.items:
+                        raise RuntimeError("No complete rollout groups available for training")
                     groups: Dict[int, List[RolloutItem]] = {}
                     for it in batch.items:
                         groups.setdefault(it.group_id, []).append(it)
@@ -475,17 +492,26 @@ def run_long_train(
                     is_oom = "out of memory" in str(e_oom).lower() or isinstance(e_oom, torch.cuda.OutOfMemoryError)
                     if is_oom and attempt == 0:
                         print(f"\n[Sword Alert] CUDA Out-of-Memory intercepted at step {step_idx} (attempt 1). Clearing cache and retrying...")
+                        # Release failed autograd graphs and gradients before retry.
+                        optimizer.zero_grad(set_to_none=True)
+                        e_oom.__traceback__ = None
+                        bridge.config.micro_batch_size = max(1, bridge.config.micro_batch_size // 2)
+                        bridge.loss_fn.chunk_size = max(1, bridge.loss_fn.chunk_size // 2)
                         gc.collect()
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
-                        b_judge.release_after_eval()
+                        if b_judge is not None:
+                            b_judge.release_after_eval()
                         continue
                     elif is_oom:
                         print(f"\n[Sword Alert] CUDA Out-of-Memory persisted at step {step_idx}. Securing emergency checkpoint...")
+                        optimizer.zero_grad(set_to_none=True)
+                        e_oom.__traceback__ = None
                         gc.collect()
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
-                        b_judge.release_after_eval()
+                        if b_judge is not None:
+                            b_judge.release_after_eval()
 
                         # Emergency save: NEVER mark incomplete dataset as completed
                         emergency_ckpt = ckpt_mgr.save_checkpoint(
@@ -511,6 +537,8 @@ def run_long_train(
 
             visited_row_hashes.add(current_row.row_hash)
             current_step = step_idx
+            if kwargs.get("return_step_metrics", False):
+                step_metrics.append(dict(metrics))
 
             # Logging
             if show_detail_logs:
@@ -546,6 +574,9 @@ def run_long_train(
     except KeyboardInterrupt:
         print("\n[Sword] Training interrupted by user. Saving current checkpoint...")
     finally:
+        if b_judge is not None:
+            b_judge.release_after_eval()
+        bridge.weight_sync.cleanup()
         # Mark dataset completed ONLY if training truly completed all planned steps and all dataset rows were visited
         all_rows_visited = len(records) > 0 and all(r.row_hash in visited_row_hashes for r in records)
         if completed_successfully and all_rows_visited:
@@ -584,4 +615,15 @@ def run_long_train(
         "total_rows": len(records),
         "dataset_sha256": dataset_sha256,
         "checkpoint_dir": final_ckpt,
+        "rollout_backend": "vllm" if bridge.vllm_engine is not None else "pytorch",
+        "vllm_initialization_error": bridge.vllm_initialization_error,
+        "step_metrics": step_metrics,
+        "b_model": {
+            "enabled": True,
+            "model_name": b_judge.config.model_name,
+            "active_model_name": b_judge.active_model_name,
+            "evaluation_source": b_judge.last_evaluation_source,
+            "evaluation_counts": dict(b_judge.evaluation_counts),
+            "last_error": b_judge.last_error,
+        } if b_judge is not None else {"enabled": False, "evaluation_counts": {}},
     }

@@ -282,6 +282,7 @@ class InProcessRolloutEngine:
             )
 
         response_ids = outputs[:, prompt_len:]
+        self.last_rollout_tokens = (input_ids[0].tolist(), response_ids[0].tolist())
         decoded_response = self.tokenizer.decode(response_ids[0], skip_special_tokens=True)
 
         del inputs, outputs, response_ids, input_ids, attention_mask
@@ -495,6 +496,34 @@ class MathScorer:
         s = re.sub(r"\.0+(?=[^\d]|$)", "", s)
         return s
 
+    @staticmethod
+    def _narrow_final_answer(answer: str, tag_audit: Dict[str, Any]) -> str:
+        """
+        BUG H1 fix helper. Restricts accuracy matching to the final-answer
+        region when the thinking-tag verifier could not separate answer from
+        trace (no/malformed tags). Preference order:
+          1. last \\boxed{...} expression,
+          2. trailing "final answer( is|:)" / "answer( is|:)" clause,
+          3. the last non-empty sentence of the text.
+        Returns "" when nothing answer-like can be isolated (no match at all,
+        rather than a full-text scan that rewards reference numbers in prose).
+        """
+        if tag_audit.get("valid_thinking_tags"):
+            return answer  # verifier already isolated the final answer
+        boxed = re.findall(r"\\boxed\{([^{}]+)\}", answer)
+        if boxed:
+            return boxed[-1].strip()
+        m_ans = re.search(
+            r"(?:final\s+answer|answer)\s*(?:is\s*:?\s*|\s*:\s*|\s*=\s*)([^\n]+)",
+            answer,
+            re.IGNORECASE,
+        )
+        if m_ans:
+            return m_ans.group(1).strip()
+        # Fallback: last sentence only (never the whole text).
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", answer.strip()) if s.strip()]
+        return sentences[-1] if sentences else ""
+
     def score(
         self,
         problem: str,
@@ -506,30 +535,37 @@ class MathScorer:
     ) -> Dict[str, Any]:
         tag_score, tag_audit, trace, answer = ThinkingFormatVerifier.verify(full_text)
         audit_flags: Dict[str, Any] = {"thinking_tags": tag_audit}
+        # BUG H1 FIX: when the required thinking tags are absent, the verifier
+        # returns the WHOLE text as the answer. Narrow it to the final-answer
+        # region (last boxed expression, or the "answer is ... " clause) so the
+        # reference number can no longer be matched inside reasoning/trace text.
+        answer = self._narrow_final_answer(answer, tag_audit)
 
         norm_ref = self._normalize_math(reference_answer)
         norm_ans = self._normalize_math(answer)
-        norm_full = self._normalize_math(full_text)
 
         # 1. Ground Truth Accuracy (handles float/integer equivalence, interval notation, and boxed answers)
+        # BUG H1 FIX: matching is restricted to the FINAL answer region only.
+        # We never scan the reasoning trace (`trace`) or the full text
+        # (`full_text`) for the reference number/string: an intermediate value
+        # or a quoted ground truth inside the trace must NOT earn the reward.
         is_match = False
         try:
             ref_num = float(norm_ref)
-            ans_numbers = [float(x) for x in re.findall(r"[-+]?(?:\d*\.\d+|\d+)", answer)]
-            if any(abs(n - ref_num) < 1e-4 for n in ans_numbers):
+            # Only numbers appearing in the final answer section (post-think,
+            # or the whole normalized answer when boxed extraction applied).
+            final_answer_numbers = [float(x) for x in re.findall(r"[-+]?(?:\d*\.\d+|\d+)", answer)]
+            if any(abs(n - ref_num) < 1e-4 for n in final_answer_numbers):
                 is_match = True
-            else:
-                boxed_nums = [float(x) for x in re.findall(r"[-+]?(?:\d*\.\d+|\d+)", norm_ans)]
-                if any(abs(n - ref_num) < 1e-4 for n in boxed_nums):
-                    is_match = True
         except (ValueError, TypeError):
             pass
 
         if not is_match:
-            is_match = (
+            # String equality / containment against the FINAL ANSWER only —
+            # never against the full text (norm_full matching removed by BUG H1 fix).
+            is_match = bool(norm_ref) and (
                 (norm_ref in norm_ans)
                 or (norm_ans == norm_ref)
-                or (norm_ref and norm_ref in norm_full)
                 or (reference_answer.strip().lower() in answer.lower())
             )
         accuracy_score = 0.35 if is_match else -0.40
@@ -832,6 +868,8 @@ class ExplanationScorer:
     ) -> Dict[str, Any]:
         tag_score, tag_audit, trace, answer = ThinkingFormatVerifier.verify(full_text)
         audit_flags: Dict[str, Any] = {"thinking_tags": tag_audit}
+        # BUG H1 fix: same final-answer narrowing as MathScorer (see above).
+        answer = MathScorer._narrow_final_answer(answer, tag_audit)
 
         # -------------------------------------------------------------
         # 1. THINKING TRACE RULES ("Stolen from reasoning content")
@@ -1065,7 +1103,6 @@ class ExplanationScorer:
         # -------------------------------------------------------------
         norm_ref = self._normalize_math(reference_answer)
         norm_ans = self._normalize_math(answer)
-        norm_full = self._normalize_math(full_text)
 
         is_concept_match = False
         try:
@@ -1077,10 +1114,11 @@ class ExplanationScorer:
             pass
 
         if not is_concept_match:
-            is_concept_match = (
+            # BUG H1 fix: no matching against the full text / trace — accuracy
+            # is judged on the final-answer region only.
+            is_concept_match = bool(norm_ref) and (
                 (norm_ref in norm_ans)
                 or (norm_ans == norm_ref)
-                or (norm_ref and norm_ref in norm_full)
                 or (reference_answer.strip().lower() in answer.lower())
             )
 
@@ -1219,10 +1257,7 @@ def compute_gdpo_advantages(
 # 📉  MEMORY-EFFICIENT CHUNKED GRPO SURROGATE LOSS
 # =====================================================================
 class ChunkedGRPOLoss(nn.Module):
-    """
-    Unsloth-style sequence chunking cross-entropy.
-    Prevents materializing the massive [Batch, SeqLen, Vocab] tensor in VRAM.
-    """
+    """Standalone GRPO using the shared checkpointed token statistics."""
 
     def __init__(self, clip_eps: float = 0.2, kl_coeff: float = 0.04, chunk_size: int = 512):
         super().__init__()
@@ -1230,134 +1265,33 @@ class ChunkedGRPOLoss(nn.Module):
         self.kl_coeff = kl_coeff
         self.chunk_size = chunk_size
 
-    def forward(
-        self,
-        model: nn.Module,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        prompt_lengths: List[int],
-        advantages: torch.Tensor,
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        batch_size, seq_len = input_ids.shape
-        device = input_ids.device
+    def forward(self, model, input_ids, attention_mask, prompt_lengths, advantages):
+        from sword.rl.loss import ChunkedGRPOLoss as PolicyLoss
+        return PolicyLoss(self.clip_eps, self.kl_coeff, self.chunk_size).forward_chunked(
+            model, input_ids, attention_mask, prompt_lengths, advantages)
 
-        # Mask response tokens only
-        response_mask = torch.zeros_like(input_ids, dtype=torch.bool)
-        for i, p_len in enumerate(prompt_lengths):
-            response_mask[i, p_len:] = attention_mask[i, p_len:].bool()
-
-        outputs = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            use_cache=False,
-            return_dict=True,
-        )
-        logits = outputs.logits
-
-        targets = input_ids[:, 1:]
-        target_mask = response_mask[:, 1:]
-        shift_logits = logits[:, :-1, :]
-
-        num_tokens = shift_logits.size(1)
-        policy_logprobs_list = []
-
-        # Iterate over sequence in chunks (chunk_size=512)
-        for start_idx in range(0, num_tokens, self.chunk_size):
-            end_idx = min(start_idx + self.chunk_size, num_tokens)
-            chunk_logits = shift_logits[:, start_idx:end_idx, :].reshape(-1, shift_logits.size(-1))
-            chunk_targets = targets[:, start_idx:end_idx].reshape(-1)
-
-            token_logprobs = -F.cross_entropy(
-                chunk_logits.float(),
-                chunk_targets,
-                reduction="none",
-            ).reshape(batch_size, end_idx - start_idx)
-            policy_logprobs_list.append(token_logprobs)
-
-        policy_logprobs = torch.cat(policy_logprobs_list, dim=1)
-        old_logprobs = policy_logprobs.detach()
-
-        # Clipped surrogate objective
-        log_ratio = policy_logprobs - old_logprobs
-        ratio = torch.exp(log_ratio)
-        adv = advantages.unsqueeze(-1).to(ratio.device)
-
-        surr1 = ratio * adv
-        surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * adv
-        policy_loss_per_token = -torch.min(surr1, surr2)
-
-        valid_tokens = target_mask.float().sum().clamp(min=1.0)
-        policy_loss = (policy_loss_per_token * target_mask.float()).sum() / valid_tokens
-
-        metrics = {
-            "grpo_loss": round(policy_loss.item(), 5),
-            "mean_ratio": round(ratio.mean().item(), 4),
-            "mean_advantage": round(advantages.mean().item(), 4),
-        }
-        return policy_loss, metrics
-
-    def forward_single(
-        self,
-        model: nn.Module,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        prompt_length: int,
-        advantage: float,
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """
-        Micro-batch loss for a single rollout sequence (batch_size=1).
-        Disables use_cache and only computes cross entropy on the response tokens
-        in chunks, keeping activation VRAM minimal (< 1.5 GB).
-        """
-        outputs = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            use_cache=False,
-            return_dict=True,
-        )
-        logits = outputs.logits  # [1, seq_len, vocab_size]
-
-        targets = input_ids[:, 1:]
-        shift_logits = logits[:, :-1, :]
-
-        resp_start = max(0, prompt_length - 1)
-        resp_logits = shift_logits[:, resp_start:, :]
-        resp_targets = targets[:, resp_start:]
-
-        if resp_targets.numel() == 0:
-            return torch.tensor(0.0, device=input_ids.device, requires_grad=True), {"grpo_loss": 0.0}
-
-        resp_logits_flat = resp_logits.reshape(-1, resp_logits.size(-1))
-        resp_targets_flat = resp_targets.reshape(-1)
-        num_tokens = resp_targets_flat.size(0)
-
-        token_logprobs_list = []
-        for s_idx in range(0, num_tokens, self.chunk_size):
-            e_idx = min(s_idx + self.chunk_size, num_tokens)
-            c_logits = resp_logits_flat[s_idx:e_idx].float()
-            c_targets = resp_targets_flat[s_idx:e_idx]
-            c_logprobs = -F.cross_entropy(c_logits, c_targets, reduction="none")
-            token_logprobs_list.append(c_logprobs)
-
-        policy_logprobs = torch.cat(token_logprobs_list, dim=0)
-        old_logprobs = policy_logprobs.detach()
-
-        log_ratio = policy_logprobs - old_logprobs
-        ratio = torch.exp(log_ratio)
-        adv_tensor = torch.tensor(advantage, dtype=torch.float32, device=input_ids.device)
-
-        surr1 = ratio * adv_tensor
-        surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * adv_tensor
-        policy_loss = -torch.min(surr1, surr2).mean()
-
-        token_nll = -policy_logprobs.mean().item()
-        pg_loss = -(policy_logprobs * adv_tensor).mean().item()
-
-        return policy_loss, {
-            "grpo_loss": round(policy_loss.item(), 5),
-            "nll": round(token_nll, 4),
-            "pg_loss": round(pg_loss, 4),
-        }
+    def forward_single(self, model, input_ids, attention_mask, prompt_length, advantage):
+        from sword.rl.policy import token_statistics
+        from sword.rl.loss import ChunkedGRPOLoss as PolicyLoss
+        from sword.rl.loss import compute_reference_logprobs
+        logprobs, _ = token_statistics(model, input_ids, attention_mask, self.chunk_size)
+        # BUG H4 fix: one fresh update per rollout -> the previous sampling
+        # policy IS the current policy before this gradient step, so supply
+        # the detached baseline explicitly instead of relying on the loss
+        # defaulting old_logprobs to policy_logprobs.detach().
+        old_logprobs = logprobs.detach()
+        # BUG H4 fix: frozen reference logprobs (adapters disabled) so
+        # kl_coeff=0.04 actually anchors drift instead of silently staying 0.
+        ref_logprobs = compute_reference_logprobs(model, input_ids, attention_mask, self.chunk_size)
+        mask = attention_mask[:, 1:].bool().clone()
+        mask[:, :max(0, prompt_length - 1)] = False
+        advantages = torch.tensor([advantage], dtype=torch.float32, device=input_ids.device)
+        loss, metrics = PolicyLoss(self.clip_eps, self.kl_coeff, self.chunk_size)._compute_surrogate_loss(
+            logprobs, mask, advantages, old_logprobs=old_logprobs, ref_logprobs=ref_logprobs)
+        valid_lp = logprobs.masked_select(mask)
+        metrics["nll"] = -valid_lp.mean().item() if valid_lp.numel() else 0.0
+        metrics["pg_loss"] = metrics["nll"] * advantage
+        return loss, metrics
 
 
 # =====================================================================
@@ -2815,6 +2749,7 @@ def run_standalone_math_grpo(
 
         rollout_results = []
         raw_rollouts = []
+        rollout_token_ids = []
 
         for r_idx in range(num_rollouts):
             t_ro_start = time.perf_counter()
@@ -2827,6 +2762,7 @@ def run_standalone_math_grpo(
                 temperature=0.8,
             )
             raw_rollouts.append(text)
+            rollout_token_ids.append(getattr(engine, "last_rollout_tokens", None))
             t_ro_elapsed = time.perf_counter() - t_ro_start
             token_count = len(tokenizer.encode(text, add_special_tokens=False))
 
@@ -2911,11 +2847,15 @@ def run_standalone_math_grpo(
                 model.config.use_cache = False
             optimizer.zero_grad()
 
-            p_ids = tokenizer.encode(problem_text, add_special_tokens=False)
+            p_ids = tokenizer.encode(formatted_prompt, add_special_tokens=False)
             p_len = len(p_ids)
 
             for i, res in enumerate(rollout_results):
-                r_ids = tokenizer.encode(res["full_text"], add_special_tokens=False)
+                sampled_ids = rollout_token_ids[i]
+                if sampled_ids is None:
+                    raise RuntimeError("GRPO requires exact prompt and response token IDs from the rollout engine")
+                p_ids, r_ids = sampled_ids
+                p_len = len(p_ids)
                 combo = p_ids + r_ids
                 cur_input = torch.tensor([combo], dtype=torch.long, device=device)
                 cur_mask = torch.ones_like(cur_input)
@@ -2938,7 +2878,8 @@ def run_standalone_math_grpo(
 
             grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             grad_norm_val = float(grad_norm)
-            optimizer.step()
+            from sword.rl.policy import safe_optimizer_step
+            safe_optimizer_step(optimizer, trainable_params)
             print(" done")
         else:
             print(f"[Step {step:03d}/{steps:03d} | {step_effort.upper():<6}] 🔍 Study Mode: Evaluated {num_rollouts} rollouts (Backprop skipped)")

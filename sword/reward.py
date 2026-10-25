@@ -50,14 +50,14 @@ class MathVerifier:
             parts = cleaned.split("</think>", 1)
             after_think = parts[1].strip()
             if after_think:
-                return after_think
+                cleaned = after_think
 
         # 2. Answer after <channel|>
         if "<channel|>" in cleaned:
             parts = cleaned.split("<channel|>", 1)
             after_ch = parts[1].strip()
             if after_ch:
-                return after_ch
+                cleaned = after_ch
 
         # 3. Boxed answer \boxed{...}
         m_box = re.findall(r"\\boxed\{([^{}]+)\}", cleaned)
@@ -65,9 +65,9 @@ class MathVerifier:
             return m_box[-1].strip()
 
         # 4. "The answer is ..."
-        m_ans = re.search(r"(?:the\s+answer\s+is\s*:?|final\s+answer\s*:?)\s*([^\n\.]+)", cleaned, re.IGNORECASE)
+        m_ans = re.search(r"(?:the\s+answer\s+is\s*:?|final\s+answer\s*:?)\s*([^\n]+)", cleaned, re.IGNORECASE)
         if m_ans:
-            return m_ans.group(1).strip()
+            return m_ans.group(1).strip().rstrip(".")
 
         return cleaned
 
@@ -82,14 +82,29 @@ class MathVerifier:
 
         # Check numeric equality
         try:
-            cand_nums = [float(x) for x in re.findall(r"[-+]?(?:\d*\.\d+|\d+)", cand_str)]
-            exp_nums = [float(x) for x in re.findall(r"[-+]?(?:\d*\.\d+|\d+)", exp_str)]
+            number_pattern = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
+            cand_nums = [float(x) for x in re.findall(number_pattern, cand_str)]
+            exp_nums = [float(x) for x in re.findall(number_pattern, exp_str)]
             if cand_nums and exp_nums and len(cand_nums) == len(exp_nums):
                 if all(abs(c - e) < 1e-4 for c, e in zip(cand_nums, exp_nums)):
                     return True
                 # Check sorted roots equality (e.g. x1 = 1, x2 = 2)
                 if sorted(cand_nums) == sorted(exp_nums):
                     return True
+            # BUG E1 fix: when the expected (or candidate) answer reduces to a
+            # single value, accept a match wherever it appears — extra
+            # parenthetical / unit numbers in prose must not invalidate a
+            # numerically correct answer (count mismatch previously forced a
+            # hard False for correct solutions).
+            if cand_nums and exp_nums and (len(exp_nums) == 1 or len(cand_nums) == 1):
+                if len(exp_nums) == 1:
+                    e = exp_nums[0]
+                    if any(abs(c - e) < 1e-4 for c in cand_nums):
+                        return True
+                if len(cand_nums) == 1:
+                    c = cand_nums[0]
+                    if any(abs(c - e) < 1e-4 for e in exp_nums):
+                        return True
         except Exception:
             pass
 

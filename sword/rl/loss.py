@@ -13,6 +13,7 @@ from typing import Dict, Any, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from .policy import token_statistics
 
 
 DEFAULT_COLUMN_MAPPING: Dict[str, str] = {
@@ -141,14 +142,14 @@ class ChunkedGRPOLoss(nn.Module):
             elif hasattr(item, "column_scores") and item.column_scores:
                 comps = item.column_scores
             elif isinstance(item, dict):
-                comps = item
+                comps = item.get("component_scores") or item.get("column_scores") or item
             else:
                 total_r = getattr(item, "total_reward", float(item) if isinstance(item, (int, float)) else 0.0)
                 comps = {"ground_truth": total_r}
 
             col_totals = {"accuracy": 0.0, "formatting": 0.0, "efficiency": 0.0, "safety": 0.0}
             for k, val in comps.items():
-                target_col = mapping.get(k, "accuracy")
+                target_col = k if k in col_totals else mapping.get(k, "accuracy")
                 if target_col not in col_totals:
                     col_totals[target_col] = 0.0
                 col_totals[target_col] += float(val)
@@ -158,7 +159,7 @@ class ChunkedGRPOLoss(nn.Module):
         if G == 1:
             s_val = rollout_columns[0]["safety"]
             adv = [round(s_val, 4)] if s_val < 0 else [0.0]
-            return adv, {col: [adv[0]] for col in ["accuracy", "formatting", "efficiency", "safety"]}
+            return adv, {"accuracy": [0.0], "formatting": [0.0], "efficiency": [0.0], "safety": [s_val]}
 
         # 2. Decoupled normalization per channel
         norm_advs: Dict[str, List[float]] = {}
@@ -221,69 +222,13 @@ class ChunkedGRPOLoss(nn.Module):
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
 
-        # 1. Forward pass through base backbone to obtain final hidden states
-        # (LM Head is applied in chunks to conserve VRAM)
-        lm_head = getattr(model, "lm_head", None)
-        base_model = getattr(model, "model", model)
-
         # Mask response tokens only for policy loss calculation
         response_mask = torch.zeros_like(input_ids, dtype=torch.bool)
         for i, p_len in enumerate(prompt_lengths):
             response_mask[i, p_len:] = attention_mask[i, p_len:].bool()
 
-        # If model has custom forward or standard transformer forward
-        outputs = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-            return_dict=True,
-        )
-
-        if hasattr(outputs, "hidden_states") and outputs.hidden_states is not None:
-            hidden_states = outputs.hidden_states[-1]
-        elif hasattr(outputs, "last_hidden_state"):
-            hidden_states = outputs.last_hidden_state
-        else:
-            # Output already has logits
-            logits = outputs.logits
-            return self._compute_loss_from_logits(
-                logits, input_ids, response_mask, advantages, old_logprobs, ref_logprobs
-            )
-
-        # 2. Chunked logprob extraction using lm_head
-        # Target tokens are input_ids shifted by 1
-        targets = input_ids[:, 1:]
         target_mask = response_mask[:, 1:]
-        h_states = hidden_states[:, :-1, :]  # [B, L-1, H]
-        num_tokens = h_states.size(1)
-
-        policy_logprobs_list = []
-
-        # Iterate over sequence in chunks
-        for start_idx in range(0, num_tokens, self.chunk_size):
-            end_idx = min(start_idx + self.chunk_size, num_tokens)
-            chunk_h = h_states[:, start_idx:end_idx, :]  # [B, chunk_len, H]
-            chunk_targets = targets[:, start_idx:end_idx]  # [B, chunk_len]
-
-            # Unsloth-style memory-efficient fused token logprob computation:
-            # Mathematically: log_softmax(logits)[target] == -cross_entropy(logits, target)
-            # Fused PyTorch C++/CUDA kernel eliminates materializing full [B, chunk_len, V] float32 tensor in VRAM!
-            chunk_b, chunk_l, chunk_h_dim = chunk_h.shape
-            chunk_h_flat = chunk_h.reshape(-1, chunk_h_dim)
-            if lm_head is not None:
-                chunk_logits = lm_head(chunk_h_flat)
-            else:
-                chunk_logits = F.linear(chunk_h_flat, model.get_output_embeddings().weight)
-
-            token_logprobs = -F.cross_entropy(
-                chunk_logits.float(),
-                chunk_targets.reshape(-1),
-                reduction="none",
-            ).reshape(chunk_b, chunk_l)
-            policy_logprobs_list.append(token_logprobs)
-
-        # Concatenate across chunks -> [B, L-1]
-        policy_logprobs = torch.cat(policy_logprobs_list, dim=1)
+        policy_logprobs, _ = token_statistics(model, input_ids, attention_mask, self.chunk_size)
 
         return self._compute_surrogate_loss(
             policy_logprobs, target_mask, advantages, old_logprobs, ref_logprobs
@@ -331,14 +276,17 @@ class ChunkedGRPOLoss(nn.Module):
             # First pass: old_logprobs detached from policy
             old_logprobs = policy_logprobs.detach()
 
-        # Align lengths if needed
-        min_len = min(policy_logprobs.size(1), old_logprobs.size(1), target_mask.size(1))
+        if old_logprobs.shape != policy_logprobs.shape or target_mask.shape != policy_logprobs.shape:
+            raise ValueError("old_logprobs and response mask must align with shifted next-token logprobs")
+        if ref_logprobs is not None and ref_logprobs.shape != policy_logprobs.shape:
+            raise ValueError("reference logprobs must align with shifted next-token logprobs")
+        min_len = policy_logprobs.size(1)
         p_logp = policy_logprobs[:, :min_len]
-        old_logp = old_logprobs[:, :min_len]
+        old_logp = old_logprobs[:, :min_len].detach()
         mask = target_mask[:, :min_len].float()
 
         # Ratio: r = exp(log_pi - log_pi_old)
-        log_ratio = p_logp - old_logp
+        log_ratio = (p_logp - old_logp).masked_fill(~target_mask.bool(), 0.0)
         ratio = torch.exp(log_ratio)
 
         # Reshape advantages to broadcast with tokens: [Batch, 1]
@@ -355,9 +303,10 @@ class ChunkedGRPOLoss(nn.Module):
         # KL divergence penalty against reference model if available
         kl_div = torch.tensor(0.0, device=policy_loss.device)
         if ref_logprobs is not None:
-            ref_logp = ref_logprobs[:, :min_len]
+            ref_logp = ref_logprobs[:, :min_len].detach()
             # Schulman unbiased estimator: exp(log_ref - log_pi) - (log_ref - log_pi) - 1
-            kl_per_token = torch.exp(ref_logp - p_logp) - (ref_logp - p_logp) - 1.0
+            log_diff = (ref_logp - p_logp).masked_fill(~target_mask.bool(), 0.0)
+            kl_per_token = torch.expm1(log_diff) - log_diff
             kl_div = (kl_per_token * mask).sum() / valid_tokens
 
         total_loss = policy_loss + (self.kl_coeff * kl_div)
@@ -366,7 +315,7 @@ class ChunkedGRPOLoss(nn.Module):
             "grpo_loss": round(total_loss.item(), 5),
             "policy_loss": round(policy_loss.item(), 5),
             "kl_div": round(kl_div.item(), 5),
-            "mean_ratio": round(ratio.mean().item(), 4),
+            "mean_ratio": round(ratio.masked_select(target_mask.bool()).mean().item() if target_mask.any() else 1.0, 4),
             "mean_advantage": round(advantages.mean().item(), 4),
         }
 
@@ -376,3 +325,37 @@ class ChunkedGRPOLoss(nn.Module):
 # Module-level convenient aliases
 compute_gdpo_advantages = ChunkedGRPOLoss.compute_gdpo_advantages
 compute_group_advantages = ChunkedGRPOLoss.compute_group_advantages
+
+
+def compute_reference_logprobs(
+    model,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    chunk_size: int = 512,
+) -> Optional[torch.Tensor]:
+    """
+    BUG H4 fix helper: frozen-reference logprobs for the KL anchor.
+
+    Runs token_statistics with the trainable adapters disabled (PEFT /
+    unsloth `disable_adapter` context), so the returned logprobs come from
+    the base policy, not the currently-trained LoRA. Returns None when the
+    model does not support adapter disabling (e.g. full fine-tune or a mock),
+    in which case callers must keep the KL term off and the training drift
+    unanchored (same as before this fix).
+    Shape: [Batch, SeqLen-1], aligned with token_statistics' shifted columns.
+    """
+    disable = getattr(model, "disable_adapter", None)
+    if disable is None:
+        return None
+    from .policy import token_statistics
+
+    was_training = model.training
+    model.eval()
+    try:
+        with disable():
+            with torch.no_grad():
+                ref, _ = token_statistics(model, input_ids, attention_mask, chunk_size)
+    finally:
+        if was_training:
+            model.train()
+    return ref

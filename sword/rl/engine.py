@@ -11,6 +11,7 @@ Coordinates Sword Fast Rollout Serving (188+ tokens/s) + Unsloth Memory-Efficien
 import os
 import gc
 import json
+import inspect
 import time
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Union
@@ -25,6 +26,7 @@ from .scorer import PrimaryScorer
 from .verifier import ExternalVerifier
 from .moe_monitor import MoERouterMonitor
 from .loss import ChunkedGRPOLoss
+from .policy import safe_optimizer_step
 from ..server import FastQwen3MoeServer, FastMoEServer, FastServer
 from ..finetune import apply_lora_to_model
 from ..trainer import (
@@ -109,7 +111,7 @@ class GRPOTrainer:
             self.server = FastLingServer.from_pretrained(
                 model_name_or_path=model_name_or_path,
                 torch_dtype=torch_dtype,
-                device_map="auto" if device == "cuda" else None,
+                device_map="auto" if self.device.startswith("cuda") else None,
                 patch_sword=True,
                 patch_moe=True,
             )
@@ -117,7 +119,7 @@ class GRPOTrainer:
             self.server = FastQwen3MoeServer.from_pretrained(
                 model_name_or_path=model_name_or_path,
                 torch_dtype=torch_dtype,
-                device_map="auto" if device == "cuda" else None,
+                device_map="auto" if self.device.startswith("cuda") else None,
                 max_concurrency=max(batch_size * num_rollouts_per_prompt, 8),
                 max_seq_len=2048,
             )
@@ -232,6 +234,29 @@ class GRPOTrainer:
         """Dynamic dataset registration without stopping the engine ("infinity time")."""
         return self.queue.add_data_source(source_url_or_path)
 
+    def _generate_rollouts(self, prompts: List[str], max_tokens: int):
+        """Use exact backend metadata, or a shared-policy fallback for legacy servers."""
+        if "return_token_ids" in inspect.signature(self.server.generate_rollouts).parameters:
+            return self.server.generate_rollouts(
+                prompts=prompts, num_rollouts_per_prompt=self.num_rollouts_per_prompt,
+                max_new_tokens=max_tokens, temperature=0.8, auto_clear=True,
+                return_logprobs=True, return_token_ids=True,
+            )
+        # Legacy Ling serving exposes decoded text only. Re-tokenizing it cannot
+        # recover sampled EOS tokens or prompt templates, so generate directly.
+        from ..grpo_bridge import FallbackRolloutEngine
+        expanded = [prompt for prompt in prompts for _ in range(self.num_rollouts_per_prompt)]
+        results = FallbackRolloutEngine(self.model, self.tokenizer).generate(
+            expanded, max_new_tokens=max_tokens, temperature=0.8,
+        )
+        grouped, logprobs, metadata = [], [], []
+        for start in range(0, len(results), self.num_rollouts_per_prompt):
+            rows = results[start:start + self.num_rollouts_per_prompt]
+            grouped.append([row["response_text"] for row in rows])
+            logprobs.append([torch.tensor(row["rollout_logprobs"]) for row in rows])
+            metadata.append([(row["prompt_token_ids"], row["response_token_ids"]) for row in rows])
+        return grouped, logprobs, metadata
+
     def step(self) -> Optional[Dict[str, Any]]:
         """
         Executes a single end-to-end GRPO step:
@@ -249,7 +274,6 @@ class GRPOTrainer:
             print("[Sword-RL] ⏳ Queue is currently empty, waiting for new problems...")
             return None
 
-        self.global_step += 1
         t_start = time.perf_counter()
 
         all_scored_trajectories: List[List[ScoredTrajectory]] = []
@@ -264,17 +288,12 @@ class GRPOTrainer:
         with torch.no_grad():
             prompts = [prob.user_problem for prob in problems]
             max_tokens_budget = min(self.max_new_tokens, max(prob.effort_tier.max_tokens for prob in problems))
-            rollouts_batch, logprobs_batch = self.server.generate_rollouts(
-                prompts=prompts,
-                num_rollouts_per_prompt=self.num_rollouts_per_prompt,
-                max_new_tokens=max_tokens_budget,
-                temperature=0.8,
-                auto_clear=True,
-                return_logprobs=True,
-            )
+            rollouts_batch, logprobs_batch, token_metadata = self._generate_rollouts(prompts, max_tokens_budget)
 
             for p_idx, prob in enumerate(problems):
                 rollouts = rollouts_batch[p_idx]
+                if len(rollouts) != self.num_rollouts_per_prompt:
+                    raise ValueError("Rollout backend returned an incomplete GRPO group")
                 rollout_lps = logprobs_batch[p_idx] if logprobs_batch is not None else [None] * len(rollouts)
                 group_scored: List[ScoredTrajectory] = []
 
@@ -329,9 +348,10 @@ class GRPOTrainer:
                 )
 
                 # Tokenize inputs + responses for gradient calculation (combo = prompt + response)
-                p_ids = self.tokenizer.encode(prob.user_problem, add_special_tokens=False)
                 for r_idx, scored in enumerate(group_scored):
-                    r_ids = self.tokenizer.encode(scored.trajectory.full_text, add_special_tokens=False)
+                    p_ids, r_ids = token_metadata[p_idx][r_idx]
+                    if not p_ids:
+                        raise ValueError("GRPO rollout prompt must contain at least one token")
                     combo = p_ids + r_ids
 
                     flat_input_ids.append(torch.tensor(combo, dtype=torch.long))
@@ -341,9 +361,11 @@ class GRPOTrainer:
 
                     lp = rollout_lps[r_idx]
                     if lp is not None:
+                        if lp.numel() != len(r_ids):
+                            raise ValueError("Rollout token IDs and logprobs must have identical lengths")
                         flat_old_logprobs.append((len(p_ids), lp.squeeze(0) if lp.dim() == 2 else lp))
                     else:
-                        flat_old_logprobs.append(None)
+                        raise ValueError("GRPO rollout backend omitted token logprobs")
 
         # 6. Policy Gradient Training Phase (train mode)
         self.model.train()
@@ -390,8 +412,10 @@ class GRPOTrainer:
 
         # Backward & Optimizer Step
         total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-        self.optimizer.step()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0, error_if_nonfinite=True)
+        safe_optimizer_step(self.optimizer, [p for p in self.model.parameters() if p.requires_grad])
+        self.optimizer.zero_grad(set_to_none=True)
+        self.global_step += 1
 
         elapsed = time.perf_counter() - t_start
 
@@ -477,8 +501,12 @@ class GRPOTrainer:
 
         # 1. Restore weights
         try:
-            from peft import PeftModel
-            self.model = PeftModel.from_pretrained(self.model, ckpt_dir)
+            from peft.utils.save_and_load import load_peft_weights, set_peft_model_state_dict
+            if not hasattr(self.model, "peft_config"):
+                raise ValueError("Expected an existing trainable PEFT model when resuming")
+            weights = load_peft_weights(ckpt_dir, device=self.device)
+            adapter_name = self.model.active_adapter
+            set_peft_model_state_dict(self.model, weights, adapter_name=adapter_name)
             print("  ✅ LoRA weights restored.")
         except Exception:
             try:

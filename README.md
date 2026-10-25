@@ -135,4 +135,91 @@ trainer = sword.start_grpo(
 trainer.step()
 ```
 
+## Automatic Ollama Judge Setup
 
+`sword.train(long_train=True, ...)` automatically installs Ollama on Linux if
+needed, starts its API on `B_model_port` (default `11343`), and pulls
+`B_model_name` (default `qwen3.6:35b`). The judge loads
+when reward scoring begins, after rollout VRAM is released. If the primary model
+cannot download, load, or evaluate a response, the same reward is retried with
+`qwen3.5:9b`. The selected fallback remains active for subsequent rewards and is
+unloaded before the training phase when `auto_unload_B_model=True` (the default).
+
+Installation uses `~/.local/share/sword/ollama`; no systemd is needed. Linux amd64
+and arm64 archives are supported. Missing `tar`/`zstd` are installed with apt-get
+in root Debian/Ubuntu containers; other environments need those tools available.
+Existing local or remote servers are reused. Their existing model-storage settings
+continue to apply. Windows/macOS can use an installed Ollama or a remote server.
+
+Optional training arguments are `B_model_auto_setup=False` for a caller-managed
+server, `B_model_fallback_name=None` to disable the smaller-model retry,
+`B_model_models_dir`, `B_model_startup_timeout`, `B_model_pull_stall_s`,
+`B_model_timeout`, `B_model_num_ctx`, `B_model_force_gpu`, and `B_model_log_path`.
+The model-directory default is `/marimo/.ollama` in Marimo containers and
+`~/.ollama/models` elsewhere. Pulls print streaming progress and report stalled
+layers. Mock training disables automatic setup by default. If both judges fail,
+training can still use deterministic rewards; `train_result["b_model"]["evaluation_counts"]` records
+that explicitly and the real compatibility runner reports `ok=False`.
+
+### Target environment setup and test suite
+
+Run this in the Linux GPU environment where you will train:
+
+```python
+import os
+import sword
+
+result = sword.train(
+    prep_and_logs=True,
+    setup=True,
+    test=True,
+    b_model=True,
+    HF_TOKEN=os.environ.get("HF_TOKEN"),
+)
+assert result["ok"], result["test_suite"]
+```
+
+The GRPO target defaults to `google/gemma-4-31B-it`, with an 8-bit LoRA trainer
+and FP8 vLLM rollouts. The primary Ollama judge defaults to `qwen3.6:35b`; a
+primary download, load, or scoring failure retries the reward with `qwen3.5:9b`.
+The successful fallback remains active for subsequent rewards. Override the
+models with `model`, `B_model_name`, and `B_model_fallback_name`. Set
+`load_in_8bit=False` for an unquantized trainer or `load_in_4bit=True` for 4-bit
+LoRA training. Use `vllm_quantization` to override rollout quantization.
+
+`setup=True` prepares missing Python dependencies and harness tools, installs
+and patches `vllm==0.23.0`, fetches the four pinned harness repositories, caches
+the target model, and starts/reuses Ollama on the configured port. It downloads
+both judges before training. Repeated setup reuses installed packages, cached
+models, and the running server. `vllm_version`, `model_cache_dir`,
+`model_revision`, and `B_model_models_dir` let you select versions and storage.
+Pass `HF_TOKEN` when the target model requires authenticated access. If setup
+changes packages already imported into a notebook, it returns a restart request
+and waits to run training until you restart the kernel and repeat the call.
+
+`prep_and_logs=True, test=True` checks CUDA forward/backward, dependency imports,
+vLLM imports and patches, the target architecture/tokenizer, and all four pinned
+harness repositories. Each harness executes real write/edit/read or patch tools
+and Python code in a temporary workspace. With `b_model=True`, the suite verifies
+live reward scoring, GPU residency, VRAM release, and a controlled primary-load
+failure followed by two actual fallback scoring requests. It then runs five GRPO
+steps (two coding problems and three math/general problems), verifies finite
+losses and gradient norms, checks LoRA policy updates, and reads back the adapter,
+optimizer state, and dataset completion log. Diagnostic checkpoints stay local
+under `checkpoints/diagnostics`; `Argument["output_dir"]` overrides the location.
+
+The result includes `setup_result`, `patch_result`, `harness_status`,
+`b_model_diagnostic`, `train_result`, and `test_suite`. Each entry in
+`test_suite["checks"]` has a `passed`, `failed`, or `skipped` status and diagnostic
+details. A missing dependency, failed harness, PyTorch rollout fallback, or
+deterministic judge fallback makes the live suite return `ok=False`. Failed
+preflight checks prevent large model loading and training.
+
+Use `prep_and_logs=True, setup=True, test=False` to prepare and validate readiness
+without starting GRPO. `sword.setup_environment()` also exposes provisioning
+alone. With `setup=False`, diagnostics validate an already prepared environment
+without package installation, repository cloning, or model downloads.
+`b_model=False` disables Ollama setup/checks and model-based reward judging.
+`mock_test=True` skips provisioning and live model checks, exercises the small
+mock trainer and real harness tools, and reports `environment_validated=False`.
+Quick `sword.train(test=True)` inference benchmarks retain the small Qwen default.
