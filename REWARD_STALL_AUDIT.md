@@ -409,3 +409,35 @@ availability mocked offline, for **347 passing CPU tests**. Compilation and
 `git diff --check` passed. These verify code/dataflow and small-model gradients;
 the larger GPU contexts and the native large-model thinking output still need
 live validation after restarting the target runtime.
+
+## Math correctness now uses the live LLM judge
+
+Math tasks already sent the reasoning and answer rules to Model B, but the scorer
+discarded Model B's correctness value for `can_be_verify=True` rows. It substituted
+an exact numeric/string check with a maximum truth score of 0.5. The shared scorer
+now uses a successful live judge's correctness score for math as well, on the same
+0–1 scale as other tasks. This lets the judge recognize equivalent expressions,
+units, and answers in words without an exact-match override. Exact verification
+continues to supply math correctness when judging is disabled or Model B falls
+back to deterministic evaluation.
+
+The math rubric explicitly separates correctness from reasoning length. Extra
+thinking and repeated calculations earn no bonus. Dataset rules requesting
+concision can lower reasoning compliance for unnecessary derivations or repeated
+verification; explicitly requested detailed derivations retain credit. No arbitrary
+token-length penalty was added. The policy receives the same dataset rules, and
+the judge sees earlier thought/action turns plus the final response as before.
+
+`test/test_math_llm_judge.py` sends actual local HTTP judge requests for verifiable
+math and checks that returned truth and rule scores determine the reward. Its
+controlled cases accept an answer in words that exact verification rejects,
+reduce correctness for a units mismatch that numeric matching accepts, and retain
+a lower reasoning score for repetitive thinking despite a correct final answer.
+Disabled/offline judge checks preserve exact correctness fallback. These fixtures
+verify transport and scoring authority rather than real judge quality.
+
+The active source stamp is `sword-grpo-bridge math-llm-judge/v8`.
+The affected judge/reward/runtime suite passed **117 tests**, all four sampled
+agent/tool/HTTP-judge/backward integrations passed, and trainer/math/RL
+compatibility passed **111 tests** with judge availability mocked offline:
+**232 passing CPU tests**. Compilation and `git diff --check` passed.

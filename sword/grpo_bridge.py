@@ -40,7 +40,7 @@ from .logging_utils import quiet_quantization_cast_notices, output_preview
 
 # Runtime-visibility stamp: printed when the trainer initializes, so live logs
 # always reveal which bridge change set is actually executing.
-_CODE_STAMP = "sword-grpo-bridge judge-rules/context-v7"
+_CODE_STAMP = "sword-grpo-bridge math-llm-judge/v8"
 
 
 def format_rollout_prompt(tokenizer, prompt: str, *, enable_thinking: bool = True) -> Tuple[str, bool]:

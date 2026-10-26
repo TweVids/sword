@@ -185,7 +185,7 @@ class MultiMetricRewardScorer:
             is_math_correct = MathVerifier.verify_answer(candidate_response, solution)
             truth = 0.5 if is_math_correct else 0.0
 
-        # 3. Model B evaluation for reasoning rule, answer rule, non-math truth, and cheating
+        # 3. Model B evaluation for correctness and dataset rules, including math.
         b_res = self.b_model_judge.evaluate(
             problem=problem,
             solution=solution,
@@ -205,8 +205,13 @@ class MultiMetricRewardScorer:
         rule_answer_follow = b_res.rule_answer_follow
         cheating = b_res.cheating
 
-        # If task cannot be verified mathematically, truth is scored by Model B
-        if not can_be_verify:
+        # A successful live judge owns math correctness too: exact string/number
+        # matching must not override semantic evaluation or cap it at 0.5.
+        # Preserve exact verification when the judge is disabled or falls back.
+        live_judge = self.b_model_judge is not None and getattr(
+            self.b_model_judge, "last_evaluation_source", None,
+        ) != "deterministic"
+        if live_judge or not can_be_verify:
             truth = b_res.truth
 
         # 4. Total score calculation based on user specification:

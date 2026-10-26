@@ -178,14 +178,19 @@ runs with no reward-driven gradients. Results also report `optimizer_steps` and
 
 The long trainer shares the bridge's optional historical reward baseline. Set
 `Argument={"use_cross_step_baseline": False, ...}` for strict group-centered GRPO.
-The coding diagnostic tasks use Model B's semantic truth scores; numeric answer
-verification remains enabled for the math task. `b_model=False` uses local
-heuristics without constructing an Ollama judge.
+Model B judges correctness, reasoning rules, and answer rules for both coding
+and math tasks. Live math correctness uses the judge's full 0–1 score, including
+equivalent expressions, units, and answers in words. Numeric verification supplies
+the math correctness fallback when the judge is disabled or unavailable.
+`b_model=False` uses local heuristics without constructing an Ollama judge.
+Longer thinking and repeated calculations earn no extra credit; the judge assesses
+concision when the dataset's reasoning rule requires it and respects requested
+detailed derivations.
 
 Instruction-tuned rollouts use the tokenizer's chat template and assistant
 generation prefix. The bridge sends exact prompt token IDs to vLLM so BOS is
 not inserted twice, and reserves template overhead in the harness prompt budget.
-The five-step diagnostic defaults to `max_new_tokens=512`; an explicit
+The live five-step diagnostic defaults to `max_new_tokens=2048` (64 in CPU mock mode); an explicit
 `Argument["max_new_tokens"]` still overrides it.
 
 When rewards are uniform or an update is skipped, logs print up to two response previews and raw judge
@@ -227,7 +232,7 @@ underflow. Skipped steps report the largest advantage, unique first turns and
 trajectories, token counts, gradient-buffer connectivity, policy/rollout logprobs,
 and zero importance-weight fraction. Tracing also saves the exact data for all
 training turns in `rollout_details.jsonl`. The bridge startup stamp for this
-change is `sword-grpo-bridge judge-rules/context-v7`; load this updated checkout
+change is `sword-grpo-bridge math-llm-judge/v8`; load this updated checkout
 and restart the target runtime before rerunning.
 
 Text GRPO attaches Gemma's adapters to its language decoder. Mixed projection

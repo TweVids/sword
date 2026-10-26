@@ -214,7 +214,17 @@ def test_diagnostic_coding_truth_uses_semantic_judge(index):
     assert score.truth == 0.9
 
 
-def test_diagnostic_math_truth_keeps_exact_verification():
+def test_diagnostic_math_truth_uses_live_judge():
+    row = diagnostic_dataset()[2]
+    judge = SimpleNamespace(evaluate=lambda **kwargs: ModelBEvaluationResult(truth=0.9))
+    score = MultiMetricRewardScorer(judge).score(
+        problem=row["problem"], solution=row["solution"], candidate_response="The answer is 9",
+        can_be_verify=row["can_be_verify"], category=row["category"],
+    )
+    assert score.truth == 0.9
+
+
+def test_diagnostic_math_without_judge_keeps_exact_verification():
     row = diagnostic_dataset()[2]
     score = MultiMetricRewardScorer(None).score(
         problem=row["problem"], solution=row["solution"], candidate_response="The answer is 9",
