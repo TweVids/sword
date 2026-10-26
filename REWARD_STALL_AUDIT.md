@@ -347,3 +347,65 @@ The active source stamp is `sword-grpo-bridge text-lora-connectivity/v6`.
 Restart from the base model to replace the previous vision-only adapters; changing
 the installed source does not move adapters already attached in a live process.
 The full 31B GPU/vLLM update still needs rerunning in the user's environment.
+
+## Judge rules, longer context, and policy thinking
+
+The user subsequently confirmed a successful live update with loss -0.046728,
+gradient norm 0.223795, reward 0.875, sixteen trained turns, truth 1.00, and
+`Update: applied`. This verifies that the language-adapter correction resolved
+the reported disconnected-gradient failure in that GPU run.
+
+Inspection of rule scoring found two independent omissions: Model A received the
+problem without its dataset reasoning/answer rules, and Model B received only
+the final assistant turn, losing earlier reasoning. Initial and follow-up policy
+prompts now retain both rules without exposing the reference solution. The judge
+receives earlier assistant responses separately from the final answer, with an
+explicit rubric for every metric. An absent reasoning rule no longer creates an
+invented step-by-step requirement. Rule-specific prohibitions and whole-response
+format constraints still apply. Tool success uses measured invocation counts.
+
+Ollama requests now use a JSON schema with all six score fields required and no
+extra keys. Live validation rejects missing fields, null/string/boolean scores,
+nonfinite/out-of-range numbers, and a nonboolean cheating flag. It preserves valid
+zero scores. A format-repair retry names the missing/invalid field and reuses the
+complete evidence, including when thinking is disabled. Existing public parser
+compatibility for older nested/partial outputs remains available outside strict
+live evaluation. Request/response traces include context and reported input-token
+counts, as well as complete judge attempts.
+
+Shared GRPO defaults are now 12,288 total tokens, 2,048 reserved per response, and
+one assistant turn per training microbatch. vLLM schedules at most two sequences
+concurrently and prefills in 2,048-token chunks. These settings limit concurrent
+activation/KV growth while preserving every requested rollout. The trainer is
+offloaded during rollouts by default, vLLM sleeps before scoring/training, and the
+judge unloads before backward. Model B defaults to 32,768 context tokens. Explicit
+context, response, and scheduler overrides remain available. These larger memory
+limits have not yet been validated on the user's GPU.
+Tiny CPU mock runs default to 64 response tokens to keep smoke checks practical;
+explicit response budgets remain honored in that mode.
+
+Previously the bridge did not explicitly request native policy thinking. It now
+passes `enable_thinking=True` through the tokenizer's chat template for both
+generation backends; `A_model_thinking=False` overrides the request. Special
+thought/channel markers are retained in display text. A thought opener injected
+by the prompt template is restored for harness/judge interpretation without
+changing sampled token IDs or logprobs. Thinking blocks remain excluded from
+tool execution. Logs distinguish thinking requested from actual nonempty tagged
+thought sections, and step metrics count `reasoning_turns` as `ThoughtTurns`.
+Templates that ignore `enable_thinking` cannot be forced into native thinking;
+the actual large Gemma tokenizer/output must be confirmed through these logs.
+
+Tests use real Jinja chat-template rendering, actual PyTorch backward on differing
+thought tokens with identical final answers, complete-schema HTTP/dataflow checks,
+and all four real tool-loop integrations. They preserve long rule and final-answer
+tails, prove earlier turns reach the judge, verify rule retention in every policy
+turn, exercise repair for each missing score with thinking on/off, and reject
+invalid scores. Existing small real Gemma/8-bit adapter regressions still run.
+
+The active source stamp is `sword-grpo-bridge judge-rules/context-v7`.
+The final focused suite passed **236 tests**, with the same two existing checks
+deselected. Trainer/math/RL compatibility passed **111 tests** with judge
+availability mocked offline, for **347 passing CPU tests**. Compilation and
+`git diff --check` passed. These verify code/dataflow and small-model gradients;
+the larger GPU contexts and the native large-model thinking output still need
+live validation after restarting the target runtime.

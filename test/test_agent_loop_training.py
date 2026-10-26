@@ -99,9 +99,16 @@ def test_sampled_policy_executes_full_loop_and_all_turns_get_trained(tmp_path, c
         def do_POST(self):
             data = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             judge_requests.append(data)
+            query = data["messages"][-1]["content"]
+            assert "VERIFY_AFTER_EDIT_RULE" in query and "FINAL_DIGIT_RULE" in query
+            earlier = query.split("Earlier Assistant Turns (reasoning and action evidence):\n", 1)[1]
+            earlier = json.loads(earlier.split("\n\nCandidate Model Response to Evaluate:", 1)[0])
+            assert len(earlier) == 4
+            assert "state.txt" in earlier[0] and "CHECKED" in earlier[-1]
             candidate = data["messages"][-1]["content"].split("Candidate Model Response to Evaluate:\n", 1)[1]
             truth = float("Final Answer: 1" in candidate)
-            scores = {"truth":truth, "formatted":1, "rule_reasoning_follow":1, "rule_answer_follow":1}
+            scores = {"truth":truth, "formatted":1, "rule_reasoning_follow":1, "rule_answer_follow":1,
+                      "tools_success":1, "cheating":False}
             body = json.dumps({"message":{"content":json.dumps(scores)}, "eval_count":32, "done_reason":"stop"}).encode()
             self.send_response(200)
             self.send_header("Content-Length", str(len(body)))
@@ -122,6 +129,8 @@ def test_sampled_policy_executes_full_loop_and_all_turns_get_trained(tmp_path, c
              patch.object(GRPOBridge, "initialize_vllm", return_value=False):
             result = run_long_train(
                 dataset=[{"problem":"Write draft, change it to verified, read it, verify it, then give a final digit.",
+                          "reasoning_rule":"VERIFY_AFTER_EDIT_RULE: read and verify the edited file before answering.",
+                          "answer_rule":"FINAL_DIGIT_RULE: give a final digit.",
                           "solution":"Final Answer: 1", "harness":harness.name, "can_be_verify":False}],
                 model="controlled-agent-policy", trainer_model=model, tokenizer=CharacterTokenizer(),
                 b_model=True, B_model_auto_setup=False, trace_rollouts=True, return_step_metrics=True,
@@ -136,6 +145,8 @@ def test_sampled_policy_executes_full_loop_and_all_turns_get_trained(tmp_path, c
         assert all(record["tools_called"] == record["tools_succeeded"] == 4 for record in records)
         assert all(record["training_turn_count"] == len(record["training_turns"]) == 5 for record in records)
         for record in records:
+            assert all("VERIFY_AFTER_EDIT_RULE" in turn["prompt_text"] and "FINAL_DIGIT_RULE" in turn["prompt_text"]
+                       for turn in record["training_turns"])
             assert all(len(turn["response_token_ids"]) == len(turn["rollout_logprobs"]) for turn in record["training_turns"])
             assert record["training_response_tokens"] == sum(len(turn["response_token_ids"]) for turn in record["training_turns"])
             assert record["judge_attempts"][0]["status"] == "scored"

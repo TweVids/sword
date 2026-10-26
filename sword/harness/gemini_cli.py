@@ -28,7 +28,7 @@ class GeminiCliHarness(BaseHarness):
 
     def extract_reasoning(self, text: str) -> str:
         """Extracts thought traces."""
-        m = re.search(r"<\|channel>thought(.*?)(?:<channel\||<\|end_channel>|$)", text, re.DOTALL)
+        m = re.search(r"<\|channel>\s*thought(.*?)(?:<channel\||<\|end_channel>|$)", text, re.DOTALL)
         if m:
             return m.group(1).strip()
         m_alt = re.search(r"<think>(.*?)</think>", text, re.DOTALL)

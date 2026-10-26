@@ -98,7 +98,8 @@ def test_bounded_output_preserves_answer_tail_and_marks_empty():
 
 def test_real_http_judge_outputs_and_thinking_only_retry_are_visible(capsys):
     requests_seen = []
-    scores = {"truth":1, "formatted":1, "rule_reasoning_follow":1, "rule_answer_follow":1}
+    scores = {"truth":1, "formatted":1, "rule_reasoning_follow":1, "rule_answer_follow":1,
+              "tools_success":0, "cheating":False}
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
             pass

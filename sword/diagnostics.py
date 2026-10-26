@@ -14,7 +14,9 @@ import requests
 import torch
 
 from .b_model import ModelBJudge, model_b_config
-from .defaults import DEFAULT_GRPO_MODEL
+from .defaults import (
+    DEFAULT_GRPO_MODEL, DEFAULT_GRPO_CONTEXT, DEFAULT_GRPO_MAX_NEW_TOKENS, DEFAULT_MOCK_MAX_NEW_TOKENS,
+)
 from .harness import get_harness, WorkspaceSandbox
 from .reward import MultiMetricRewardScorer
 from .runtime_setup import (
@@ -477,8 +479,8 @@ def run_target_diagnostics(
         if test:
             arguments.setdefault("steps", 5)
             arguments.setdefault("concurrency_g", concurrent)
-            arguments.setdefault("max_seq_len", 2048)
-            arguments.setdefault("max_new_tokens", 512)
+            arguments.setdefault("max_seq_len", DEFAULT_GRPO_CONTEXT)
+            arguments.setdefault("max_new_tokens", DEFAULT_MOCK_MAX_NEW_TOKENS if mock_test else DEFAULT_GRPO_MAX_NEW_TOKENS)
             arguments.setdefault("micro_batch_size", 1)
             arguments.setdefault("output_dir", "checkpoints/diagnostics")
             arguments.setdefault("allow_retest", True)

@@ -15,6 +15,7 @@ import gc
 import sys
 import json
 import math
+import re
 import time
 import shutil
 import tempfile
@@ -34,25 +35,26 @@ except Exception:
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from .rl.policy import token_statistics, safe_optimizer_step
-from .defaults import DEFAULT_GRPO_MODEL
+from .defaults import DEFAULT_GRPO_MODEL, DEFAULT_GRPO_CONTEXT, DEFAULT_GRPO_MAX_NEW_TOKENS
 from .logging_utils import quiet_quantization_cast_notices, output_preview
 
 # Runtime-visibility stamp: printed when the trainer initializes, so live logs
 # always reveal which bridge change set is actually executing.
-_CODE_STAMP = "sword-grpo-bridge text-lora-connectivity/v6"
+_CODE_STAMP = "sword-grpo-bridge judge-rules/context-v7"
 
 
-def format_rollout_prompt(tokenizer, prompt: str) -> Tuple[str, bool]:
+def format_rollout_prompt(tokenizer, prompt: str, *, enable_thinking: bool = True) -> Tuple[str, bool]:
     """Use the model's assistant-generation template when one is configured."""
     if getattr(tokenizer, "chat_template", None) and callable(getattr(tokenizer, "apply_chat_template", None)):
         return tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True,
+            enable_thinking=enable_thinking,
         ), True
     return prompt, False
 
 
-def tokenize_rollout_prompt(tokenizer, prompt: str, max_prompt_tokens: Optional[int] = None):
-    text, is_chat = format_rollout_prompt(tokenizer, prompt)
+def tokenize_rollout_prompt(tokenizer, prompt: str, max_prompt_tokens: Optional[int] = None, *, enable_thinking: bool = True):
+    text, is_chat = format_rollout_prompt(tokenizer, prompt, enable_thinking=enable_thinking)
     options = {"return_tensors": "pt"}
     if is_chat:
         # The template already inserts BOS and role markers. Do not add BOS twice
@@ -66,15 +68,38 @@ def tokenize_rollout_prompt(tokenizer, prompt: str, max_prompt_tokens: Optional[
     return inputs, is_chat
 
 
-def rollout_prompt_budget(tokenizer, max_model_len: int, max_new_tokens: int) -> int:
+def rollout_prompt_budget(tokenizer, max_model_len: int, max_new_tokens: int, *, enable_thinking: bool = True) -> int:
     """Reserve role-marker tokens before the harness trims its instructions."""
     budget = max_model_len - max_new_tokens
     if getattr(tokenizer, "chat_template", None):
-        inputs, _ = tokenize_rollout_prompt(tokenizer, "")
+        inputs, _ = tokenize_rollout_prompt(tokenizer, "", enable_thinking=enable_thinking)
         budget -= inputs["input_ids"].shape[-1] + 8
     if budget < 1:
         raise ValueError("max_seq_len must leave room for the chat template, task, and response")
     return budget
+
+
+def restore_thinking_prefix(tokenizer, prompt_ids: List[int], response: str) -> str:
+    """Expose an open thought section placed in the prompt by the chat template.
+
+    This changes only harness/judge display text. Sampled token IDs and logprobs
+    remain untouched, and thinking content cannot become executable tool calls.
+    """
+    if not getattr(tokenizer, "chat_template", None):
+        return response
+    prefix = tokenizer.decode(prompt_ids, skip_special_tokens=False)
+    match = re.search(r"(<think>|<\|channel>\s*thought)\s*$", prefix)
+    if match and not response.lstrip().startswith(match.group(1)):
+        return match.group(1) + "\n" + response
+    return response
+
+
+def has_thought_section(response: str) -> bool:
+    """Whether the emitted/displayed response contains nonempty thought text."""
+    patterns = (r"<think>(.*?)(?:</think>|$)",
+                r"<\|channel>\s*thought(.*?)(?:<channel\||<\|end_channel>|$)")
+    return any(match.group(1).strip() for pattern in patterns
+               for match in re.finditer(pattern, response, flags=re.DOTALL))
 
 
 def _peft_base_layer_types() -> tuple:
@@ -191,8 +216,8 @@ class GRPOBridgeConfig:
     """
     model_name: str = DEFAULT_GRPO_MODEL
     concurrency_g: int = 4
-    max_model_len: int = 2048
-    max_new_tokens: int = 512
+    max_model_len: int = DEFAULT_GRPO_CONTEXT
+    max_new_tokens: int = DEFAULT_GRPO_MAX_NEW_TOKENS
     temperature: float = 0.7
     top_p: float = 0.9
     temperature_scale: bool = False
@@ -204,10 +229,12 @@ class GRPOBridgeConfig:
     entropy_floor: float = 0.01
     entropy_coeff: float = 0.001
     max_grad_norm: float = 1.0
-    micro_batch_size: int = 2
+    micro_batch_size: int = 1
+    vllm_max_num_seqs: int = 2
+    vllm_max_num_batched_tokens: int = 2048
     max_kept_adapters: int = 2
     enable_vllm_sleep: bool = True
-    offload_trainer_during_rollout: bool = False
+    offload_trainer_during_rollout: bool = True
     drop_incomplete_groups: bool = True
     vllm_gpu_utilization: float = 0.33
     use_cross_step_baseline: bool = True
@@ -236,6 +263,7 @@ class GRPOBridgeConfig:
     local_files_only: bool = False
     require_vllm: bool = False
     log_model_outputs: bool = True
+    enable_thinking: bool = True
     model_output_chars: int = 1200
 
     def __post_init__(self):
@@ -243,6 +271,8 @@ class GRPOBridgeConfig:
             raise ValueError("Choose either load_in_4bit or load_in_8bit.")
         if self.concurrency_g < 1 or self.micro_batch_size < 1 or self.chunk_size < 1:
             raise ValueError("rollout count, microbatch size, and chunk size must be positive")
+        if self.vllm_max_num_seqs < 1 or self.vllm_max_num_batched_tokens < self.vllm_max_num_seqs:
+            raise ValueError("vLLM sequence and prefill budgets must be positive and allow each sequence")
         if self.max_new_tokens < 1 or self.max_model_len <= self.max_new_tokens:
             raise ValueError("max_model_len must leave room for prompt and response tokens")
         if not math.isfinite(self.temperature) or self.temperature <= 0 or not 0 < self.top_p <= 1:
@@ -713,6 +743,7 @@ class FallbackRolloutEngine:
         temperature: float = 0.7,
         top_p: float = 0.9,
         max_model_len: Optional[int] = None,
+        enable_thinking: bool = True,
     ) -> List[Dict[str, Any]]:
         device = next(self.model.parameters()).device
         results = []
@@ -721,6 +752,7 @@ class FallbackRolloutEngine:
         for prompt in prompts:
             raw_inputs, _ = tokenize_rollout_prompt(
                 self.tokenizer, prompt, max_model_len - max_new_tokens if max_model_len is not None else None,
+                enable_thinking=enable_thinking,
             )
             if hasattr(raw_inputs, "to"):
                 inputs = raw_inputs.to(device)
@@ -762,7 +794,10 @@ class FallbackRolloutEngine:
                     break
                 curr_input = torch.cat([curr_input, next_token], dim=1)
 
-            resp_text = self.tokenizer.decode(gen_tokens, skip_special_tokens=True)
+            display_tokens = gen_tokens[:-1] if gen_tokens and gen_tokens[-1] in eos_ids else gen_tokens
+            resp_text = restore_thinking_prefix(
+                self.tokenizer, p_ids, self.tokenizer.decode(display_tokens, skip_special_tokens=False),
+            )
             results.append({
                 "prompt_token_ids": p_ids,
                 "response_token_ids": gen_tokens,
@@ -1033,6 +1068,9 @@ class GRPOBridge:
                 "enable_lora": self.config.enable_lora,
                 "max_lora_rank": self.config.lora_r,
                 "max_loras": 1,
+                "max_num_seqs": self.config.vllm_max_num_seqs,
+                "max_num_batched_tokens": self.config.vllm_max_num_batched_tokens,
+                "enable_chunked_prefill": True,
                 "hf_overrides": hf_over,
             }
             if self.config.hf_token:
@@ -1108,7 +1146,8 @@ class GRPOBridge:
         use_fallback = self.vllm_engine is None
         if self.config.log_model_outputs:
             print(f"[ModelA Request] model={self.config.model_name} backend={'pytorch' if use_fallback else 'vllm'} "
-                  f"rollouts={len(expanded_prompts)} max_tokens={self.config.max_new_tokens}", flush=True)
+                  f"rollouts={len(expanded_prompts)} context={self.config.max_model_len} "
+                  f"max_tokens={self.config.max_new_tokens} thinking_requested={self.config.enable_thinking}", flush=True)
         if not use_fallback:
             # Token prompts prevent vLLM from inserting another BOS into an
             # already-rendered chat template. Preserve original text for harnesses.
@@ -1117,6 +1156,7 @@ class GRPOBridge:
                 if getattr(self.tokenizer, "chat_template", None):
                     inputs, _ = tokenize_rollout_prompt(
                         self.tokenizer, prompt, self.config.max_model_len - self.config.max_new_tokens,
+                        enable_thinking=self.config.enable_thinking,
                     )
                     engine_prompts.append({"prompt_token_ids": inputs["input_ids"][0].tolist()})
                 else:
@@ -1129,6 +1169,7 @@ class GRPOBridge:
                     top_p=self.config.top_p,
                     max_tokens=self.config.max_new_tokens,
                     logprobs=1,
+                    skip_special_tokens=False,
                 )
                 lora_req = self.weight_sync.get_current_lora_request()
                 try:
@@ -1156,7 +1197,7 @@ class GRPOBridge:
                     if isinstance(engine_prompts[idx], dict) and p_ids != engine_prompts[idx]["prompt_token_ids"]:
                         raise ValueError("vLLM changed the supplied chat prompt token IDs")
                     resp = out.outputs[0]
-                    r_text = resp.text
+                    r_text = restore_thinking_prefix(self.tokenizer, p_ids, resp.text)
                     r_ids = list(resp.token_ids)
 
                     r_logprobs = []
@@ -1197,6 +1238,7 @@ class GRPOBridge:
                 temperature=self.config.temperature,
                 top_p=self.config.top_p,
                 max_model_len=self.config.max_model_len,
+                enable_thinking=self.config.enable_thinking,
             )
             for idx, res in enumerate(fb_results):
                 batch.items.append(RolloutItem(
@@ -1214,7 +1256,8 @@ class GRPOBridge:
             for idx, item in enumerate(batch.items):
                 print(f"[ModelA Output] model={self.config.model_name} backend={'pytorch' if use_fallback else 'vllm'} "
                       f"rollout={idx} policy={item.policy_version} prompt_tokens={len(item.prompt_token_ids)} "
-                      f"response_tokens={len(item.response_token_ids)} truncated={item.is_truncated}\n"
+                      f"response_tokens={len(item.response_token_ids)} truncated={item.is_truncated} "
+                      f"thought_present={has_thought_section(item.response_text)}\n"
                       f"{output_preview(item.response_text, self.config.model_output_chars)}", flush=True)
         return batch
 
@@ -1511,6 +1554,7 @@ class GRPOBridge:
         accumulated_metrics["gradient_abs_max"] = gradient_abs_max
         accumulated_metrics["zero_gradient_reason"] = zero_gradient_reason
         accumulated_metrics["training_turns"] = len(training_turns)
+        accumulated_metrics["reasoning_turns"] = sum(has_thought_section(turn.response_text) for _, turn in training_turns)
         accumulated_metrics["followup_training_turns"] = len(training_turns) - len(batch.items)
         accumulated_metrics["truncated_training_turns"] = sum(turn.is_truncated for _, turn in training_turns)
         accumulated_metrics["entropy_penalty"] = accumulated_metrics.get("entropy_loss", 0) * self.loss_fn.entropy_coeff

@@ -227,7 +227,7 @@ underflow. Skipped steps report the largest advantage, unique first turns and
 trajectories, token counts, gradient-buffer connectivity, policy/rollout logprobs,
 and zero importance-weight fraction. Tracing also saves the exact data for all
 training turns in `rollout_details.jsonl`. The bridge startup stamp for this
-change is `sword-grpo-bridge text-lora-connectivity/v6`; load this updated checkout
+change is `sword-grpo-bridge judge-rules/context-v7`; load this updated checkout
 and restart the target runtime before rerunning.
 
 Text GRPO attaches Gemma's adapters to its language decoder. Mixed projection
@@ -237,6 +237,38 @@ Startup prints the selected scope and trainable tensor coverage and rejects a
 model with no trainable language parameters. This setup is shared by diagnostic
 training (`prep_and_logs=True, test=True`) and ordinary training (`test=False`).
 Restart from the base model when replacing the older vision-only adapters.
+
+The policy uses a **12,288-token context**, with **2,048 tokens per response**,
+for both diagnostic and ordinary GRPO. Dataset reasoning and answer rules are
+included in the initial task and every follow-up prompt; the reference solution
+is reserved for evaluation. Explicit `Argument["max_seq_len"]` and
+`Argument["max_new_tokens"]` override these defaults. Training microbatches
+default to one turn. vLLM schedules at most two sequences concurrently and uses
+2,048-token chunked prefill; all requested rollouts still run. Trainer offloading,
+vLLM sleep, and judge unloading keep the GPU phases separate. Larger GPU contexts
+still require validation on the target hardware.
+CPU mock runs reserve 64 response tokens by default; explicit response limits
+still apply in mock mode.
+
+Policy thinking is requested through the native chat template by default.
+Use `A_model_thinking=False` to disable that request. The tokenizer must support
+the template's `enable_thinking` option for it to control native thinking.
+Reasoning markers are preserved, including a thought opener placed in the prompt,
+so the harness does not execute tools mentioned inside thinking. Sampled thought
+tokens remain part of GRPO. `[ModelA Request]` shows `thinking_requested`, each
+output shows `thought_present`, and `ThoughtTurns` counts nonempty tagged thought
+sections across all trained turns. A request alone does not prove the model
+actually emitted a thought section.
+
+Model B uses a **32,768-token context** by default; `B_model_num_ctx` overrides
+it. The judge receives the complete dataset rules, earlier assistant turns as
+reasoning evidence, the final response separately, and measured tool counts.
+Its rubric evaluates both rules explicitly and avoids inventing an unstated
+reasoning requirement. Ollama structured output requires all six score fields,
+with numeric scores and a boolean `cheating`. Missing or invalid fields trigger
+a repair request that names the problem; valid zero scores remain zero. Judge
+request logs show the configured context, and responses record prompt token counts
+when Ollama reports them.
 
 Model output logging is enabled by default for detailed long training, including
 healthy steps. `[ModelA Request]` and `[ModelA Output]` show the active backend,

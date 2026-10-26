@@ -31,7 +31,7 @@ class CodexCliHarness(BaseHarness):
         m_think = re.search(r"<think>(.*?)</think>", text, re.DOTALL)
         if m_think:
             return m_think.group(1).strip()
-        m_chan = re.search(r"<\|channel>thought(.*?)(?:<channel\||<\|end_channel>|$)", text, re.DOTALL)
+        m_chan = re.search(r"<\|channel>\s*thought(.*?)(?:<channel\||<\|end_channel>|$)", text, re.DOTALL)
         if m_chan:
             return m_chan.group(1).strip()
         return ""

@@ -26,7 +26,9 @@ except Exception:
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from sword.b_model import ModelBJudge, model_b_config
-from sword.defaults import DEFAULT_GRPO_MODEL
+from sword.defaults import (
+    DEFAULT_GRPO_MODEL, DEFAULT_GRPO_CONTEXT, DEFAULT_GRPO_MAX_NEW_TOKENS, DEFAULT_MOCK_MAX_NEW_TOKENS,
+)
 from sword.harness.prompts import harness_repo_policy
 from sword.harness import get_harness, HarnessResult, WorkspaceSandbox
 from sword.reward import MultiMetricRewardScorer, RewardBreakdown
@@ -62,6 +64,21 @@ class DatasetProblemRow:
             "problem_id": self.problem_id,
             "row_hash": self.row_hash,
         }
+
+
+def policy_task_prompt(row: DatasetProblemRow) -> str:
+    """Give the policy its dataset rules without exposing the reference answer."""
+    requirements = []
+    if row.reasoning_rule:
+        requirements.append("Reasoning Rule:\n" + row.reasoning_rule)
+    if row.answer_rule:
+        requirements.append("Answer Rule:\n" + row.answer_rule)
+    if not requirements:
+        return row.problem
+    return (row.problem + "\n\nDataset response requirements:\n" + "\n\n".join(requirements)
+            + "\n\nFollow these requirements throughout your response and tool work. "
+              "Include the required reasoning in your assistant responses; "
+              "make the final answer satisfy the answer rule.")
 
 
 def parse_dataset_row(raw: Dict[str, Any], index: int = 0) -> DatasetProblemRow:
@@ -230,9 +247,10 @@ def run_long_train(
     lr = float(args.get("lr") or args.get("learning_rate") or 5e-6)
     concurrency_g = int(args.get("concurrency_g") or args.get("num_rollouts") or 4)
     save_steps = int(args.get("save_steps") or 25)
-    micro_batch_size = int(args.get("micro_batch_size") or 2)
-    max_seq_len = int(args.get("max_seq_len") or 2048)
-    max_new_tokens = int(args.get("max_new_tokens") or 512)
+    micro_batch_size = int(args.get("micro_batch_size") or 1)
+    max_seq_len = int(args.get("max_seq_len") or DEFAULT_GRPO_CONTEXT)
+    max_new_tokens = int(args.get("max_new_tokens") or
+                         (DEFAULT_MOCK_MAX_NEW_TOKENS if effective_mock else DEFAULT_GRPO_MAX_NEW_TOKENS))
     output_dir = str(args.get("output_dir") or "checkpoints")
     harness_max_turns = int(kwargs.get("harness_max_turns", args.get("harness_max_turns", 8)))
     keep_harness_workspaces = bool(kwargs.get("keep_harness_workspaces", args.get("keep_harness_workspaces", False)))
@@ -247,6 +265,9 @@ def run_long_train(
     print(f" Target Model:            {model}")
     print(f" Model B Judge Port:      {B_model_port}")
     print(f" Concurrency (G):         {concurrency_g} rollouts/problem")
+    print(f" Policy context:          {max_seq_len} tokens ({max_new_tokens} reserved per response)")
+    if b_model:
+        print(f" Judge context:           {model_b_config(**kwargs).num_ctx} tokens")
     print(f" Steps Planned:           {steps} (save every {save_steps} steps)")
     print(f" Device:                  {device}")
     print(f" Upload Repo ID:          {upload_id or 'Local only'}")
@@ -317,12 +338,14 @@ def run_long_train(
         max_model_len=max_seq_len,
         max_new_tokens=max_new_tokens,
         micro_batch_size=micro_batch_size,
+        vllm_max_num_seqs=int(kwargs.get("vllm_max_num_seqs", 2)),
+        vllm_max_num_batched_tokens=int(kwargs.get("vllm_max_num_batched_tokens", 2048)),
         use_cross_step_baseline=bool(kwargs.get("use_cross_step_baseline", args.get("use_cross_step_baseline", True))),
         temperature=float(args.get("temperature", 0.7)),
         top_p=float(args.get("top_p", 0.9)),
         chunk_size=int(args.get("chunk_size", 512)),
         enable_vllm_sleep=bool(kwargs.get("enable_vllm_sleep", True)),
-        offload_trainer_during_rollout=bool(kwargs.get("offload_trainer_during_rollout", False)),
+        offload_trainer_during_rollout=bool(kwargs.get("offload_trainer_during_rollout", True)),
         vllm_gpu_utilization=float(kwargs.get("vllm_gpu_utilization", 0.40)),
         adapter_sync_dir=os.path.join(output_dir, "rollout_adapters"),
         lora_r=int(lora_conf.get("r", 16)),
@@ -344,6 +367,7 @@ def run_long_train(
         device=device,
         log_model_outputs=bool(kwargs.get("log_model_outputs", show_detail_logs)),
         model_output_chars=int(kwargs.get("model_output_chars", 1200)),
+        enable_thinking=bool(kwargs.get("A_model_thinking", True)),
     )
     bridge = GRPOBridge(config=bridge_config)
     bridge.initialize_trainer(
@@ -392,6 +416,7 @@ def run_long_train(
             step_idx = current_step + 1
             row_idx = (step_idx - 1) % len(records)
             current_row = records[row_idx]
+            policy_task = policy_task_prompt(current_row)
             harness = get_harness(current_row.harness)
             if harness is not None:
                 harness.workspace_parent_dir = os.path.join(output_dir, "harness_workspaces")
@@ -408,15 +433,17 @@ def run_long_train(
 
                 try:
                     # Rollout Phase with authentic harness prompt injection and token-budget guard
-                    prompt_token_budget = rollout_prompt_budget(bridge.tokenizer, max_seq_len, max_new_tokens)
+                    prompt_token_budget = rollout_prompt_budget(
+                        bridge.tokenizer, max_seq_len, max_new_tokens, enable_thinking=bridge.config.enable_thinking,
+                    )
                     with harness_repo_policy(auto_clone=not effective_mock):
                         rollout_prompt = (
                             harness.format_prompt(
-                                current_row.problem,
+                                policy_task,
                                 max_tokens=prompt_token_budget,
                                 tokenizer=getattr(bridge, "tokenizer", None),
                             )
-                            if harness is not None else current_row.problem
+                            if harness is not None else policy_task
                         )
                     prompts = [rollout_prompt]
                     batch = bridge.generate_rollouts(prompts)
@@ -448,7 +475,7 @@ def run_long_train(
                                 # overflowing the model window as tool turns grow.
                                 history = turn_p[len(item.prompt_text):] if turn_p.startswith(item.prompt_text) else turn_p
                                 followup = harness.format_followup_prompt(
-                                    current_row.problem, history, prompt_token_budget, tokenizer=bridge.tokenizer,
+                                    policy_task, history, prompt_token_budget, tokenizer=bridge.tokenizer,
                                 )
                                 turn = bridge.generate_single(followup, return_item=True)
                                 if not isinstance(turn, RolloutItem):
@@ -495,6 +522,8 @@ def run_long_train(
                             harness_name=current_row.harness,
                             tools_called=tools_called,
                             tools_succeeded=tools_succeeded,
+                            assistant_history=[turn.response_text for turn in [item] + item.followup_turns[:-1]]
+                                              if item.followup_turns else [],
                         )
                         item.reward = score_breakdown.total_score
                         step_scores.append(score_breakdown)
@@ -643,6 +672,7 @@ def run_long_train(
                     f"RewardStd: {metrics.get('reward_std', 0.0):.6g} | "
                     f"AdvMax: {metrics.get('advantage_abs_max', 0.0):.6g} | "
                     f"TrainTurns: {metrics.get('training_turns', 0)} | "
+                    f"ThoughtTurns: {metrics.get('reasoning_turns', 0)} | "
                     f"Truth: {avg_truth:.2f} | "
                     f"Judge: {metrics['judge_evaluation_source']} | "
                     f"Update: {'skipped' if metrics.get('optimizer_step_skipped') else 'applied'} | "

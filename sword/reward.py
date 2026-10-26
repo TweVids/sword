@@ -8,7 +8,7 @@ and penalty deductions for cheating.
 import re
 import math
 from dataclasses import dataclass, field
-from typing import Dict, Any, Optional, Tuple, Union
+from typing import Dict, Any, Optional, Tuple, Union, List
 
 from sword.b_model import ModelBJudge, ModelBEvaluationResult, deterministic_evaluation
 
@@ -137,7 +137,7 @@ class MultiMetricRewardScorer:
         score = 1.0
 
         # Check thinking channel tags
-        has_think_open = "<think>" in text or "<|channel>thought" in text
+        has_think_open = "<think>" in text or bool(re.search(r"<\|channel>\s*thought", text))
         has_think_close = "</think>" in text or "<channel|>" in text
         if has_think_open != has_think_close:
             score -= 0.4  # Unbalanced thinking tags
@@ -166,6 +166,7 @@ class MultiMetricRewardScorer:
         harness_name: Optional[str] = None,
         tools_called: int = 0,
         tools_succeeded: int = 0,
+        assistant_history: Optional[List[str]] = None,
     ) -> RewardBreakdown:
         """
         Computes the complete multi-metric score breakdown:
@@ -195,6 +196,7 @@ class MultiMetricRewardScorer:
             category=category,
             tools_called=tools_called,
             tools_succeeded=tools_succeeded,
+            **({"assistant_history": assistant_history} if assistant_history else {}),
         ) if self.b_model_judge is not None else deterministic_evaluation(
             candidate_response, solution, tools_called, tools_succeeded,
         )

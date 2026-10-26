@@ -5,7 +5,7 @@ import re
 
 def visible_response(text):
     text = re.sub(r"<think>.*?(?:</think>|$)", "", text, flags=re.DOTALL | re.IGNORECASE)
-    return re.sub(r"<\|channel>thought.*?(?:<channel\||<\|end_channel>|$)", "", text, flags=re.DOTALL)
+    return re.sub(r"<\|channel>\s*thought.*?(?:<channel\||<\|end_channel>|$)", "", text, flags=re.DOTALL)
 
 
 def structured_calls(text):

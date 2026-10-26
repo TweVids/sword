@@ -30,7 +30,7 @@ class OpenCodeHarness(BaseHarness):
         m_think = re.search(r"<think>(.*?)</think>", text, re.DOTALL)
         if m_think:
             return m_think.group(1).strip()
-        m_channel = re.search(r"<\|channel>thought(.*?)(?:<channel\||<\|end_channel>|$)", text, re.DOTALL)
+        m_channel = re.search(r"<\|channel>\s*thought(.*?)(?:<channel\||<\|end_channel>|$)", text, re.DOTALL)
         if m_channel:
             return m_channel.group(1).strip()
         return ""

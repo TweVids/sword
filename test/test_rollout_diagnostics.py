@@ -110,7 +110,8 @@ def judge_with_reply(reply):
 
 def test_partial_live_judge_scores_retry_without_thinking():
     calls = []
-    complete = {"truth": 1, "formatted": 1, "rule_reasoning_follow": 1, "rule_answer_follow": 1}
+    complete = {"truth": 1, "formatted": 1, "rule_reasoning_follow": 1, "rule_answer_follow": 1,
+                "tools_success": 0, "cheating": False}
     def reply(payload):
         calls.append(payload)
         data = {"formatted": 1} if len(calls) == 1 else complete
@@ -131,7 +132,8 @@ def test_partial_judge_does_not_report_successful_live_evaluation():
 
 
 def test_complete_zero_judge_scores_are_accepted_without_fabricating_signal():
-    reply = {"truth": 0, "formatted": 0, "rule_reasoning_follow": 0, "rule_answer_follow": 0}
+    reply = {"truth": 0, "formatted": 0, "rule_reasoning_follow": 0, "rule_answer_follow": 0,
+             "tools_success": 0, "cheating": False}
     judge = judge_with_reply(lambda payload: {"message": {"content": json.dumps(reply)}})
     result = judge.evaluate("2+2", "4", "", "", "bad answer")
     assert result.truth == 0
