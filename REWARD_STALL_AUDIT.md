@@ -300,3 +300,50 @@ and credentials are excluded.
 These checks establish the implementation and its tested dataflow. They do not
 establish the large GPU policy's coding quality, the live judge's responses, or
 the exact cause of that runtime's earlier zero-gradient status line.
+
+## Live-log diagnosis: LoRA attached only to the unused vision tower
+
+The supplied `logs.txt` confirms the v5 bridge ran in the GPU environment.
+Generation and judging now work: eight distinct trajectories, sixteen trained
+assistant turns, twenty-nine tool calls, complete judge JSON, mean reward 0.875,
+reward standard deviation 0.0829156, truth 1.00, and maximum advantage 1.50754.
+The exact quantization-cast spam is absent. Nevertheless backward produced
+**zero gradient buffers out of 378 trainable tensors**, with reason
+`disconnected_trainable_parameters` and zero importance-weight underflow.
+
+The target resolver globally replaced each projection suffix with `.linear`
+because some matches were Gemma4ClippableLinear wrappers. For `q_proj`, this
+discarded sixty supported language projections and kept only twenty-seven vision
+wrappers. The same happened to all seven requested projection names. Twenty-seven
+vision layers times seven projections times two LoRA matrices equals exactly
+378 unused trainable tensors. Text forwards never execute those vision layers.
+Embedding input-gradient hooks explain why the loss still supported backward.
+Negative GRPO loss is valid and is not the cause of this failure.
+
+The resolver now retains supported projections and redirects each incompatible
+wrapper individually using qualified names when matches are mixed. It verifies
+every wrapper has a dispatchable child before PEFT can partially mutate the
+model. Both Unsloth and Transformers trainer paths additionally scope multimodal
+text training to the language decoder. Config and adapter export share the same
+resolved targets. Startup reports trainable language coverage and rejects an
+already loaded model whose trainable weights are entirely outside that decoder.
+These are shared runtime changes used by both diagnostic and ordinary GRPO.
+
+`test/test_text_lora_connectivity.py` uses an actual small Transformers Gemma 4
+model with both language projections and Gemma4ClippableLinear vision wrappers.
+The old suffix selection reproduces the live failure with actual bitsandbytes
+8-bit layers: the loss supports backward but all fourteen vision LoRA tensors
+have missing gradients. Corrected shared PEFT initialization, nonreentrant
+checkpointed GRPO backward, optimizer updates, and safetensors export succeed
+with both plain and actual 8-bit projections. All fourteen language LoRA tensors
+receive gradient buffers, weights change, and only language adapters are exported.
+Additional checks cover mixed target preservation, incomplete wrapper coverage,
+and rejection of explicit vision-only targets. All six new tests passed locally.
+The expanded focused suite, including all four agent pipeline integrations,
+passed **205 tests** with the same two known checks deselected. Compilation and
+`git diff --check` passed.
+
+The active source stamp is `sword-grpo-bridge text-lora-connectivity/v6`.
+Restart from the base model to replace the previous vision-only adapters; changing
+the installed source does not move adapters already attached in a live process.
+The full 31B GPU/vLLM update still needs rerunning in the user's environment.

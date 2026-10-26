@@ -227,8 +227,16 @@ underflow. Skipped steps report the largest advantage, unique first turns and
 trajectories, token counts, gradient-buffer connectivity, policy/rollout logprobs,
 and zero importance-weight fraction. Tracing also saves the exact data for all
 training turns in `rollout_details.jsonl`. The bridge startup stamp for this
-change is `sword-grpo-bridge agent-output/quantization-v5`; load this updated checkout
+change is `sword-grpo-bridge text-lora-connectivity/v6`; load this updated checkout
 and restart the target runtime before rerunning.
+
+Text GRPO attaches Gemma's adapters to its language decoder. Mixed projection
+types retain their directly supported layers and redirect only the individual
+wrappers, so vision-only `.linear` matches cannot displace the language layers.
+Startup prints the selected scope and trainable tensor coverage and rejects a
+model with no trainable language parameters. This setup is shared by diagnostic
+training (`prep_and_logs=True, test=True`) and ordinary training (`test=False`).
+Restart from the base model when replacing the older vision-only adapters.
 
 Model output logging is enabled by default for detailed long training, including
 healthy steps. `[ModelA Request]` and `[ModelA Output]` show the active backend,

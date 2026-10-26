@@ -39,7 +39,7 @@ from .logging_utils import quiet_quantization_cast_notices, output_preview
 
 # Runtime-visibility stamp: printed when the trainer initializes, so live logs
 # always reveal which bridge change set is actually executing.
-_CODE_STAMP = "sword-grpo-bridge agent-output/quantization-v5"
+_CODE_STAMP = "sword-grpo-bridge text-lora-connectivity/v6"
 
 
 def format_rollout_prompt(tokenizer, prompt: str) -> Tuple[str, bool]:
@@ -113,58 +113,73 @@ def _peft_base_layer_types() -> tuple:
     return tuple(types)
 
 
-def peft_compatible_target_names(model: nn.Module, requested: List[str]) -> List[str]:
-    """
-    Redirect target names that resolve only to PEFT-incompatible wrapper modules.
+def _text_language_root(model: nn.Module) -> Optional[str]:
+    """Find the separate language decoder of a multimodal model, if present."""
+    roots = [name for name, _ in model.named_modules()
+             if name == "language_model" or name.endswith(".language_model")]
+    return min(roots, key=len) if roots else None
 
-    Gemma4 hides attention projections inside custom wrappers such as
-    Gemma4ClippableLinear (containing a bitsandbytes Linear8bitLt). PEFT matches
-    targets by module NAME and then dispatches replacements by module CLASS, so
-    the wrapper's name (e.g. "q_proj") resolves to an unsupported class even
-    though its inner layer is standard. In that case redirect the target to the
-    inner supported layer ("q_proj.linear"): the wrapper keeps its clipping and
-    forward logic, and the adapter is attached to the projection itself.
+
+def peft_compatible_target_names(
+    model: nn.Module, requested: List[str], *, text_only: bool = False,
+) -> List[str]:
+    """Resolve each projection without dropping supported siblings.
+
+    A suffix can match both language Linear8bitLt layers and vision wrappers.
+    Replacing that suffix globally with ``.linear`` silently loses the language
+    layers. Use qualified names for mixed matches, redirecting only the actual
+    wrappers. Text GRPO scopes multimodal targets to the language decoder.
     """
     supported = _peft_base_layer_types()
     named_modules = list(model.named_modules())
+    modules_by_name = dict(named_modules)
+    text_root = _text_language_root(model) if text_only else None
+    if text_root:
+        print(f"[GRPO] Text LoRA scope: {text_root}; selecting the language decoder", flush=True)
     adapted = []
-    changed = False
     for target in requested:
-        matches = [m for key, m in named_modules if key == target or key.endswith("." + target)]
+        all_matches = [(key, module) for key, module in named_modules
+                       if key == target or key.endswith("." + target)]
+        matches = [(key, module) for key, module in all_matches
+                   if not text_root or key.startswith(text_root + ".")]
         if not matches:
+            if all_matches and text_root:
+                raise ValueError(f"LoRA target '{target}' matches only outside the text language decoder "
+                                 f"'{text_root}'; these adapters cannot train text GRPO")
             print(f"[GRPO] LoRA target scan: '{target}' -> no module matched; "
                   f"PEFT may resolve it differently at attach time", flush=True)
             adapted.append(target)
             continue
-        classes = sorted({type(m).__name__ for m in matches})
-        classes = sorted({type(m).__name__ for m in matches})
-        unsupported = [m for m in matches if not isinstance(m, supported)]
+        classes = sorted({type(module).__name__ for _, module in matches})
+        unsupported = [(key, module) for key, module in matches if not isinstance(module, supported)]
         if not unsupported:
             print(f"[GRPO] LoRA target scan: '{target}' -> {len(matches)} module(s), "
                   f"all classes dispatchable: {classes}", flush=True)
-            adapted.append(target)
+            if text_root:
+                adapted.extend(key for key, _ in matches)
+            else:
+                adapted.append(target)
             continue
-        # Mixed matches are common on heterogeneous models (e.g. Gemma4 with
-        # plain Linear8bitLt projections alongside ClippableLinear-wrapped
-        # ones). "Some dispatchable" is NOT enough: PEFT raises when it reaches
-        # a wrapped one, so redirect to the wrapper's inner supported layer.
-        inner = [m for key, m in named_modules
-                 if key.endswith("." + target + ".linear") and isinstance(m, supported)]
-        if inner:
-            cover_note = (f" (PARTIAL coverage: {len(unsupported)} of {len(matches)} "
-                          f"matched modules are wrapper-only)" if len(unsupported) != len(matches) else "")
-            print(f"[GRPO] LoRA target scan: '{target}' -> {len(matches)} module(s), "
-                  f"classes {classes}, redirecting {len(unsupported)} non-dispatchable one(s) "
-                  f"to '{target}.linear'{cover_note}", flush=True)
+        missing = [key for key, _ in unsupported
+                   if not isinstance(modules_by_name.get(key + ".linear"), supported)]
+        if missing:
+            # Fail before PEFT mutates a subset of the model. Finding one valid
+            # inner layer does not establish coverage of every matched wrapper.
+            raise ValueError(f"LoRA target '{target}' contains unsupported modules without a "
+                             f"dispatchable '.linear' child: {missing}")
+        if not text_root and len(unsupported) == len(matches):
             adapted.append(target + ".linear")
-            changed = True
-            continue
-        print(f"[GRPO] LoRA target scan: '{target}' -> {len(matches)} module(s), classes "
-              f"{classes}: {len(unsupported)} NOT dispatchable and no supported inner "
-              f"'.linear' layer was found", flush=True)
-        adapted.append(target)
-    if changed:
-        print(f"[GRPO] Adjusted LoRA targets for PEFT-compatible modules: {adapted}", flush=True)
+        else:
+            adapted.extend(key if isinstance(module, supported) else key + ".linear"
+                           for key, module in matches)
+        print(f"[GRPO] LoRA target scan: '{target}' -> {len(matches)} module(s), classes {classes}; "
+              f"retained {len(matches) - len(unsupported)} direct projections and redirected "
+              f"{len(unsupported)} wrappers", flush=True)
+    adapted = list(dict.fromkeys(adapted))
+    if adapted != requested:
+        preview = adapted[:8]
+        print(f"[GRPO] Resolved {len(adapted)} LoRA targets: {preview}"
+              f"{' ...' if len(adapted) > len(preview) else ''}", flush=True)
     return adapted
 
 
@@ -819,6 +834,7 @@ class GRPOBridge:
             "token": self.config.hf_token, "cache_dir": self.config.model_cache_dir,
             "revision": self.config.model_revision, "local_files_only": self.config.local_files_only,
         }
+        adapter_targets = None
         if model is not None and tokenizer is not None:
             self.trainer_model = model
             self.tokenizer = tokenizer
@@ -834,14 +850,17 @@ class GRPOBridge:
                         load_in_8bit=self.config.load_in_8bit,
                         **load_options,
                     )
+                    adapter_targets = peft_compatible_target_names(
+                        self.trainer_model,
+                        self.config.target_modules or ["q_proj", "k_proj", "v_proj", "o_proj"],
+                        text_only=True,
+                    )
                     self.trainer_model = FastLanguageModel.get_peft_model(
                         self.trainer_model,
                         r=self.config.lora_r,
                         lora_alpha=self.config.lora_alpha,
                         lora_dropout=self.config.lora_dropout,
-                        target_modules=peft_compatible_target_names(
-                            self.trainer_model,
-                            self.config.target_modules or ["q_proj", "k_proj", "v_proj", "o_proj"]),
+                        target_modules=adapter_targets,
                     )
                 except Exception:
                     self.trainer_model = None
@@ -900,7 +919,7 @@ class GRPOBridge:
 
                 from peft import LoraConfig, get_peft_model
                 requested_targets = self.config.target_modules or ["q_proj", "k_proj", "v_proj", "o_proj"]
-                adapter_targets = peft_compatible_target_names(self.trainer_model, requested_targets)
+                adapter_targets = peft_compatible_target_names(self.trainer_model, requested_targets, text_only=True)
                 adapter_config = LoraConfig(
                     r=self.config.lora_r,
                     lora_alpha=self.config.lora_alpha,
@@ -921,7 +940,7 @@ class GRPOBridge:
                         raise RuntimeError(
                             "PEFT attach wrapped part of the model before failing; "
                             "cannot retry without reloading the model") from exc
-                    retry_targets = peft_compatible_target_names(self.trainer_model, adapter_targets)
+                    retry_targets = peft_compatible_target_names(self.trainer_model, adapter_targets, text_only=True)
                     if retry_targets == adapter_targets:
                         raise
                     print(f"[GRPO] Retrying PEFT attach with redirected targets: "
@@ -934,10 +953,24 @@ class GRPOBridge:
                         bias="none", task_type="CAUSAL_LM",
                     )
                     self.trainer_model = get_peft_model(self.trainer_model, adapter_config)
-                # Keep the weight-sync config aligned with the module names PEFT
-                # actually wrapped, so exported adapter files name them correctly.
-                if self.config.target_modules and adapter_targets != requested_targets:
-                    self.config.target_modules = list(adapter_targets)
+                    adapter_targets = retry_targets
+
+        if adapter_targets is not None:
+            # Keep both loading paths and manual adapter export aligned with the
+            # exact modules selected, including when default targets were used.
+            self.config.target_modules = list(adapter_targets)
+            self.weight_sync.target_modules = list(adapter_targets)
+
+        trainable = [(name, param) for name, param in self.trainer_model.named_parameters()
+                     if param.requires_grad]
+        text_root = _text_language_root(self.trainer_model)
+        if text_root:
+            text_count = sum(name.startswith(text_root + ".") for name, _ in trainable)
+            print(f"[GRPO] Trainable parameter coverage: {text_count}/{len(trainable)} tensors "
+                  f"in text language decoder '{text_root}'", flush=True)
+            if not text_count:
+                raise RuntimeError("No trainable parameters in the text language decoder; "
+                                   "reload the base model and attach language LoRA targets")
 
         if (self.trainer_model is not None and hasattr(self.trainer_model, "to")
                 and not getattr(self.trainer_model, "is_loaded_in_4bit", False)

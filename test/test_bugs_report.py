@@ -387,8 +387,8 @@ def test_peft_target_redirect_with_mixed_supported_and_wrapped_matches():
     """
     Heterogeneous models (observed on Gemma4): one target name matches BOTH a
     plain Linear (dispatchable) and a wrapper module (not dispatchable). PEFT
-    raises on the wrapper, so the redirect must fire even when some matches
-    are already dispatchable.
+    raises on the wrapper. Redirect only that wrapper and retain the directly
+    dispatchable sibling rather than losing it to a global suffix replacement.
     """
     torch = pytest.importorskip("torch")
     from sword.grpo_bridge import peft_compatible_target_names
@@ -408,7 +408,7 @@ def test_peft_target_redirect_with_mixed_supported_and_wrapped_matches():
 
     model = Mixed(4)
     adapted = peft_compatible_target_names(model, ["q_proj"])
-    assert adapted == ["q_proj.linear"]
+    assert adapted == ["plain.q_proj", "wrapped.q_proj.linear"]
 
 
 def test_self_update_origin_fallback_without_direct_url():
