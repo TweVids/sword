@@ -31,7 +31,8 @@ from sword.harness.prompts import harness_repo_policy
 from sword.harness import get_harness, HarnessResult, WorkspaceSandbox
 from sword.reward import MultiMetricRewardScorer, RewardBreakdown
 from sword.checkpoint import CheckpointManager
-from sword.grpo_bridge import GRPOBridge, GRPOBridgeConfig, RolloutBatch, RolloutItem
+from sword.grpo_bridge import GRPOBridge, GRPOBridgeConfig, RolloutBatch, RolloutItem, rollout_prompt_budget
+from sword.logging_utils import quiet_quantization_cast_notices
 
 
 @dataclass
@@ -233,6 +234,10 @@ def run_long_train(
     max_seq_len = int(args.get("max_seq_len") or 2048)
     max_new_tokens = int(args.get("max_new_tokens") or 512)
     output_dir = str(args.get("output_dir") or "checkpoints")
+    harness_max_turns = int(kwargs.get("harness_max_turns", args.get("harness_max_turns", 8)))
+    keep_harness_workspaces = bool(kwargs.get("keep_harness_workspaces", args.get("keep_harness_workspaces", False)))
+    if harness_max_turns < 1:
+        raise ValueError("harness_max_turns must be positive")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -291,7 +296,8 @@ def run_long_train(
             records = uncompleted_records
 
     # 3. Model B Judge & Scorer Initialization
-    judge_options = {**kwargs, "mock_test": effective_mock}
+    quiet_quantization_cast_notices()
+    judge_options = {"log_model_outputs": show_detail_logs, **kwargs, "mock_test": effective_mock}
     b_judge_config = model_b_config(
         B_model_port, auto_unload=auto_unload_B_model, keep_alive=B_model_keep_alive, **judge_options,
     )
@@ -336,6 +342,8 @@ def run_long_train(
         local_files_only=bool(kwargs.get("local_files_only", False)),
         require_vllm=bool(kwargs.get("require_vllm", False)),
         device=device,
+        log_model_outputs=bool(kwargs.get("log_model_outputs", show_detail_logs)),
+        model_output_chars=int(kwargs.get("model_output_chars", 1200)),
     )
     bridge = GRPOBridge(config=bridge_config)
     bridge.initialize_trainer(
@@ -372,6 +380,8 @@ def run_long_train(
     visited_row_hashes = set()
     optimizer_steps = 0
     skipped_optimizer_steps = 0
+    rollout_details_path = os.path.join(output_dir, "rollout_details.jsonl")
+    trace_rollouts = bool(kwargs.get("trace_rollouts", False))
     current_step = start_step
     completed_successfully = False
 
@@ -383,6 +393,9 @@ def run_long_train(
             row_idx = (step_idx - 1) % len(records)
             current_row = records[row_idx]
             harness = get_harness(current_row.harness)
+            if harness is not None:
+                harness.workspace_parent_dir = os.path.join(output_dir, "harness_workspaces")
+                harness.keep_workspace = keep_harness_workspaces
 
             step_success = False
             log_start_len = len(reward_history_logs)
@@ -395,7 +408,7 @@ def run_long_train(
 
                 try:
                     # Rollout Phase with authentic harness prompt injection and token-budget guard
-                    prompt_token_budget = max(1, max_seq_len - max_new_tokens)
+                    prompt_token_budget = rollout_prompt_budget(bridge.tokenizer, max_seq_len, max_new_tokens)
                     with harness_repo_policy(auto_clone=not effective_mock):
                         rollout_prompt = (
                             harness.format_prompt(
@@ -411,37 +424,65 @@ def run_long_train(
                     # Complete all harness generation before loading the judge.
                     step_scores = []
                     scoring_inputs = []
+                    step_details = []
 
                     for item in batch.items:
                         tools_called = 0
                         tools_succeeded = 0
+                        h_res = None
 
                         # Multi-turn harness interaction
                         if harness is not None:
+                            harness.log_tool_outputs = bool(kwargs.get("log_model_outputs", show_detail_logs))
+                            harness.model_output_chars = int(kwargs.get("model_output_chars", 1200))
+                            turn_number = 0
                             def multi_turn_generate(turn_p: str) -> str:
+                                nonlocal turn_number
+                                turn_number += 1
                                 if turn_p == item.prompt_text:
+                                    if show_detail_logs:
+                                        print(f"[Agent Turn] rollout={len(scoring_inputs)} turn={turn_number} "
+                                              f"phase=initial tokens={len(item.response_token_ids)}", flush=True)
                                     return item.response_text
-                                return bridge.generate_single(turn_p)
+                                # Preserve the task and recent observations without
+                                # overflowing the model window as tool turns grow.
+                                history = turn_p[len(item.prompt_text):] if turn_p.startswith(item.prompt_text) else turn_p
+                                followup = harness.format_followup_prompt(
+                                    current_row.problem, history, prompt_token_budget, tokenizer=bridge.tokenizer,
+                                )
+                                turn = bridge.generate_single(followup, return_item=True)
+                                if not isinstance(turn, RolloutItem):
+                                    raise RuntimeError("Harness follow-up generation must retain sampled tokens and logprobs")
+                                item.followup_turns.append(turn)
+                                if show_detail_logs:
+                                    print(f"[Agent Turn] rollout={len(scoring_inputs)} turn={turn_number} "
+                                          f"phase=followup tokens={len(turn.response_token_ids)}", flush=True)
+                                return turn.response_text
 
                             h_res = harness.run(
                                 prompt=item.prompt_text,
                                 model_generate_fn=multi_turn_generate,
                                 task_id=current_row.problem_id,
+                                max_turns=harness_max_turns,
                             )
                             tools_called = h_res.tools_called
                             tools_succeeded = h_res.tools_succeeded
 
-                            # Use final harness text as the outcome reward while keeping
-                            # the exact sampled first-turn tokens for policy gradients.
-                            candidate_response = h_res.final_text or item.response_text
+                            # Assign the outcome reward to the complete sampled trajectory.
+                            candidate_response = h_res.final_text if getattr(h_res, "is_completed", True) else ""
+                            if show_detail_logs:
+                                print(f"[Harness {len(scoring_inputs)}] turns={getattr(h_res, 'turns', 0)} "
+                                      f"stop={getattr(h_res, 'stop_reason', 'unknown')} tools={tools_succeeded}/{tools_called} "
+                                      f"workspace={getattr(h_res, 'workspace_dir', '')} "
+                                      f"({'removed' if getattr(h_res, 'workspace_removed', False) else 'kept'})")
                         else:
                             candidate_response = item.response_text
-                        scoring_inputs.append((item, candidate_response, tools_called, tools_succeeded))
+                        scoring_inputs.append((item, candidate_response, tools_called, tools_succeeded, h_res))
 
                     bridge.vram_mgr.enter_score_phase(bridge.vllm_engine)
                     if b_judge is not None and not effective_mock:
                         b_judge.prepare_for_eval()
-                    for item, candidate_response, tools_called, tools_succeeded in scoring_inputs:
+                    for rollout_idx, (item, candidate_response, tools_called, tools_succeeded, h_res) in enumerate(scoring_inputs):
                         score_breakdown = reward_scorer.score(
                             problem=current_row.problem,
                             solution=current_row.solution,
@@ -458,12 +499,46 @@ def run_long_train(
                         item.reward = score_breakdown.total_score
                         step_scores.append(score_breakdown)
 
+                        detail = {
+                            "step": step_idx, "rollout": rollout_idx, "group_id": item.group_id,
+                            "problem_id": current_row.problem_id, "problem": current_row.problem,
+                            "scores": score_breakdown.to_dict(), "judge_scores": score_breakdown.judge_scores,
+                            "judge_source": str(score_breakdown.judge_source or (b_judge.last_evaluation_source if b_judge else "disabled")),
+                            "judge_response": score_breakdown.judge_response,
+                            "candidate_preview": candidate_response[:512], "candidate_tail": candidate_response[-512:],
+                            "candidate_chars": len(candidate_response), "response_tokens": len(item.response_token_ids),
+                            "is_truncated": item.is_truncated,
+                            "training_turn_count": 1 + len(item.followup_turns),
+                            "training_response_tokens": sum(len(turn.response_token_ids) for turn in [item] + item.followup_turns),
+                            "tools_called": tools_called, "tools_succeeded": tools_succeeded,
+                        }
+                        if h_res is not None:
+                            detail["harness"] = {
+                                "turns": getattr(h_res, "turns", 0), "stop_reason": getattr(h_res, "stop_reason", "unknown"),
+                                "is_completed": getattr(h_res, "is_completed", True),
+                                "workspace_dir": getattr(h_res, "workspace_dir", ""),
+                                "workspace_removed": getattr(h_res, "workspace_removed", False),
+                            }
+                            detail["harness_last_response_preview"] = h_res.final_text[-512:]
+                        if trace_rollouts:
+                            detail.update(
+                                candidate_response=candidate_response, first_response=item.response_text,
+                                prompt_text=item.prompt_text, prompt_token_ids=item.prompt_token_ids,
+                                response_token_ids=item.response_token_ids, rollout_logprobs=item.rollout_logprobs,
+                                tool_history=getattr(h_res, "tool_history", []) if h_res is not None else [],
+                                assistant_turns=getattr(h_res, "assistant_turns", []) if h_res is not None else [],
+                                training_turns=[{
+                                    "prompt_text": turn.prompt_text, "prompt_token_ids": turn.prompt_token_ids,
+                                    "response_text": turn.response_text, "response_token_ids": turn.response_token_ids,
+                                    "rollout_logprobs": turn.rollout_logprobs, "policy_version": turn.policy_version,
+                                    "is_truncated": turn.is_truncated,
+                                } for turn in [item] + item.followup_turns],
+                                judge_attempts=[dict(attempt) for attempt in getattr(b_judge, "last_evaluation_attempts", [])]
+                                               if b_judge is not None else [],
+                            )
+                        step_details.append(detail)
                         if score_logs:
-                            reward_history_logs.append({
-                                "step": step_idx,
-                                "problem_id": current_row.problem_id,
-                                "scores": score_breakdown.to_dict(),
-                            })
+                            reward_history_logs.append(detail)
 
                     # Release Model B VRAM before training forward / backward pass
                     if b_judge is not None:
@@ -472,12 +547,22 @@ def run_long_train(
                     # Share advantage calculation and degeneracy diagnostics with
                     # the bridge; harness outcome rewards have already been assigned.
                     bridge.compute_advantages(batch)
+                    for detail, (item, _, _, _, _) in zip(step_details, scoring_inputs):
+                        detail["advantage"] = item.advantage
                     if not batch.items:
                         raise RuntimeError("No complete rollout groups available for training")
 
                     # Execute training forward / backward step
                     metrics = bridge.train_step(batch, optimizer)
                     metrics["judge_evaluation_source"] = b_judge.last_evaluation_source if b_judge else "disabled"
+                    metrics.update(
+                        unique_responses=len({candidate for _, candidate, _, _, _ in scoring_inputs}),
+                        empty_responses=sum(not candidate.strip() for _, candidate, _, _, _ in scoring_inputs),
+                        truncated_rollouts=sum(item.is_truncated for item in batch.items),
+                        tools_called=sum(detail["tools_called"] for detail in step_details),
+                        incomplete_harness_rollouts=sum(h_res is not None and not getattr(h_res, "is_completed", True)
+                                                        for _, _, _, _, h_res in scoring_inputs),
+                    )
                     step_success = True
                     break
 
@@ -538,6 +623,12 @@ def run_long_train(
                 optimizer_steps += 1
             if kwargs.get("return_step_metrics", False):
                 step_metrics.append(dict(metrics))
+            # Trace IO runs after committing the completed step so an IO error
+            # cannot leave an updated policy checkpointed under the prior step.
+            if score_logs:
+                with open(rollout_details_path, "a", encoding="utf-8") as detail_file:
+                    for detail in step_details:
+                        detail_file.write(json.dumps(detail, ensure_ascii=False) + "\n")
 
             # Logging
             if show_detail_logs:
@@ -550,12 +641,41 @@ def run_long_train(
                     f"GradNorm: {grad_norm_disp:.6g} | "
                     f"Avg Reward: {avg_reward:.3f} | "
                     f"RewardStd: {metrics.get('reward_std', 0.0):.6g} | "
+                    f"AdvMax: {metrics.get('advantage_abs_max', 0.0):.6g} | "
+                    f"TrainTurns: {metrics.get('training_turns', 0)} | "
                     f"Truth: {avg_truth:.2f} | "
                     f"Judge: {metrics['judge_evaluation_source']} | "
                     f"Update: {'skipped' if metrics.get('optimizer_step_skipped') else 'applied'} | "
                     f"Harness: {current_row.harness or 'none'} | "
                     f"Diff: {current_row.difficulty}"
                 )
+                if metrics.get("reward_std", 1.0) <= 1e-6 or metrics.get("optimizer_step_skipped", False):
+                    reason = "Uniform rewards" if metrics.get("reward_std", 1.0) <= 1e-6 else "Zero-gradient step"
+                    print(f"[GRPO] {reason}: unique responses {metrics['unique_responses']}/{len(batch.items)}, "
+                          f"empty {metrics['empty_responses']}, truncated {metrics['truncated_rollouts']}, "
+                          f"tools called {metrics['tools_called']}; policy loss {metrics.get('policy_loss', 0):.6g}, "
+                          f"entropy penalty {metrics.get('entropy_penalty', 0):.6g}, "
+                          f"gradient buffers {metrics.get('tensors_with_grad', 0)}/{metrics.get('trainable_tensors', 0)}")
+                    print(f"[GRPO] Gradient signal: max advantage {metrics.get('advantage_abs_max', 0):.6g}, "
+                          f"unique first turns {metrics.get('unique_first_turns', 0)}/{len(batch.items)}, "
+                          f"unique trajectories {metrics.get('unique_training_trajectories', 0)}/{len(batch.items)}, "
+                          f"training turns {metrics.get('training_turns', 0)}, "
+                          f"response tokens {metrics.get('response_token_count', 0)}, "
+                          f"nonzero gradient buffers {metrics.get('tensors_with_nonzero_grad', 0)}")
+                    print(f"[GRPO] Policy statistics: logprob min/max "
+                          f"{metrics.get('policy_logprob_min', 0):.6g}/{metrics.get('policy_logprob_max', 0):.6g}, "
+                          f"policy/rollout mean logprob {metrics.get('policy_logprob_mean', 0):.6g}/"
+                          f"{metrics.get('rollout_logprob_mean', 0):.6g}, "
+                          f"entropy {metrics.get('mean_entropy', 0):.6g}, "
+                          f"zero importance fraction {metrics.get('importance_zero_fraction', 0):.6g}; "
+                          f"reason={metrics.get('zero_gradient_reason', '')}")
+                    for detail in step_details[:2]:
+                        print(f"[GRPO Rollout {detail['rollout']}] Scores: {json.dumps(detail['scores'])}")
+                        print(f"[GRPO Response {detail['rollout']}] {detail['candidate_preview']!r}")
+                        if detail["judge_response"]:
+                            print(f"[ModelB JSON {detail['rollout']}] {detail['judge_response'][:2048]}")
+                    if score_logs:
+                        print(f"[GRPO] Rollout details: {rollout_details_path}")
 
             # Periodic checkpoint saving
             if current_step % save_steps == 0:
@@ -615,6 +735,7 @@ def run_long_train(
         "final_step": current_step,
         "optimizer_steps": optimizer_steps,
         "skipped_optimizer_steps": skipped_optimizer_steps,
+        "rollout_details_path": rollout_details_path if score_logs else None,
         "visited_rows": len(visited_row_hashes),
         "total_rows": len(records),
         "dataset_sha256": dataset_sha256,

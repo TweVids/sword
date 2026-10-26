@@ -20,16 +20,23 @@ class WorkspaceSandbox:
     Isolated directory workspace for agentic harness tool execution.
     Executes real subprocesses (bash, python) and real file operations in an isolated folder.
     """
-    def __init__(self, base_dir: Optional[str] = None, timeout_sec: float = 10.0, cleanup: bool = True):
+    def __init__(self, base_dir: Optional[str] = None, timeout_sec: float = 10.0, cleanup: bool = True,
+                 parent_dir: Optional[str] = None):
         self.cleanup = cleanup
         self.timeout_sec = timeout_sec
+        self.was_removed = False
         if base_dir:
             self.root_dir = os.path.abspath(base_dir)
             os.makedirs(self.root_dir, exist_ok=True)
             self._created_temp = False
         else:
-            self.root_dir = os.path.abspath(tempfile.mkdtemp(prefix="sword_harness_workspace_"))
+            if parent_dir:
+                parent_dir = os.path.abspath(parent_dir)
+                os.makedirs(parent_dir, exist_ok=True)
+            self.root_dir = os.path.abspath(tempfile.mkdtemp(prefix="sword_harness_workspace_", dir=parent_dir))
             self._created_temp = True
+        self._owned_root = os.path.realpath(self.root_dir)
+        self._owned_parent = os.path.dirname(self._owned_root)
 
     def _resolve_safe_path(self, path: str) -> str:
         """Ensures path resides inside workspace root directory."""
@@ -233,7 +240,9 @@ class WorkspaceSandbox:
         if not code_clean:
             return False, "Empty Python code"
 
-        script_path = os.path.join(self.root_dir, "_agent_runner.py")
+        # Never overwrite a project file to execute an assistant's Python snippet.
+        script_fd, script_path = tempfile.mkstemp(prefix=".sword_agent_", suffix=".py", dir=self.root_dir)
+        os.close(script_fd)
         try:
             with open(script_path, "w", encoding="utf-8") as f:
                 f.write(code_clean)
@@ -262,4 +271,8 @@ class WorkspaceSandbox:
     def close(self):
         """Cleans up workspace if temporary."""
         if self._created_temp and self.cleanup and os.path.exists(self.root_dir):
+            resolved = os.path.realpath(self.root_dir)
+            if resolved != self._owned_root or os.path.dirname(resolved) != self._owned_parent:
+                raise PermissionError("Refusing to remove a workspace that is not the owned temporary directory")
             shutil.rmtree(self.root_dir, ignore_errors=True)
+            self.was_removed = not os.path.exists(self.root_dir)

@@ -11,6 +11,7 @@ from typing import Dict, Any, List, Optional, Callable, Tuple
 
 from sword.harness.base import BaseHarness, HarnessResult
 from sword.harness.sandbox import WorkspaceSandbox
+from sword.harness.protocol import structured_calls, visible_response
 
 
 class CodexCliHarness(BaseHarness):
@@ -38,7 +39,7 @@ class CodexCliHarness(BaseHarness):
     def extract_code_blocks(self, text: str) -> List[str]:
         """Extracts executable python code blocks from markdown."""
         blocks = []
-        for m in re.finditer(r"```(?:python|py)?\n(.*?)```", text, re.DOTALL):
+        for m in re.finditer(r"```(?:python|py)?\n(.*?)```", visible_response(text), re.DOTALL):
             code = m.group(1).strip()
             if code and not code.startswith("*** Begin Patch"):
                 blocks.append(code)
@@ -46,22 +47,34 @@ class CodexCliHarness(BaseHarness):
 
     def extract_patches(self, text: str) -> List[str]:
         """Extracts Codex apply_patch blocks (*** Begin Patch ... *** End Patch)."""
-        return [m.group(1).strip() for m in re.finditer(r"\*\*\* Begin Patch\s*\n(.*?)\*\*\* End Patch", text, re.DOTALL)]
+        text = visible_response(text)
+        blocks = [text]
+        for call in structured_calls(text):
+            if call["name"] == "apply_patch":
+                args = call["args"]
+                if isinstance(args, str):
+                    patch = args
+                elif isinstance(args, dict):
+                    patch = args.get("patch", args.get("input", ""))
+                else:
+                    patch = ""
+                blocks.append(patch)
+        return [m.group(1).strip() for block in blocks
+                for m in re.finditer(r"\*\*\* Begin Patch\s*\n(.*?)\*\*\* End Patch", block, re.DOTALL)]
 
     def extract_exec_commands(self, text: str) -> List[str]:
         """Extracts Codex exec_command JSON payloads or bash blocks."""
         cmds: List[str] = []
+        text = visible_response(text)
         for m in re.finditer(r"```(?:bash|sh)\n(.*?)```", text, re.DOTALL):
             c = m.group(1).strip()
             if c:
                 cmds.append(c)
-        for m in re.finditer(r"(\{[^{}]*\"cmd\"\s*:\s*\"[^\"]+\"[^{}]*\})", text):
-            try:
-                obj = json.loads(m.group(1))
-                if isinstance(obj, dict) and obj.get("cmd"):
-                    cmds.append(str(obj["cmd"]))
-            except Exception:
-                pass
+        for call in structured_calls(text):
+            if call["name"] in ("exec_command", "shell", "bash", "run_shell_command") and isinstance(call["args"], dict):
+                command = call["args"].get("cmd") or call["args"].get("command")
+                if command:
+                    cmds.append(str(command))
         return cmds
 
     def apply_codex_patch(self, patch_body: str, sandbox: WorkspaceSandbox) -> Tuple[bool, str]:
@@ -183,11 +196,13 @@ class CodexCliHarness(BaseHarness):
         self,
         prompt: str,
         model_generate_fn: Callable[[str], str],
-        max_turns: int = 2,
+        max_turns: int = 8,
         task_id: str = "",
     ) -> HarnessResult:
         """Runs the authentic Codex CLI multi-turn code verification and repair loop."""
-        sandbox = WorkspaceSandbox(base_dir=self.workspace_dir, timeout_sec=self.timeout_sec)
+        if max_turns < 1:
+            raise ValueError("max_turns must be positive")
+        sandbox = self.create_sandbox()
         curr_prompt = prompt
         tools_called = 0
         tools_succeeded = 0
@@ -195,11 +210,15 @@ class CodexCliHarness(BaseHarness):
         history: List[Dict[str, Any]] = []
         final_text = ""
         reasoning_text = ""
+        assistant_turns = []
+        is_completed = False
+        stop_reason = "turn_limit"
 
         try:
             for turn in range(max(1, max_turns)):
                 response = model_generate_fn(curr_prompt)
                 final_text = response
+                assistant_turns.append({"turn": turn, "response": response})
                 r = self.extract_reasoning(response)
                 if r:
                     reasoning_text = r
@@ -209,7 +228,14 @@ class CodexCliHarness(BaseHarness):
                 code_blocks = self.extract_code_blocks(response)
 
                 if not patches and not exec_cmds and not code_blocks:
-                    break
+                    if self.has_final_answer(response):
+                        is_completed, stop_reason = True, "final_response"
+                        break
+                    if turn >= max_turns - 1:
+                        stop_reason = "missing_final_answer" if response.strip() else "empty_response"
+                        break
+                    curr_prompt = self.unfinished_feedback(curr_prompt, response)
+                    continue
 
                 turn_succeeded = 0
                 turn_failed = 0
@@ -218,6 +244,7 @@ class CodexCliHarness(BaseHarness):
                 for p_idx, patch_body in enumerate(patches):
                     tools_called += 1
                     ok, msg = self.apply_codex_patch(patch_body, sandbox)
+                    self.log_tool_result(turn, "apply_patch", ok, msg)
                     if ok:
                         tools_succeeded += 1
                         turn_succeeded += 1
@@ -231,6 +258,7 @@ class CodexCliHarness(BaseHarness):
                 for c_idx, cmd in enumerate(exec_cmds):
                     tools_called += 1
                     ok, msg = sandbox.run_bash(cmd)
+                    self.log_tool_result(turn, "exec_command", ok, msg)
                     if ok:
                         tools_succeeded += 1
                         turn_succeeded += 1
@@ -244,6 +272,7 @@ class CodexCliHarness(BaseHarness):
                 for idx, block in enumerate(code_blocks):
                     tools_called += 1
                     ok, msg = self.validate_and_execute(block, sandbox)
+                    self.log_tool_result(turn, "python", ok, msg)
                     if ok:
                         tools_succeeded += 1
                         turn_succeeded += 1
@@ -260,14 +289,20 @@ class CodexCliHarness(BaseHarness):
                         "message": msg,
                     })
 
-                if turn_failed == 0 or turn >= max_turns - 1:
+                if self.has_final_answer(response) and not patches and not exec_cmds and turn_failed == 0:
+                    is_completed = True
+                    stop_reason = "final_response"
+                    break
+                if turn >= max_turns - 1:
                     break
 
                 feedback_report = "\n".join(feedback_items)
                 curr_prompt = (
                     f"{curr_prompt}\n\nModel:\n{response}\n\n"
                     f"Codex CLI Execution Feedback:\n{feedback_report}\n\n"
-                    "Please fix the code errors and output the corrected version."
+                    "Inspect the execution feedback. Fix errors, edit or verify as needed, "
+                    "then provide Final Answer: when the task is complete. "
+                    "Successful tool execution alone does not complete the task."
                 )
 
         finally:
@@ -285,5 +320,8 @@ class CodexCliHarness(BaseHarness):
             tools_failed=tools_failed,
             tool_history=history,
             success_rate=success_rate,
-            is_completed=True,
+            is_completed=is_completed,
+            error_message=None if is_completed else "No final answer before " + stop_reason,
+            turns=len(assistant_turns), stop_reason=stop_reason, assistant_turns=assistant_turns,
+            workspace_dir=sandbox.root_dir, workspace_removed=sandbox.was_removed,
         )

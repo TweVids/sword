@@ -166,8 +166,9 @@ layers. Mock training disables automatic setup by default. If both judges fail,
 training can still use deterministic rewards; `train_result["b_model"]["evaluation_counts"]` records
 that explicitly and the real compatibility runner reports `ok=False`.
 
-Training logs show `RewardStd` (within-group reward standard deviation), `Judge`,
-and whether the optimizer update ran. Identical rewards produce zero GRPO
+Training logs show `RewardStd` (within-group reward standard deviation), `AdvMax`
+(largest absolute advantage), `TrainTurns`, `Judge`, and whether the optimizer
+update ran. Identical rewards produce zero GRPO
 advantages; a constant reward across steps still supplies no learning signal.
 Zero-gradient steps preserve weights and optimizer state instead of applying
 Adam momentum or weight decay. Loss and gradient metrics retain their precision;
@@ -180,6 +181,87 @@ The long trainer shares the bridge's optional historical reward baseline. Set
 The coding diagnostic tasks use Model B's semantic truth scores; numeric answer
 verification remains enabled for the math task. `b_model=False` uses local
 heuristics without constructing an Ollama judge.
+
+Instruction-tuned rollouts use the tokenizer's chat template and assistant
+generation prefix. The bridge sends exact prompt token IDs to vLLM so BOS is
+not inserted twice, and reserves template overhead in the harness prompt budget.
+The five-step diagnostic defaults to `max_new_tokens=512`; an explicit
+`Argument["max_new_tokens"]` still overrides it.
+
+When rewards are uniform or an update is skipped, logs print up to two response previews and raw judge
+JSON results, plus counts of unique, empty, and truncated responses and tool
+calls. `score_logs=True` also writes `rollout_details.jsonl` in the output
+directory. Diagnostics enable `trace_rollouts=True` to include complete first
+and final responses, sampled token IDs, rollout logprobs, and tool history;
+normal long training records previews unless tracing is explicitly enabled.
+Blank output earns no formatting credit. Live judge responses missing truth,
+formatting, reasoning-rule, or answer-rule scores are retried without thinking
+and then with the configured fallback instead of being reported as successful
+live scoring with missing values filled by zero.
+
+Harnesses execute tools, return their results to the model, and continue for up
+to eight turns per rollout. Successful tools alone do not end the interaction.
+An explicit `Final Answer:` or `Final Solution:` with a result ends the loop; a labelled final code answer can
+also finish after its implicit code checks pass. A rollout still calling tools
+at the turn limit is marked incomplete and supplies an empty final answer to
+the scorer. Set `Argument["harness_max_turns"]` to change the limit. Follow-up
+prompts retain the original task and recent tool observations within the model
+context budget; older turns are dropped when necessary.
+
+Thinking-only responses, plans, and incomplete tool calls receive feedback and
+continue the loop. Tool parsing accepts tagged, fenced, bare, and function-style
+JSON with nested or stringified arguments. Tool-shaped text inside thinking is
+excluded from execution. These policy-driven adapters execute real filesystem,
+patch, Python, and shell operations using the upstream harness tool conventions.
+
+Training uses every sampled assistant turn, including follow-up actions and final
+answers, with each turn's exact prompt tokens and rollout logprobs. One group
+advantage is assigned per trajectory and applied to its assistant tokens; tool
+observations remain context. This avoids discarding the distinguishing later
+turns when first tool calls are identical. Training work grows with the number
+of turns; microbatching still bounds the forward/backward batch size.
+
+Nonzero reward variation can still produce zero gradients when the trained
+trajectories are identical, the adapters are disconnected, or importance weights
+underflow. Skipped steps report the largest advantage, unique first turns and
+trajectories, token counts, gradient-buffer connectivity, policy/rollout logprobs,
+and zero importance-weight fraction. Tracing also saves the exact data for all
+training turns in `rollout_details.jsonl`. The bridge startup stamp for this
+change is `sword-grpo-bridge agent-output/quantization-v5`; load this updated checkout
+and restart the target runtime before rerunning.
+
+Model output logging is enabled by default for detailed long training, including
+healthy steps. `[ModelA Request]` and `[ModelA Output]` show the active backend,
+sampled text, token counts, and truncation for initial and follow-up generations.
+`[Agent Turn]` and `[Agent Tool]` show each iteration and its actual tool result.
+`[ModelB Request]`, `[ModelB Output]`, and `[ModelB Scores]` show every judge
+attempt and its returned JSON before parsing. Thinking-only judge responses show
+a thinking preview, and failed retries or deterministic scoring are labelled.
+`trace_rollouts=True` also saves judge attempts and every training turn.
+
+Use `log_model_outputs=False` to disable the output bodies and tool previews.
+`model_output_chars` defaults to `1200` and retains the beginning and end of long
+responses; `0` prints the full response. Judge-only overrides are
+`B_model_log_outputs` and `B_model_output_chars`. Keep `show_detail_logs=True`
+to see turn labels and step summaries.
+
+Each rollout creates a fresh directory under `<output_dir>/harness_workspaces`.
+Files persist across that rollout's turns, and the directory is removed when
+the harness exits. Set `Argument["keep_harness_workspaces"] = True` to retain
+the directories for inspection. A harness constructed directly with an explicit
+`workspace_dir` reuses that caller-owned project and never automatically wipes
+it. Logs and rollout details record turn counts, stop reasons, workspace paths,
+and whether cleanup succeeded; tracing also saves all assistant turns.
+
+Sword suppresses the repetitive bitsandbytes `MatMul8bitLt: inputs will be cast
+from ... to float16 during quantization` notice. Other warnings and errors remain
+visible. The guard is reinstalled after dependency imports and at generation/
+training boundaries, and handles logger-filter and warning-policy resets.
+Negative GRPO policy loss is valid because it minimizes a negated
+advantage-weighted objective. Its sign or proximity to zero does not establish
+learning: check reward variation, nonzero gradients, optimizer updates, and truth
+scores. Uniform-reward logs separate policy loss from the weighted entropy
+penalty, which can produce a small nonzero total loss without reward signal.
 
 ### Target environment setup and test suite
 

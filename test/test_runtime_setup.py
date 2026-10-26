@@ -279,7 +279,7 @@ def test_scorer_restarts_crashed_ollama_then_uses_the_smaller_model():
     from sword.reward import MultiMetricRewardScorer
     crashed = False
     models = []
-    scores = json.dumps({"truth": 1, "rule_reasoning_follow": 1, "formatted": 1})
+    scores = json.dumps({"truth": 1, "rule_reasoning_follow": 1, "rule_answer_follow": 1, "formatted": 1})
 
     def get(url, **_):
         if crashed:

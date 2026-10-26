@@ -27,6 +27,9 @@ class RewardBreakdown:
     cheating: bool = False
     total_score: float = 0.0
     is_agentic: bool = False
+    judge_scores: Dict[str, Any] = field(default_factory=dict)
+    judge_response: str = ""
+    judge_source: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -129,6 +132,8 @@ class MultiMetricRewardScorer:
         Awards 1.0 for clean tags and balanced fences, 0.5 to 0.8 for minor flaws, 0.0 for broken output.
         """
         text = candidate_response.strip()
+        if not text:
+            return 0.0
         score = 1.0
 
         # Check thinking channel tags
@@ -227,4 +232,7 @@ class MultiMetricRewardScorer:
             cheating=cheating,
             total_score=total_score,
             is_agentic=is_agentic,
+            judge_scores=b_res.to_dict(),
+            judge_response=b_res.raw_response,
+            judge_source=getattr(self.b_model_judge, "last_evaluation_source", "unknown") if self.b_model_judge is not None else "disabled",
         )

@@ -10,6 +10,7 @@ from typing import Dict, Any, List, Optional, Callable, Tuple
 
 from sword.harness.base import BaseHarness, HarnessResult
 from sword.harness.sandbox import WorkspaceSandbox
+from sword.harness.protocol import structured_calls, visible_response
 
 
 class PiHarness(BaseHarness):
@@ -38,9 +39,10 @@ class PiHarness(BaseHarness):
     def parse_actions(self, text: str) -> List[Dict[str, Any]]:
         """Extracts Pi foundational actions (read, write, edit, bash) or code blocks."""
         actions = []
+        text = visible_response(text)
 
         # 1. Structured action directives: Action: read path / Action: bash cmd / Action: write path \n content
-        for match in re.finditer(r"(?:^|\n)Action:\s*(read|write|edit|bash|python)\s+(.+?)(?=\n(?:Plan|Observation|Reflection|Action|$))", text, re.DOTALL | re.IGNORECASE):
+        for match in re.finditer(r"(?:^|\n)Action:\s*(read|write|edit|bash|python)\s+(.+?)(?=\n(?:Plan|Observation|Reflection|Action|Final Answer)|\Z)", text, re.DOTALL | re.IGNORECASE):
             tool_name = match.group(1).lower()
             args_raw = match.group(2).strip()
             actions.append({"tool": tool_name, "raw_args": args_raw})
@@ -49,19 +51,11 @@ class PiHarness(BaseHarness):
         for match in re.finditer(r"```(bash|sh|python)\n(.*?)```", text, re.DOTALL):
             lang = match.group(1).lower()
             code = match.group(2).strip()
-            actions.append({"tool": "bash" if lang in ("bash", "sh") else "python", "raw_args": code})
+            actions.append({"tool": "bash" if lang in ("bash", "sh") else "python", "raw_args": code, "source": "code_block"})
 
         # 3. JSON tool calls (markdown json blocks or <tool_call> blocks)
-        for pattern in (r"```json\s*(\{.*?\})\s*```", r"<tool_call>\s*(\{.*?\})\s*</tool_call>"):
-            for match in re.finditer(pattern, text, re.DOTALL):
-                try:
-                    data = json.loads(match.group(1))
-                    if isinstance(data, dict):
-                        tool_name = data.get("action") or data.get("tool") or data.get("name")
-                        if tool_name:
-                            actions.append({"tool": tool_name, "params": data.get("parameters") or data.get("args") or data})
-                except Exception:
-                    pass
+        for call in structured_calls(text):
+            actions.append({"tool": call["name"], "params": call["args"], "valid_json": call["valid_json"]})
 
         return actions
 
@@ -70,6 +64,8 @@ class PiHarness(BaseHarness):
         tool = str(act.get("tool", "")).lower()
         raw = str(act.get("raw_args", "")).strip()
         params = act.get("params", {})
+        if not act.get("valid_json", True) or not isinstance(params, dict):
+            return False, "Malformed tool arguments. Emit a complete JSON object."
 
         if tool in ("bash", "sh"):
             cmd = raw or params.get("command") or params.get("cmd") or ""
@@ -135,11 +131,13 @@ class PiHarness(BaseHarness):
         self,
         prompt: str,
         model_generate_fn: Callable[[str], str],
-        max_turns: int = 2,
+        max_turns: int = 8,
         task_id: str = "",
     ) -> HarnessResult:
         """Runs the authentic Pi multi-turn plan/action/observation cycle."""
-        sandbox = WorkspaceSandbox(base_dir=self.workspace_dir, timeout_sec=self.timeout_sec)
+        if max_turns < 1:
+            raise ValueError("max_turns must be positive")
+        sandbox = self.create_sandbox()
         curr_prompt = prompt
         tools_called = 0
         tools_succeeded = 0
@@ -147,23 +145,36 @@ class PiHarness(BaseHarness):
         history: List[Dict[str, Any]] = []
         final_text = ""
         reasoning_text = ""
+        assistant_turns = []
+        is_completed = False
+        stop_reason = "turn_limit"
 
         try:
             for turn in range(max(1, max_turns)):
                 response = model_generate_fn(curr_prompt)
                 final_text = response
+                assistant_turns.append({"turn": turn, "response": response})
                 r = self.extract_reasoning(response)
                 if r:
                     reasoning_text = r
 
                 actions = self.parse_actions(response)
                 if not actions:
-                    break
+                    if self.has_final_answer(response):
+                        is_completed, stop_reason = True, "final_response"
+                        break
+                    if turn >= max_turns - 1:
+                        stop_reason = "missing_final_answer" if response.strip() else "empty_response"
+                        break
+                    curr_prompt = self.unfinished_feedback(curr_prompt, response)
+                    continue
 
                 turn_feedbacks = []
+                failures_before = tools_failed
                 for act in actions:
                     tools_called += 1
                     ok, msg = self.execute_action_in_sandbox(act, sandbox)
+                    self.log_tool_result(turn, act.get("tool"), ok, msg)
                     if ok:
                         tools_succeeded += 1
                     else:
@@ -173,13 +184,18 @@ class PiHarness(BaseHarness):
                     turn_feedbacks.append(f"{tag}: {msg}")
                     history.append({"turn": turn, "action": act, "success": ok, "output": msg})
 
+                if (self.has_final_answer(response) and tools_failed == failures_before
+                        and all(action.get("source") == "code_block" for action in actions)):
+                    is_completed = True
+                    stop_reason = "final_response"
+                    break
                 if turn >= max_turns - 1:
                     break
 
                 feedback_str = "\n".join(turn_feedbacks)
                 curr_prompt = (
                     f"{curr_prompt}\n\nModel:\n{response}\n\n"
-                    f"{feedback_str}\n\nProceed to complete task or state Final Answer:"
+                    f"{feedback_str}\n\nInspect the observations, edit or verify as needed, then provide Final Answer: when done."
                 )
 
         finally:
@@ -197,5 +213,8 @@ class PiHarness(BaseHarness):
             tools_failed=tools_failed,
             tool_history=history,
             success_rate=success_rate,
-            is_completed=True,
+            is_completed=is_completed,
+            error_message=None if is_completed else "No final answer before " + stop_reason,
+            turns=len(assistant_turns), stop_reason=stop_reason, assistant_turns=assistant_turns,
+            workspace_dir=sandbox.root_dir, workspace_removed=sandbox.was_removed,
         )

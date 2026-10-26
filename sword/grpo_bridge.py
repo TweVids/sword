@@ -35,10 +35,46 @@ except Exception:
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from .rl.policy import token_statistics, safe_optimizer_step
 from .defaults import DEFAULT_GRPO_MODEL
+from .logging_utils import quiet_quantization_cast_notices, output_preview
 
 # Runtime-visibility stamp: printed when the trainer initializes, so live logs
 # always reveal which bridge change set is actually executing.
-_CODE_STAMP = "sword-grpo-bridge reward-stall-diagnostics/v1"
+_CODE_STAMP = "sword-grpo-bridge agent-output/quantization-v5"
+
+
+def format_rollout_prompt(tokenizer, prompt: str) -> Tuple[str, bool]:
+    """Use the model's assistant-generation template when one is configured."""
+    if getattr(tokenizer, "chat_template", None) and callable(getattr(tokenizer, "apply_chat_template", None)):
+        return tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True,
+        ), True
+    return prompt, False
+
+
+def tokenize_rollout_prompt(tokenizer, prompt: str, max_prompt_tokens: Optional[int] = None):
+    text, is_chat = format_rollout_prompt(tokenizer, prompt)
+    options = {"return_tensors": "pt"}
+    if is_chat:
+        # The template already inserts BOS and role markers. Do not add BOS twice
+        # or truncate away the task/assistant prefix after template rendering.
+        options["add_special_tokens"] = False
+    elif max_prompt_tokens is not None:
+        options.update(truncation=True, max_length=max_prompt_tokens)
+    inputs = tokenizer(text, **options)
+    if is_chat and max_prompt_tokens is not None and inputs["input_ids"].shape[-1] > max_prompt_tokens:
+        raise ValueError("Chat-formatted rollout prompt exceeds the prompt token budget; shorten the prompt or increase max_seq_len")
+    return inputs, is_chat
+
+
+def rollout_prompt_budget(tokenizer, max_model_len: int, max_new_tokens: int) -> int:
+    """Reserve role-marker tokens before the harness trims its instructions."""
+    budget = max_model_len - max_new_tokens
+    if getattr(tokenizer, "chat_template", None):
+        inputs, _ = tokenize_rollout_prompt(tokenizer, "")
+        budget -= inputs["input_ids"].shape[-1] + 8
+    if budget < 1:
+        raise ValueError("max_seq_len must leave room for the chat template, task, and response")
+    return budget
 
 
 def _peft_base_layer_types() -> tuple:
@@ -184,6 +220,8 @@ class GRPOBridgeConfig:
     model_revision: Optional[str] = None
     local_files_only: bool = False
     require_vllm: bool = False
+    log_model_outputs: bool = True
+    model_output_chars: int = 1200
 
     def __post_init__(self):
         if self.load_in_4bit and self.load_in_8bit:
@@ -211,6 +249,7 @@ class RolloutItem:
     group_id: int = 0
     policy_version: int = 0
     is_truncated: bool = False
+    followup_turns: List["RolloutItem"] = field(default_factory=list)
 
 
 @dataclass
@@ -620,12 +659,25 @@ class DualCorrectionGRPOLoss(nn.Module):
         metrics = {
             "grpo_loss": total_loss.item(),
             "policy_loss": policy_loss.item(),
+            "entropy_loss": entropy_loss.item(),
             "mean_ratio": round(ratio_on_policy.masked_select(target_mask).mean().item() if target_mask.any() else 1.0, 4),
             "mean_is_weight": round(is_weight.masked_select(target_mask).mean().item() if target_mask.any() else 1.0, 4),
             "mean_entropy": round(mean_entropy.item(), 4),
             "effective_clip_eps": round(effective_clip_eps, 4),
             "mean_advantage": round(advantages.mean().item(), 4),
+            "response_token_count": int(target_mask.sum().item()),
+            "policy_stats_require_grad": policy_logprobs.requires_grad,
         }
+        if target_mask.any():
+            policy_values = policy_logprobs.detach().masked_select(target_mask)
+            old_values = vllm_old_logprobs.masked_select(target_mask)
+            weights = is_weight.masked_select(target_mask)
+            metrics.update(
+                policy_logprob_min=policy_values.min().item(), policy_logprob_max=policy_values.max().item(),
+                policy_logprob_mean=policy_values.mean().item(), rollout_logprob_mean=old_values.mean().item(),
+                importance_weight_min=weights.min().item(), importance_weight_max=weights.max().item(),
+                importance_zero_fraction=(weights == 0).float().mean().item(),
+            )
         return total_loss, metrics
 
 
@@ -652,10 +704,9 @@ class FallbackRolloutEngine:
         eos_ids = getattr(self.tokenizer, "eos_token_id", None)
         eos_ids = set(eos_ids if isinstance(eos_ids, (list, tuple)) else [eos_ids])
         for prompt in prompts:
-            tokenization_args = {"return_tensors": "pt"}
-            if max_model_len is not None:
-                tokenization_args.update(truncation=True, max_length=max_model_len - max_new_tokens)
-            raw_inputs = self.tokenizer(prompt, **tokenization_args)
+            raw_inputs, _ = tokenize_rollout_prompt(
+                self.tokenizer, prompt, max_model_len - max_new_tokens if max_model_len is not None else None,
+            )
             if hasattr(raw_inputs, "to"):
                 inputs = raw_inputs.to(device)
             elif isinstance(raw_inputs, dict):
@@ -761,6 +812,7 @@ class GRPOBridge:
     ):
         """Initializes the Unsloth or PEFT trainer model with LoRA adapters and checkpointing."""
         import sys as _sys
+        quiet_quantization_cast_notices()
         print(f"[GRPO] bridge code {_CODE_STAMP} (from {_sys.modules[__name__].__file__})", flush=True)
         self.mock_test = bool(mock_test or kwargs.get("mock_test", False))
         load_options = {
@@ -815,7 +867,7 @@ class GRPOBridge:
                         def __call__(self, text, return_tensors="pt", **_kw):
                             return {"input_ids": torch.tensor([[2, 10, 20, 30]], dtype=torch.long)}
                         def decode(self, token_ids, skip_special_tokens=True):
-                            return f"mock output ({len(token_ids)} tokens)"
+                            return f"Final Answer: mock output ({len(token_ids)} tokens)"
                     self.tokenizer = MockTokenizer()
                 else:
                     try:
@@ -1007,6 +1059,7 @@ class GRPOBridge:
         Generates concurrency_g rollouts per prompt using vLLM or the fallback engine.
         Extracts token log probabilities and uses versioned LoRARequest.
         """
+        quiet_quantization_cast_notices()
         batch = RolloutBatch(
             policy_version=self.weight_sync.policy_version,
             concurrency_g=self.config.concurrency_g,
@@ -1020,7 +1073,21 @@ class GRPOBridge:
                 prompt_group_map.append(g_idx)
 
         use_fallback = self.vllm_engine is None
+        if self.config.log_model_outputs:
+            print(f"[ModelA Request] model={self.config.model_name} backend={'pytorch' if use_fallback else 'vllm'} "
+                  f"rollouts={len(expanded_prompts)} max_tokens={self.config.max_new_tokens}", flush=True)
         if not use_fallback:
+            # Token prompts prevent vLLM from inserting another BOS into an
+            # already-rendered chat template. Preserve original text for harnesses.
+            engine_prompts = []
+            for prompt in expanded_prompts:
+                if getattr(self.tokenizer, "chat_template", None):
+                    inputs, _ = tokenize_rollout_prompt(
+                        self.tokenizer, prompt, self.config.max_model_len - self.config.max_new_tokens,
+                    )
+                    engine_prompts.append({"prompt_token_ids": inputs["input_ids"][0].tolist()})
+                else:
+                    engine_prompts.append(prompt)
             try:
                 self.vram_mgr.enter_rollout_phase(self.trainer_model, self.vllm_engine)
                 from vllm import SamplingParams
@@ -1033,9 +1100,9 @@ class GRPOBridge:
                 lora_req = self.weight_sync.get_current_lora_request()
                 try:
                     if lora_req is not None:
-                        outputs = self.vllm_engine.generate(expanded_prompts, sp, lora_request=lora_req)
+                        outputs = self.vllm_engine.generate(engine_prompts, sp, lora_request=lora_req)
                     else:
-                        outputs = self.vllm_engine.generate(expanded_prompts, sp)
+                        outputs = self.vllm_engine.generate(engine_prompts, sp)
                 except torch.cuda.OutOfMemoryError:
                     # Co-residency spike (trainer + awake engine). Drain, retry once;
                     # persistent OOM surfaces to the fallback path below.
@@ -1043,9 +1110,9 @@ class GRPOBridge:
                     gc.collect()
                     torch.cuda.empty_cache()
                     if lora_req is not None:
-                        outputs = self.vllm_engine.generate(expanded_prompts, sp, lora_request=lora_req)
+                        outputs = self.vllm_engine.generate(engine_prompts, sp, lora_request=lora_req)
                     else:
-                        outputs = self.vllm_engine.generate(expanded_prompts, sp)
+                        outputs = self.vllm_engine.generate(engine_prompts, sp)
 
                 if len(outputs) != len(expanded_prompts):
                     raise ValueError("vLLM returned an incomplete rollout batch")
@@ -1053,6 +1120,8 @@ class GRPOBridge:
                 for idx, out in enumerate(outputs):
                     p_text = expanded_prompts[idx]
                     p_ids = list(out.prompt_token_ids)
+                    if isinstance(engine_prompts[idx], dict) and p_ids != engine_prompts[idx]["prompt_token_ids"]:
+                        raise ValueError("vLLM changed the supplied chat prompt token IDs")
                     resp = out.outputs[0]
                     r_text = resp.text
                     r_ids = list(resp.token_ids)
@@ -1108,19 +1177,27 @@ class GRPOBridge:
                     is_truncated=res.get("is_truncated", False),
                 ))
 
+        if self.config.log_model_outputs:
+            for idx, item in enumerate(batch.items):
+                print(f"[ModelA Output] model={self.config.model_name} backend={'pytorch' if use_fallback else 'vllm'} "
+                      f"rollout={idx} policy={item.policy_version} prompt_tokens={len(item.prompt_token_ids)} "
+                      f"response_tokens={len(item.response_token_ids)} truncated={item.is_truncated}\n"
+                      f"{output_preview(item.response_text, self.config.model_output_chars)}", flush=True)
         return batch
 
-    def generate_single(self, prompt: str) -> str:
+    def generate_single(self, prompt: str, return_item: bool = False) -> Union[str, RolloutItem]:
         """
         Generates a single model completion for prompt.
-        Used for multi-turn harness interaction and conversational rollouts.
+        Return the exact sampled tokens/logprobs too when training harness turns.
         """
         saved_g = self.config.concurrency_g
         self.config.concurrency_g = 1
         try:
             batch = self.generate_rollouts([prompt])
             if batch.items:
-                return batch.items[0].response_text
+                return batch.items[0] if return_item else batch.items[0].response_text
+            if return_item:
+                raise RuntimeError("No rollout returned for a harness follow-up turn")
             return ""
         finally:
             self.config.concurrency_g = saved_g
@@ -1208,6 +1285,12 @@ class GRPOBridge:
             "reward_min": min((it.reward for it in batch.items), default=0.0),
             "reward_max": max((it.reward for it in batch.items), default=0.0),
             "advantage_abs_max": max((abs(it.advantage) for it in batch.items), default=0.0),
+            "unique_first_turns": len({(it.group_id, tuple(it.prompt_token_ids), tuple(it.response_token_ids))
+                                       for it in batch.items}),
+            "unique_training_trajectories": len({
+                (it.group_id, tuple((tuple(turn.prompt_token_ids), tuple(turn.response_token_ids))
+                                    for turn in [it] + it.followup_turns)) for it in batch.items
+            }),
         }
         if zero_var_groups:
             if diagnostics["advantage_abs_max"] == 0:
@@ -1233,33 +1316,41 @@ class GRPOBridge:
         """
         if len(batch.items) == 0:
             return {"loss": 0.0, "step": self.global_step}
+        quiet_quantization_cast_notices()
         if batch.policy_version != self.weight_sync.policy_version or any(
             it.policy_version != batch.policy_version for it in batch.items
         ):
             raise ValueError("stale or mixed policy versions in rollout batch")
-        if any(not it.prompt_token_ids for it in batch.items):
-            raise ValueError("each rollout needs at least one prompt token for causal prediction")
         if self.config.drop_incomplete_groups:
             batch.filter_valid_groups(batch.concurrency_g)
             if not batch.items:
                 return {"loss": 0.0, "step": self.global_step}
+        # Keep one reward/advantage per trajectory, but backpropagate through
+        # every sampled assistant turn with its exact context and old logprobs.
+        # Tool observations are prompt tokens, never policy-gradient targets.
+        training_turns = [(item, turn) for item in batch.items for turn in [item] + item.followup_turns]
+        if any(not turn.prompt_token_ids for _, turn in training_turns):
+            raise ValueError("each rollout turn needs at least one prompt token for causal prediction")
+        if any(turn.policy_version != batch.policy_version for _, turn in training_turns):
+            raise ValueError("stale or mixed policy versions in harness follow-up turns")
         self.vram_mgr.enter_train_phase(self.trainer_model, self.vllm_engine)
 
         pad_id = getattr(self.tokenizer, "pad_token_id", 0) or 0
         micro_bs = max(1, self.config.micro_batch_size)
-        num_items = len(batch.items)
+        num_items = len(training_turns)
         if self.config.use_score_centering and micro_bs < num_items:
             raise ValueError("importance-weight score centering requires a single microbatch")
         num_micro_batches = math.ceil(num_items / micro_bs)
 
         # Global response token count for exact token-level loss reduction
-        global_valid_tokens = max(1, sum(len(it.response_token_ids) for it in batch.items))
+        response_tokens = sum(len(turn.response_token_ids) for _, turn in training_turns)
+        global_valid_tokens = max(1, response_tokens)
 
         optimizer.zero_grad()
         accumulated_metrics: Dict[str, float] = {}
 
         for mb_idx in range(num_micro_batches):
-            mb_items = batch.items[mb_idx * micro_bs : (mb_idx + 1) * micro_bs]
+            mb_items = training_turns[mb_idx * micro_bs : (mb_idx + 1) * micro_bs]
             if not mb_items:
                 continue
 
@@ -1268,11 +1359,11 @@ class GRPOBridge:
             advantages = []
             rollout_lps = []
 
-            for it in mb_items:
+            for trajectory, it in mb_items:
                 seq = it.prompt_token_ids + it.response_token_ids
                 padded_inputs.append(seq)
                 prompt_lens.append(len(it.prompt_token_ids))
-                advantages.append(it.advantage)
+                advantages.append(trajectory.advantage)
                 rollout_lps.append(it.rollout_logprobs)
 
             max_seq_len = max(len(s) for s in padded_inputs)
@@ -1297,17 +1388,32 @@ class GRPOBridge:
             if not torch.isfinite(mb_loss):
                 optimizer.zero_grad(set_to_none=True)
                 raise RuntimeError("Nonfinite GRPO loss; optimizer update cancelled")
+            if not mb_loss.requires_grad:
+                optimizer.zero_grad(set_to_none=True)
+                raise RuntimeError("GRPO loss is disconnected from autograd; check trainer adapters and training mode")
 
             # mb_loss is already scaled by global_valid_tokens
             mb_loss.backward()
 
             for k, v in mb_metrics.items():
-                weight = 1.0 if k in ("grpo_loss", "policy_loss") else sum(len(it.response_token_ids) for it in mb_items) / global_valid_tokens
-                accumulated_metrics[k] = accumulated_metrics.get(k, 0.0) + v * weight
+                if k.endswith("_min"):
+                    accumulated_metrics[k] = min(accumulated_metrics.get(k, math.inf), v)
+                elif k.endswith("_max"):
+                    accumulated_metrics[k] = max(accumulated_metrics.get(k, -math.inf), v)
+                elif k == "policy_stats_require_grad":
+                    accumulated_metrics[k] = bool(accumulated_metrics.get(k, True) and v)
+                else:
+                    weight = 1.0 if k in ("grpo_loss", "policy_loss", "entropy_loss", "response_token_count") else sum(len(it.response_token_ids) for _, it in mb_items) / global_valid_tokens
+                    accumulated_metrics[k] = accumulated_metrics.get(k, 0.0) + v * weight
 
         # Gradient norm clipping and gradient norm tracking
         grad_norm_val = 0.0
         trainable_params = [p for p in self.trainer_model.parameters() if p.requires_grad]
+        gradients = [p.grad for p in trainable_params if p.grad is not None]
+        grad_maxima = [gradient.detach().abs().max().float() for gradient in gradients if gradient.numel()]
+        maxima = torch.stack(grad_maxima) if grad_maxima else None
+        gradient_abs_max = maxima.max().item() if maxima is not None else 0.0
+        tensors_with_nonzero_grad = int((maxima > 0).sum().item()) if maxima is not None else 0
         if trainable_params:
             if self.config.max_grad_norm > 0.0:
                 total_norm = torch.nn.utils.clip_grad_norm_(
@@ -1325,14 +1431,31 @@ class GRPOBridge:
 
         # Adapter export is part of the update: a failed export must restore the
         # optimizer/policy rather than retry an already-applied update.
+        tensors_with_grad = sum(param.grad is not None for param in trainable_params)
         # Adam momentum and weight decay can mutate weights even with zero
         # gradients. A stalled step must preserve both policy and optimizer.
         optimizer_step_skipped = grad_norm_val == 0.0
         old_version = self.weight_sync.policy_version
         if optimizer_step_skipped:
             new_version = self.weight_sync.policy_version
-            print("[GRPO] Optimizer update skipped: all gradients are zero.", flush=True)
+            if not response_tokens:
+                zero_gradient_reason = "no_response_tokens"
+            elif not trainable_params:
+                zero_gradient_reason = "no_trainable_parameters"
+            elif not tensors_with_grad:
+                zero_gradient_reason = "disconnected_trainable_parameters"
+            elif not any(item.advantage != 0 for item in batch.items):
+                zero_gradient_reason = "zero_advantages"
+            elif accumulated_metrics.get("importance_zero_fraction", 0) == 1:
+                zero_gradient_reason = "zero_importance_weights"
+            else:
+                zero_gradient_reason = "zero_after_backward_check_cancellation_saturation_or_underflow"
+            print(f"[GRPO] Optimizer update skipped: {zero_gradient_reason}; "
+                  f"max advantage={max(abs(it.advantage) for it in batch.items):.6g}, "
+                  f"gradient buffers={tensors_with_grad}/{len(trainable_params)}, "
+                  f"nonzero buffers={tensors_with_nonzero_grad}, max |grad|={gradient_abs_max:.6g}", flush=True)
         else:
+            zero_gradient_reason = ""
             new_version = safe_optimizer_step(
                 optimizer, trainable_params,
                 after_step=lambda: self.weight_sync.sync_to_vllm(self.trainer_model, self.vllm_engine),
@@ -1349,6 +1472,15 @@ class GRPOBridge:
         accumulated_metrics["policy_version_before_update"] = old_version
         accumulated_metrics["grad_norm"] = grad_norm_val
         accumulated_metrics["optimizer_step_skipped"] = optimizer_step_skipped
+        accumulated_metrics["tensors_with_grad"] = tensors_with_grad
+        accumulated_metrics["trainable_tensors"] = len(trainable_params)
+        accumulated_metrics["tensors_with_nonzero_grad"] = tensors_with_nonzero_grad
+        accumulated_metrics["gradient_abs_max"] = gradient_abs_max
+        accumulated_metrics["zero_gradient_reason"] = zero_gradient_reason
+        accumulated_metrics["training_turns"] = len(training_turns)
+        accumulated_metrics["followup_training_turns"] = len(training_turns) - len(batch.items)
+        accumulated_metrics["truncated_training_turns"] = sum(turn.is_truncated for _, turn in training_turns)
+        accumulated_metrics["entropy_penalty"] = accumulated_metrics.get("entropy_loss", 0) * self.loss_fn.entropy_coeff
         accumulated_metrics.update(batch.reward_diagnostics)
         accumulated_metrics["vram"] = self.vram_mgr.get_memory_info()
         return accumulated_metrics

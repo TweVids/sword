@@ -4,6 +4,9 @@ Sword: Pure-PyTorch High-Throughput Attention & Generation Speed Engine.
 
 import sys
 
+from .logging_utils import quiet_quantization_cast_notices
+quiet_quantization_cast_notices()
+
 try:
     import unsloth
 except Exception:

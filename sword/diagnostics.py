@@ -159,6 +159,7 @@ def check_harness_tools(name: str) -> Dict[str, Any]:
     # Fixed tool requests test the parser and real sandbox, without relying on sampled text.
     turns = _harness_turns(name)
     expected_tools = 3 if name == "codex" else len(turns)
+    turns.append("Final Answer: Completed and verified.")
     with tempfile.TemporaryDirectory(prefix=f"sword-test-{name}-") as directory:
         harness = get_harness(name, workspace_dir=directory)
         if harness is None:
@@ -477,7 +478,7 @@ def run_target_diagnostics(
             arguments.setdefault("steps", 5)
             arguments.setdefault("concurrency_g", concurrent)
             arguments.setdefault("max_seq_len", 2048)
-            arguments.setdefault("max_new_tokens", 128)
+            arguments.setdefault("max_new_tokens", 512)
             arguments.setdefault("micro_batch_size", 1)
             arguments.setdefault("output_dir", "checkpoints/diagnostics")
             arguments.setdefault("allow_retest", True)
@@ -502,6 +503,7 @@ def run_target_diagnostics(
         )
         train_options.setdefault("vllm_quantization", "fp8" if load_in_8bit else None)
         train_options.setdefault("kv_cache_dtype", "fp8" if load_in_8bit else "auto")
+        train_options.setdefault("trace_rollouts", test)
         train_options.setdefault("speculative_ngram", True)
         train_options.setdefault("offload_trainer_during_rollout", True)
 

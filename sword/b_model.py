@@ -14,6 +14,7 @@ from typing import Dict, Any, Tuple, Optional, List, Union
 
 from sword.ollama_runtime import api_url, start_ollama_server, pull_ollama_model
 from sword.defaults import DEFAULT_B_MODEL, DEFAULT_B_MODEL_FALLBACK
+from sword.logging_utils import output_preview
 
 try:
     import requests
@@ -36,6 +37,7 @@ class ModelBEvaluationResult:
     tools_success: float = 0.0
     cheating: bool = False
     raw_response: str = ""
+    missing_scores: List[str] = field(default_factory=list)
 
     def __post_init__(self):
         for name in ("truth", "formatted", "rule_reasoning_follow", "rule_answer_follow", "tools_success"):
@@ -87,6 +89,8 @@ class ModelBJudgeConfig:
     startup_timeout: float = 60.0
     pull_stall_s: float = 120.0
     log_path: Optional[str] = None
+    log_model_outputs: bool = True
+    model_output_chars: int = 1200
 
 
 def model_b_config(port: int = 11343, *, mock_test: bool = False,
@@ -110,6 +114,8 @@ def model_b_config(port: int = 11343, *, mock_test: bool = False,
         num_predict_no_think=int(options.get("B_model_num_predict_no_think", 2048)),
         force_gpu=bool(options.get("B_model_force_gpu", True)),
         use_mmap=bool(options.get("B_model_use_mmap", False)),
+        log_model_outputs=bool(options.get("B_model_log_outputs", options.get("log_model_outputs", True))),
+        model_output_chars=int(options.get("B_model_output_chars", options.get("model_output_chars", 1200))),
     )
 
 
@@ -151,6 +157,7 @@ class ModelBJudge:
         self.last_error = None
         self.last_evaluation_source = None
         self.evaluation_counts = {}
+        self.last_evaluation_attempts = []
         self._installed_models = set()
         self._setup_retry_at = 0.0
         self.last_thinking_received = False
@@ -473,6 +480,8 @@ class ModelBJudge:
                     tools_success=float(score_data.get("tools_success", fallback_tools_success)),
                     cheating=score_data.get("cheating", False),
                     raw_response=text,
+                    missing_scores=[key for key in ("truth", "formatted", "rule_reasoning_follow", "rule_answer_follow")
+                                    if key not in score_data],
                 )
 
         # 2. JSON array format [truth, formatted, reasoning, answer, tools, cheating]
@@ -521,6 +530,8 @@ class ModelBJudge:
             tools_success=tool_val,
             cheating=is_cheat,
             raw_response=text,
+            missing_scores=[key for key in ("truth", "formatted", "rule_reasoning_follow", "rule_answer_follow")
+                            if not re.search(r'"?' + key + r'"?\s*:\s*[-+0-9.eE]+', cleaned)],
         )
 
     def _request_chat(self, payload: Dict[str, Any]):
@@ -550,6 +561,7 @@ class ModelBJudge:
     ) -> ModelBEvaluationResult:
         """Sends candidate response to Model B via Ollama /api/chat and parses result."""
         fallback_tool_ratio = tools_succeeded / max(1, tools_called) if tools_called > 0 else 0.0
+        self.last_evaluation_attempts = []
 
         if not self._memory_ready or not self.ensure_ready():
             # Graceful deterministic fallback when Ollama is offline
@@ -611,21 +623,44 @@ class ModelBJudge:
                 payload = dict(spec["payload"])
                 payload["model"] = current
                 payload["options"] = dict(spec["options"])
+                attempt = {"model": current, "think": payload.get("think"), "status": "requesting"}
+                self.last_evaluation_attempts.append(attempt)
+                if self.config.log_model_outputs:
+                    print(f"[ModelB Request] model={current} think={payload.get('think')!r} "
+                          f"candidate_chars={len(candidate_response)} max_tokens={payload['options'].get('num_predict')}", flush=True)
                 try:
                     data = self._request_chat(payload)
                     message_obj = data.get("message", {})
                     thinking = message_obj.get("thinking") or ""
                     self.last_thinking_received = bool(thinking)
                     content = message_obj.get("content", "") or ""
+                    attempt.update(content=content, thinking=thinking, content_chars=len(content),
+                                   thinking_chars=len(thinking), eval_count=data.get("eval_count"),
+                                   done_reason=data.get("done_reason"), status="received")
+                    if self.config.log_model_outputs:
+                        print(f"[ModelB Output] model={current} content_chars={len(content)} "
+                              f"thinking_chars={len(thinking)} generated_tokens={data.get('eval_count', 'unknown')} "
+                              f"done_reason={data.get('done_reason', 'unknown')}\n"
+                              f"{output_preview(content, self.config.model_output_chars)}", flush=True)
+                        if thinking and not content:
+                            print(f"[ModelB Thinking Output]\n{output_preview(thinking, self.config.model_output_chars)}", flush=True)
                     if thinking and self.config.show_thinking:
                         print(f"[ModelB Thinking]\n{thinking}\n" + "-" * 60)
 
                     result = self.parse_scores(content, fallback_tools_success=fallback_tool_ratio)
+                    if result.missing_scores:
+                        raise ValueError("Model B omitted required scores: " + ", ".join(result.missing_scores))
                     self.last_evaluation_source = current
                     self.evaluation_counts[current] = self.evaluation_counts.get(current, 0) + 1
+                    attempt["status"] = "scored"
+                    if self.config.log_model_outputs:
+                        print(f"[ModelB Scores] source={current} {json.dumps(result.to_dict())}", flush=True)
                     return result
                 except Exception as exc:
                     self.last_error = f"{exc} (model={current}, think={payload.get('think', 'default')!r})"
+                    attempt.update(status="failed", error=str(exc))
+                    if self.config.log_model_outputs:
+                        print(f"[ModelB Attempt Failed] {self.last_error}", flush=True)
                     # Parse failure: try the next spec (no-think) on this model first.
                     if isinstance(exc, ValueError):
                         continue
@@ -651,7 +686,11 @@ class ModelBJudge:
         """Lightweight deterministic scoring when Model B server is unavailable."""
         self.last_evaluation_source = "deterministic"
         self.evaluation_counts["deterministic"] = self.evaluation_counts.get("deterministic", 0) + 1
-        return deterministic_evaluation(candidate_response, solution, tools_called, tools_succeeded)
+        result = deterministic_evaluation(candidate_response, solution, tools_called, tools_succeeded)
+        if self.config.log_model_outputs:
+            print(f"[ModelB Scores] source=deterministic (no successful live judge output) "
+                  f"{json.dumps(result.to_dict())}", flush=True)
+        return result
 
 
 def deterministic_evaluation(
@@ -673,6 +712,11 @@ def deterministic_evaluation(
     formatted = 1.0 if (has_think or has_blocks) else 0.8
 
     tools_ratio = (tools_succeeded / max(1, tools_called)) if tools_called > 0 else 0.0
+    if not resp:
+        return ModelBEvaluationResult(
+            truth=0.0, formatted=0.0, rule_reasoning_follow=0.0, rule_answer_follow=0.0,
+            tools_success=tools_ratio, raw_response="deterministic fallback: empty response",
+        )
 
     # Cheating check
     banned_patterns = [

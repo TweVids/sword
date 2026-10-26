@@ -11,6 +11,7 @@ from typing import Dict, Any, List, Optional, Callable, Tuple
 
 from sword.harness.base import BaseHarness, HarnessResult
 from sword.harness.sandbox import WorkspaceSandbox
+from sword.harness.protocol import structured_calls
 
 
 class GeminiCliHarness(BaseHarness):
@@ -35,34 +36,7 @@ class GeminiCliHarness(BaseHarness):
 
     def parse_function_calls(self, text: str) -> List[Dict[str, Any]]:
         """Parses call:func{args} or ```json {"action": ...}``` patterns."""
-        calls = []
-
-        # Pattern 1: call:tool_name{...}
-        for match in re.finditer(r"call:([A-Za-z0-9_]+)\s*(\{[^{}]*\})", text):
-            fname = match.group(1)
-            raw_args = match.group(2)
-            try:
-                args = json.loads(raw_args)
-                valid_json = isinstance(args, dict)
-            except Exception:
-                args = {"raw": raw_args}
-                valid_json = False
-            calls.append({"name": fname, "args": args, "valid_json": valid_json})
-
-        # Pattern 2: ```json\n{"action": ...}\n```
-        for match in re.finditer(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL):
-            try:
-                data = json.loads(match.group(1))
-                if isinstance(data, dict) and ("action" in data or "tool" in data):
-                    calls.append({
-                        "name": data.get("action") or data.get("tool"),
-                        "args": data.get("parameters") or data.get("args") or {},
-                        "valid_json": True,
-                    })
-            except Exception:
-                pass
-
-        return calls
+        return structured_calls(text)
 
     def execute_call_in_sandbox(self, call: Dict[str, Any], sandbox: WorkspaceSandbox) -> Tuple[bool, str]:
         """Validates function schema and executes real tool in sandbox."""
@@ -155,11 +129,13 @@ class GeminiCliHarness(BaseHarness):
         self,
         prompt: str,
         model_generate_fn: Callable[[str], str],
-        max_turns: int = 2,
+        max_turns: int = 8,
         task_id: str = "",
     ) -> HarnessResult:
         """Runs the authentic Gemini CLI multi-turn function calling loop."""
-        sandbox = WorkspaceSandbox(base_dir=self.workspace_dir, timeout_sec=self.timeout_sec)
+        if max_turns < 1:
+            raise ValueError("max_turns must be positive")
+        sandbox = self.create_sandbox()
         curr_prompt = prompt
         tools_called = 0
         tools_succeeded = 0
@@ -167,23 +143,35 @@ class GeminiCliHarness(BaseHarness):
         history: List[Dict[str, Any]] = []
         final_text = ""
         reasoning_text = ""
+        assistant_turns = []
+        is_completed = False
+        stop_reason = "turn_limit"
 
         try:
             for turn in range(max(1, max_turns)):
                 response = model_generate_fn(curr_prompt)
                 final_text = response
+                assistant_turns.append({"turn": turn, "response": response})
                 r = self.extract_reasoning(response)
                 if r:
                     reasoning_text = r
 
                 calls = self.parse_function_calls(response)
                 if not calls:
-                    break
+                    if self.has_final_answer(response):
+                        is_completed, stop_reason = True, "final_response"
+                        break
+                    if turn >= max_turns - 1:
+                        stop_reason = "missing_final_answer" if response.strip() else "empty_response"
+                        break
+                    curr_prompt = self.unfinished_feedback(curr_prompt, response)
+                    continue
 
                 turn_feedbacks = []
                 for c in calls:
                     tools_called += 1
                     ok, output = self.execute_call_in_sandbox(c, sandbox)
+                    self.log_tool_result(turn, c.get("name"), ok, output)
                     if ok:
                         tools_succeeded += 1
                     else:
@@ -200,7 +188,8 @@ class GeminiCliHarness(BaseHarness):
                 curr_prompt = (
                     f"{curr_prompt}\n\nModel:\n{response}\n\n"
                     f"Gemini Environment Feedback:\n{feedback_str}\n\n"
-                    "Proceed to complete the response:"
+                    "Inspect the tool results, edit or verify as needed, then provide Final Answer: when done. "
+                    "Successful tool execution alone does not complete the task."
                 )
 
         finally:
@@ -218,5 +207,8 @@ class GeminiCliHarness(BaseHarness):
             tools_failed=tools_failed,
             tool_history=history,
             success_rate=success_rate,
-            is_completed=True,
+            is_completed=is_completed,
+            error_message=None if is_completed else "No final answer before " + stop_reason,
+            turns=len(assistant_turns), stop_reason=stop_reason, assistant_turns=assistant_turns,
+            workspace_dir=sandbox.root_dir, workspace_removed=sandbox.was_removed,
         )
