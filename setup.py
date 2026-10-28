@@ -26,4 +26,5 @@ setup(
         "requests>=2.31.0",
     ],
     python_requires=">=3.10",
+    extras_require={"logger": ["gradio>=4.44,<7", "pandas>=2.0"]},
 )

@@ -10,7 +10,7 @@ from typing import Dict, Any, List, Optional, Callable, Tuple
 
 from sword.harness.base import BaseHarness, HarnessResult
 from sword.harness.sandbox import WorkspaceSandbox
-from sword.harness.protocol import structured_calls, visible_response
+from sword.harness.protocol import structured_calls, visible_response, without_structured_calls
 
 
 class PiHarness(BaseHarness):
@@ -40,6 +40,8 @@ class PiHarness(BaseHarness):
         """Extracts Pi foundational actions (read, write, edit, bash) or code blocks."""
         actions = []
         text = visible_response(text)
+        structured = structured_calls(text)
+        text = without_structured_calls(text)
 
         # 1. Structured action directives: Action: read path / Action: bash cmd / Action: write path \n content
         for match in re.finditer(r"(?:^|\n)Action:\s*(read|write|edit|bash|python)\s+(.+?)(?=\n(?:Plan|Observation|Reflection|Action|Final Answer)|\Z)", text, re.DOTALL | re.IGNORECASE):
@@ -54,7 +56,7 @@ class PiHarness(BaseHarness):
             actions.append({"tool": "bash" if lang in ("bash", "sh") else "python", "raw_args": code, "source": "code_block"})
 
         # 3. JSON tool calls (markdown json blocks or <tool_call> blocks)
-        for call in structured_calls(text):
+        for call in structured:
             actions.append({"tool": call["name"], "params": call["args"], "valid_json": call["valid_json"]})
 
         return actions
@@ -199,7 +201,10 @@ class PiHarness(BaseHarness):
                 )
 
         finally:
-            sandbox.close()
+            try:
+                test_results = self.run_dataset_tests(sandbox, final_text)
+            finally:
+                sandbox.close()
 
         success_rate = (tools_succeeded / tools_called) if tools_called > 0 else 0.0
 
@@ -212,6 +217,7 @@ class PiHarness(BaseHarness):
             tools_succeeded=tools_succeeded,
             tools_failed=tools_failed,
             tool_history=history,
+            test_results=test_results, execution_results=list(sandbox.execution_history),
             success_rate=success_rate,
             is_completed=is_completed,
             error_message=None if is_completed else "No final answer before " + stop_reason,

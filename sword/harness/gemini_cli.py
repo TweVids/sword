@@ -193,7 +193,10 @@ class GeminiCliHarness(BaseHarness):
                 )
 
         finally:
-            sandbox.close()
+            try:
+                test_results = self.run_dataset_tests(sandbox, final_text)
+            finally:
+                sandbox.close()
 
         success_rate = (tools_succeeded / tools_called) if tools_called > 0 else 0.0
 
@@ -206,6 +209,7 @@ class GeminiCliHarness(BaseHarness):
             tools_succeeded=tools_succeeded,
             tools_failed=tools_failed,
             tool_history=history,
+            test_results=test_results, execution_results=list(sandbox.execution_history),
             success_rate=success_rate,
             is_completed=is_completed,
             error_message=None if is_completed else "No final answer before " + stop_reason,

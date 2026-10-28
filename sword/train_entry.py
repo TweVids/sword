@@ -107,6 +107,10 @@ def train(
     prep_and_logs: bool = False,
     b_model: bool = True,
     setup: bool = False,
+    model_lora_repo: str = "",
+    train_from_lora_checkpoint: Optional[Union[int, str]] = None,
+    gradio_logger: bool = False,
+    chat_template_path: Optional[str] = None,
     **kwargs,
 ) -> Dict[str, Any]:
     """
@@ -141,7 +145,30 @@ def train(
             score_logs=True,
         )
     """
-    grpo_mode = prep_and_logs or long_train or not test
+    grpo_mode = prep_and_logs or long_train or not test or bool(model_lora_repo)
+    from .chat_templates import read_chat_template
+    template_override = read_chat_template(chat_template_path)
+    if template_override is not None:
+        kwargs["_chat_template_override"] = template_override
+    if load_in_4bit and load_in_8bit:
+        raise ValueError("Choose either load_in_4bit or load_in_8bit.")
+    if not model_lora_repo and train_from_lora_checkpoint not in (None, ""):
+        raise ValueError("train_from_lora_checkpoint requires model_lora_repo")
+    if model_lora_repo:
+        if mock_test or kwargs.get("trainer_model") is not None or kwargs.get("tokenizer") is not None:
+            raise ValueError("model_lora_repo requires loading the selected checkpoint; mock_test and injected models are incompatible")
+        from .lora_source import resolve_lora_training_source
+        source = resolve_lora_training_source(
+            model_lora_repo, train_from_lora_checkpoint, base_model=model, token=HF_TOKEN,
+            revision=kwargs.get("model_lora_revision"), base_revision=kwargs.get("model_revision"),
+            cache_dir=kwargs.get("model_cache_dir"), source_cache_dir=kwargs.get("lora_cache_dir"),
+            local_files_only=bool(kwargs.get("local_files_only", False)),
+        )
+        model = source.base_model
+        kwargs["_lora_training_source"] = source
+        kwargs["model_lora_repo"] = model_lora_repo
+        kwargs["train_from_lora_checkpoint"] = train_from_lora_checkpoint
+        kwargs["model_revision"] = source.manifest.get("base_revision")
     if model is None:
         model = DEFAULT_GRPO_MODEL if grpo_mode else DEFAULT_INFERENCE_MODEL
     if load_in_8bit is None:
@@ -155,7 +182,7 @@ def train(
     if prep_and_logs:
         return _run_prep_and_logs(
             test=test,
-            long_train=long_train,
+            long_train=long_train or bool(model_lora_repo),
             dataset=dataset,
             model=model,
             B_model_port=B_model_port,
@@ -170,6 +197,8 @@ def train(
             HF_TOKEN=HF_TOKEN,
             b_model=b_model,
             setup=setup,
+            gradio_logger=gradio_logger,
+            chat_template_path=chat_template_path,
             **kwargs,
         )
 
@@ -187,7 +216,7 @@ def train(
             return {"ok": False, "status": status, "setup_result": setup_result,
                     "environment_validated": False}
 
-    if long_train or not test:
+    if long_train or not test or model_lora_repo:
         from sword.long_trainer import run_long_train
         result = run_long_train(
             dataset=dataset,
@@ -209,6 +238,8 @@ def train(
             b_model=b_model,
             load_in_4bit=load_in_4bit,
             load_in_8bit=load_in_8bit,
+            gradio_logger=gradio_logger,
+            chat_template_path=chat_template_path,
             **kwargs,
         )
         if setup_result is not None:
@@ -313,7 +344,11 @@ def train(
                     max_tokens=max_new_tokens,
                 )
                 t0 = time.perf_counter()
-                outputs = llm.generate(prompts, sampling_params)
+                if template_override is not None:
+                    outputs = llm.chat([[{"role": "user", "content": p}] for p in prompts],
+                                       sampling_params=sampling_params, chat_template=template_override)
+                else:
+                    outputs = llm.generate(prompts, sampling_params)
                 elapsed = time.perf_counter() - t0
                 responses = [out.outputs[0].text for out in outputs]
                 total_tokens = sum(len(out.outputs[0].token_ids) for out in outputs)
@@ -403,6 +438,14 @@ def train(
             model_obj = patch_qwen(model_obj)
             server = FastQwenServer(model=model_obj, tokenizer=tokenizer, max_concurrency=concurrent)
 
+        if template_override is not None:
+            from .grpo_bridge import format_rollout_prompt
+            tokenizer.chat_template = template_override
+            if not callable(getattr(tokenizer, "apply_chat_template", None)):
+                raise ValueError("chat_template_path requires a tokenizer with apply_chat_template; use a real model for serving")
+            prompts = [format_rollout_prompt(tokenizer, p)[0] for p in prompts]
+            from .chat_templates import RenderedChatTokenizer
+            server.tokenizer = RenderedChatTokenizer(tokenizer)
         print(f"[Sword] Serving {len(prompts)} concurrent streams...")
         t0 = time.perf_counter()
         results = server.serve(

@@ -10,6 +10,8 @@ import re
 import json
 import time
 import hashlib
+import csv
+import io
 from dataclasses import dataclass, field
 from typing import Dict, Any, List, Optional, Tuple, Union, Callable
 
@@ -33,8 +35,13 @@ from sword.harness.prompts import harness_repo_policy
 from sword.harness import get_harness, HarnessResult, WorkspaceSandbox
 from sword.reward import MultiMetricRewardScorer, RewardBreakdown
 from sword.checkpoint import CheckpointManager
-from sword.grpo_bridge import GRPOBridge, GRPOBridgeConfig, RolloutBatch, RolloutItem, rollout_prompt_budget
+from sword.grpo_bridge import (
+    GRPOBridge, GRPOBridgeConfig, RolloutBatch, RolloutItem, rollout_prompt_budget, normalize_effort,
+)
 from sword.logging_utils import quiet_quantization_cast_notices
+from sword.lora_source import resolve_lora_training_source, SOURCE_MANIFEST
+from sword.execution import normalize_tests, coding_row, execute_coding_answer
+from sword.execution_evidence import build_execution_evidence
 
 
 @dataclass
@@ -50,13 +57,21 @@ class DatasetProblemRow:
     harness: Optional[str] = None
     problem_id: str = ""
     row_hash: str = ""
+    effort: str = "dynamic"
+    tests: List[Dict[str, Any]] = field(default_factory=list)
+    initial_files: Dict[str, str] = field(default_factory=dict)
+    language: Optional[str] = None
+
+    def __post_init__(self):
+        self.effort = normalize_effort(self.effort)
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        result = {
             "problem": self.problem,
             "solution": self.solution,
             "reasoning_rule": self.reasoning_rule,
             "answer_rule": self.answer_rule,
+            "effort": self.effort,
             "can_be_verify": self.can_be_verify,
             "difficulty": self.difficulty,
             "category": self.category,
@@ -64,6 +79,9 @@ class DatasetProblemRow:
             "problem_id": self.problem_id,
             "row_hash": self.row_hash,
         }
+        if self.tests or self.initial_files or self.language:
+            result.update(tests=self.tests, initial_files=self.initial_files, language=self.language)
+        return result
 
 
 def policy_task_prompt(row: DatasetProblemRow) -> str:
@@ -77,7 +95,7 @@ def policy_task_prompt(row: DatasetProblemRow) -> str:
         return row.problem
     return (row.problem + "\n\nDataset response requirements:\n" + "\n\n".join(requirements)
             + "\n\nFollow these requirements throughout your response and tool work. "
-              "Include the required reasoning in your assistant responses; "
+              "Follow the reasoning rule when deciding whether and how to reason; "
               "make the final answer satisfy the answer rule.")
 
 
@@ -88,6 +106,7 @@ def parse_dataset_row(raw: Dict[str, Any], index: int = 0) -> DatasetProblemRow:
                      if key in raw and raw[key] is not None and str(raw[key]).strip()), "")
     reasoning_rule = str(raw.get("reasoning_rule") or raw.get("reasoning") or "").strip()
     answer_rule = str(raw.get("answer_rule") or "").strip()
+    effort = normalize_effort(raw.get("effort"))
 
     # Handle spelling variations in dataset schemas: can_be__verify or can_be_verify
     cbv = raw.get("can_be__verify") if "can_be__verify" in raw else raw.get("can_be_verify")
@@ -101,6 +120,26 @@ def parse_dataset_row(raw: Dict[str, Any], index: int = 0) -> DatasetProblemRow:
     difficulty = str(raw.get("difficult") or raw.get("difficulty") or "medium").strip().lower()
     category = str(raw.get("cagetory") or raw.get("category") or "general").strip().lower()
     harness = str(raw.get("harness") or "").strip().lower() or None
+    test_spec = raw.get("tests")
+    if test_spec is None and raw.get("test_commands"):
+        commands = raw["test_commands"]
+        if isinstance(commands, str):
+            try:
+                commands = json.loads(commands)
+            except ValueError:
+                commands = [commands]
+        if isinstance(commands, str):
+            commands = [commands]
+        if not isinstance(commands, list):
+            raise ValueError("test_commands must be a string or a list of command strings")
+        test_spec = [{"command": command} for command in commands]
+    tests = normalize_tests(test_spec)
+    initial_files = raw.get("initial_files", raw.get("files")) or {}
+    if isinstance(initial_files, str):
+        initial_files = json.loads(initial_files)
+    if not isinstance(initial_files, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in initial_files.items()):
+        raise ValueError("initial_files must map relative filenames to text contents")
+    language = str(raw.get("language") or "").strip().lower() or None
 
     # Deterministic row hash for expandable deduplication
     row_dict = {
@@ -108,24 +147,31 @@ def parse_dataset_row(raw: Dict[str, Any], index: int = 0) -> DatasetProblemRow:
         "solution": solution,
         "reasoning_rule": reasoning_rule,
         "answer_rule": answer_rule,
+        "effort": effort,
         "can_be_verify": can_be_verify,
         "difficulty": difficulty,
         "category": category,
         "harness": harness,
     }
     row_hash = hashlib.sha256(json.dumps(row_dict, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+    # Keep hashes of existing datasets stable while making changed tests/seeds new work.
+    if tests or initial_files or language:
+        row_dict.update(tests=tests, initial_files=initial_files, language=language)
+        row_hash = hashlib.sha256(json.dumps(row_dict, sort_keys=True).encode("utf-8")).hexdigest()[:16]
 
     return DatasetProblemRow(
         problem=problem,
         solution=solution,
         reasoning_rule=reasoning_rule,
         answer_rule=answer_rule,
+        effort=effort,
         can_be_verify=can_be_verify,
         difficulty=difficulty,
         category=category,
         harness=harness,
         problem_id=str(raw.get("id") or f"problem_{index}"),
         row_hash=row_hash,
+        tests=tests, initial_files=initial_files, language=language,
     )
 
 
@@ -173,11 +219,17 @@ def load_dataset_records(dataset_spec: Union[str, List[Any], Dict[str, Any]], hf
                 data = json.loads(content_bytes.decode("utf-8", errors="replace"))
                 raw_items = data if isinstance(data, list) else [data]
             else:
-                for line in content_bytes.decode("utf-8", errors="replace").splitlines():
-                    if line.strip():
-                        parts = line.split("\t") if "\t" in line else line.split(",")
-                        if len(parts) >= 2:
-                            raw_items.append({"problem": parts[0], "solution": parts[1]})
+                text = content_bytes.decode("utf-8-sig", errors="replace")
+                delimiter = "\t" if "\t" in text.partition("\n")[0] else ","
+                rows = [parts for parts in csv.reader(io.StringIO(text), delimiter=delimiter)
+                        if any(part.strip() for part in parts)]
+                if rows:
+                    columns = [column.strip().lower() for column in rows[0]]
+                    if any(column in columns for column in ("problem", "question", "user", "prompt")):
+                        raw_items.extend(dict(zip(columns, parts)) for parts in rows[1:])
+                    else:
+                        raw_items.extend({"problem": parts[0], "solution": parts[1]}
+                                         for parts in rows if len(parts) >= 2)
 
         # Hugging Face Hub dataset ID
         else:
@@ -232,6 +284,10 @@ def run_long_train(
     auto_unload_B_model: bool = True,
     B_model_keep_alive: str = "5m",
     b_model: bool = True,
+    model_lora_repo: str = "",
+    train_from_lora_checkpoint: Optional[Union[int, str]] = None,
+    gradio_logger: bool = False,
+    chat_template_path: Optional[str] = None,
     **kwargs,
 ) -> Dict[str, Any]:
     """
@@ -242,6 +298,24 @@ def run_long_train(
     args = Argument or {}
     lora_conf = lora_cfg or {}
     effective_mock = bool(kwargs.get("mock_test", False) or model in ("dummy", "test_model", "mock"))
+    from sword.chat_templates import read_chat_template
+    template_override = kwargs.get("_chat_template_override")
+    if template_override is None:
+        template_override = read_chat_template(chat_template_path)
+    if not model_lora_repo and train_from_lora_checkpoint not in (None, ""):
+        raise ValueError("train_from_lora_checkpoint requires model_lora_repo")
+    source_lora = kwargs.get("_lora_training_source")
+    if model_lora_repo:
+        if effective_mock or kwargs.get("trainer_model") is not None or kwargs.get("tokenizer") is not None:
+            raise ValueError("model_lora_repo requires loading the selected checkpoint; mock_test and injected models are incompatible")
+        source_lora = source_lora or resolve_lora_training_source(
+            model_lora_repo, train_from_lora_checkpoint,
+            base_model=None if model == DEFAULT_GRPO_MODEL else model, token=HF_TOKEN,
+            revision=kwargs.get("model_lora_revision"), base_revision=kwargs.get("model_revision"),
+            cache_dir=kwargs.get("model_cache_dir"), source_cache_dir=kwargs.get("lora_cache_dir"),
+            local_files_only=bool(kwargs.get("local_files_only", False)),
+        )
+        model = source_lora.base_model
 
     steps = int(args.get("steps") or args.get("max_steps") or 200)
     lr = float(args.get("lr") or args.get("learning_rate") or 5e-6)
@@ -285,6 +359,16 @@ def run_long_train(
 
     # 2. Ingest Dataset & Check Expandable SHA-256 Deduplication
     records, dataset_sha256 = load_dataset_records(dataset, hf_token=HF_TOKEN)
+    if source_lora is not None:
+        source_key = json.dumps(source_lora.manifest, sort_keys=True)
+        dataset_sha256 = hashlib.sha256((dataset_sha256 + source_key).encode()).hexdigest()
+        for row in records:
+            row.row_hash = hashlib.sha256((row.row_hash + source_key).encode()).hexdigest()[:16]
+    if template_override is not None:
+        template_key = hashlib.sha256(template_override.encode("utf-8")).hexdigest()
+        dataset_sha256 = hashlib.sha256((dataset_sha256 + template_key).encode()).hexdigest()
+        for row in records:
+            row.row_hash = hashlib.sha256((row.row_hash + template_key).encode()).hexdigest()[:16]
     print(f"[*] Dataset SHA-256: {dataset_sha256} ({len(records)} problem rows)")
 
     allow_retest = bool(kwargs.get("allow_retest", args.get("allow_retest", False)))
@@ -368,21 +452,41 @@ def run_long_train(
         log_model_outputs=bool(kwargs.get("log_model_outputs", show_detail_logs)),
         model_output_chars=int(kwargs.get("model_output_chars", 1200)),
         enable_thinking=bool(kwargs.get("A_model_thinking", True)),
+        lora_training_source=source_lora,
+        chat_template_path=chat_template_path, chat_template_override=template_override,
+        merged_base_cache_dir=str(kwargs.get("merged_base_cache_dir") or os.path.join(output_dir, "merged_bases")),
     )
     bridge = GRPOBridge(config=bridge_config)
-    bridge.initialize_trainer(
-        model=kwargs.get("trainer_model"),
-        tokenizer=kwargs.get("tokenizer"),
-        mock_test=effective_mock,
-    )
+    try:
+        bridge.initialize_trainer(
+            model=kwargs.get("trainer_model"),
+            tokenizer=kwargs.get("tokenizer"),
+            mock_test=effective_mock,
+        )
+    except Exception:
+        bridge.weight_sync.cleanup()
+        if b_judge is not None:
+            b_judge.release_after_eval()
+        raise
 
     trainable_params = [p for p in bridge.trainer_model.parameters() if p.requires_grad]
+    checkpoint_source_options = {"source_lora_manifest": bridge.source_lora_manifest,
+                                 "tokenizer": bridge.tokenizer} if bridge.source_lora_manifest else {}
+    if template_override is not None:
+        checkpoint_source_options["tokenizer"] = bridge.tokenizer
     optimizer = torch.optim.AdamW(trainable_params, lr=lr)
 
     # 5. Checkpoint Resume Discovery (only when explicitly requested)
     start_step = 0
     resolved_ckpt = ckpt_mgr.find_latest_checkpoint(resume_from_checkpoint)
     if resolved_ckpt:
+        if bridge.source_lora_manifest is not None:
+            source_file = os.path.join(resolved_ckpt, SOURCE_MANIFEST)
+            if not os.path.isfile(source_file):
+                raise ValueError("Resume checkpoint is missing its merged-base source manifest")
+            with open(source_file, encoding="utf-8") as stream:
+                if json.load(stream) != bridge.source_lora_manifest:
+                    raise ValueError("Resume checkpoint was trained on a different source LoRA base")
         print(f"[*] Resuming from checkpoint: {resolved_ckpt}")
         try:
             res_info = ckpt_mgr.load_checkpoint(
@@ -408,6 +512,12 @@ def run_long_train(
     trace_rollouts = bool(kwargs.get("trace_rollouts", False))
     current_step = start_step
     completed_successfully = False
+    dashboard = None
+    if gradio_logger:
+        from sword.training_logger import create_training_logger
+        dashboard = create_training_logger(max_rollouts=kwargs.get("gradio_max_rollouts", 8),
+                                           refresh_interval=kwargs.get("gradio_refresh_interval", 1.0),
+                                           server_port=kwargs.get("gradio_port"))
 
     print(f"\n[*] Starting training loop from step {start_step + 1} to {start_step + steps}...\n")
 
@@ -416,11 +526,16 @@ def run_long_train(
             step_idx = current_step + 1
             row_idx = (step_idx - 1) % len(records)
             current_row = records[row_idx]
+            # Keep the same dataset effort for the initial response and all tool follow-ups.
+            bridge.config.effort = current_row.effort
             policy_task = policy_task_prompt(current_row)
             harness = get_harness(current_row.harness)
             if harness is not None:
                 harness.workspace_parent_dir = os.path.join(output_dir, "harness_workspaces")
                 harness.keep_workspace = keep_harness_workspaces
+                harness.dataset_tests = current_row.tests
+                harness.initial_files = current_row.initial_files
+                harness.language = current_row.language
 
             step_success = False
             log_start_len = len(reward_history_logs)
@@ -432,9 +547,14 @@ def run_long_train(
                     del reward_history_logs[log_start_len:]
 
                 try:
+                    if dashboard is not None:
+                        dashboard.publish("task", step=step_idx, problem_id=current_row.problem_id,
+                                          problem=current_row.problem, rollout_count=concurrency_g)
+                        bridge.generation_callback = dashboard.generation
                     # Rollout Phase with authentic harness prompt injection and token-budget guard
                     prompt_token_budget = rollout_prompt_budget(
                         bridge.tokenizer, max_seq_len, max_new_tokens, enable_thinking=bridge.config.enable_thinking,
+                        effort=current_row.effort,
                     )
                     with harness_repo_policy(auto_clone=not effective_mock):
                         rollout_prompt = (
@@ -454,6 +574,8 @@ def run_long_train(
                     step_details = []
 
                     for item in batch.items:
+                        if dashboard is not None:
+                            dashboard.publish("status", status=f"Executing rollout {len(scoring_inputs) + 1}")
                         tools_called = 0
                         tools_succeeded = 0
                         h_res = None
@@ -477,7 +599,14 @@ def run_long_train(
                                 followup = harness.format_followup_prompt(
                                     policy_task, history, prompt_token_budget, tokenizer=bridge.tokenizer,
                                 )
-                                turn = bridge.generate_single(followup, return_item=True)
+                                saved_callback = bridge.generation_callback
+                                if dashboard is not None:
+                                    bridge.generation_callback = lambda _, text, finished=False: dashboard.generation(
+                                        len(scoring_inputs), text, finished=finished, turn=turn_number - 1)
+                                try:
+                                    turn = bridge.generate_single(followup, return_item=True)
+                                finally:
+                                    bridge.generation_callback = saved_callback
                                 if not isinstance(turn, RolloutItem):
                                     raise RuntimeError("Harness follow-up generation must retain sampled tokens and logprobs")
                                 item.followup_turns.append(turn)
@@ -504,26 +633,47 @@ def run_long_train(
                                       f"({'removed' if getattr(h_res, 'workspace_removed', False) else 'kept'})")
                         else:
                             candidate_response = item.response_text
+                            if kwargs.get("auto_code_executor", True) and (coding_row(current_row) or re.search(
+                                    r"```(?:python|py|javascript|js|bash|sh)\s*\n", candidate_response)):
+                                h_res = execute_coding_answer(
+                                    current_row, candidate_response,
+                                    parent_dir=os.path.join(output_dir, "harness_workspaces"),
+                                    keep_workspace=keep_harness_workspaces)
+                                tools_called, tools_succeeded = h_res.tools_called, h_res.tools_succeeded
                         scoring_inputs.append((item, candidate_response, tools_called, tools_succeeded, h_res))
 
                     bridge.vram_mgr.enter_score_phase(bridge.vllm_engine)
+                    if dashboard is not None:
+                        dashboard.publish("status", status="Scoring")
                     if b_judge is not None and not effective_mock:
                         b_judge.prepare_for_eval()
                     for rollout_idx, (item, candidate_response, tools_called, tools_succeeded, h_res) in enumerate(scoring_inputs):
+                        execution_evidence = build_execution_evidence(
+                            getattr(h_res, "tool_history", []), tools_called=tools_called, tools_succeeded=tools_succeeded,
+                            test_results=getattr(h_res, "test_results", []), execution_results=getattr(h_res, "execution_results", []),
+                            max_chars=int(kwargs.get("judge_execution_chars", 4000)),
+                            max_success=int(kwargs.get("judge_execution_success_samples", 2)),
+                            max_failed=int(kwargs.get("judge_execution_failed_samples", 4))) if h_res is not None else None
+                        assistant_turns = [item] + item.followup_turns
+                        # An unfinished last turn is still evidence for the reasoning rule.
+                        earlier_turns = assistant_turns if h_res is not None and not getattr(
+                            h_res, "is_completed", True,
+                        ) else assistant_turns[:-1]
                         score_breakdown = reward_scorer.score(
                             problem=current_row.problem,
                             solution=current_row.solution,
                             candidate_response=candidate_response,
                             reasoning_rule=current_row.reasoning_rule,
                             answer_rule=current_row.answer_rule,
+                            effort=current_row.effort,
                             can_be_verify=current_row.can_be_verify,
                             difficulty=current_row.difficulty,
                             category=current_row.category,
                             harness_name=current_row.harness,
                             tools_called=tools_called,
                             tools_succeeded=tools_succeeded,
-                            assistant_history=[turn.response_text for turn in [item] + item.followup_turns[:-1]]
-                                              if item.followup_turns else [],
+                            assistant_history=[turn.response_text for turn in earlier_turns],
+                            **({"execution_evidence": execution_evidence} if execution_evidence is not None else {}),
                         )
                         item.reward = score_breakdown.total_score
                         step_scores.append(score_breakdown)
@@ -531,6 +681,7 @@ def run_long_train(
                         detail = {
                             "step": step_idx, "rollout": rollout_idx, "group_id": item.group_id,
                             "problem_id": current_row.problem_id, "problem": current_row.problem,
+                            "effort": current_row.effort,
                             "scores": score_breakdown.to_dict(), "judge_scores": score_breakdown.judge_scores,
                             "judge_source": str(score_breakdown.judge_source or (b_judge.last_evaluation_source if b_judge else "disabled")),
                             "judge_response": score_breakdown.judge_response,
@@ -540,6 +691,7 @@ def run_long_train(
                             "training_turn_count": 1 + len(item.followup_turns),
                             "training_response_tokens": sum(len(turn.response_token_ids) for turn in [item] + item.followup_turns),
                             "tools_called": tools_called, "tools_succeeded": tools_succeeded,
+                            "execution_evidence": execution_evidence,
                         }
                         if h_res is not None:
                             detail["harness"] = {
@@ -555,6 +707,8 @@ def run_long_train(
                                 prompt_text=item.prompt_text, prompt_token_ids=item.prompt_token_ids,
                                 response_token_ids=item.response_token_ids, rollout_logprobs=item.rollout_logprobs,
                                 tool_history=getattr(h_res, "tool_history", []) if h_res is not None else [],
+                                test_results=getattr(h_res, "test_results", []) if h_res is not None else [],
+                                execution_results=getattr(h_res, "execution_results", []) if h_res is not None else [],
                                 assistant_turns=getattr(h_res, "assistant_turns", []) if h_res is not None else [],
                                 training_turns=[{
                                     "prompt_text": turn.prompt_text, "prompt_token_ids": turn.prompt_token_ids,
@@ -566,6 +720,12 @@ def run_long_train(
                                                if b_judge is not None else [],
                             )
                         step_details.append(detail)
+                        if dashboard is not None:
+                            dashboard.publish("score", rollout=rollout_idx, scores=score_breakdown.to_dict(),
+                                              judge_scores=score_breakdown.judge_scores,
+                                              judge_response=score_breakdown.judge_response[:16000],
+                                              judge_source=score_breakdown.judge_source,
+                                              execution_evidence=execution_evidence)
                         if score_logs:
                             reward_history_logs.append(detail)
 
@@ -582,6 +742,8 @@ def run_long_train(
                         raise RuntimeError("No complete rollout groups available for training")
 
                     # Execute training forward / backward step
+                    if dashboard is not None:
+                        dashboard.publish("status", status="Training")
                     metrics = bridge.train_step(batch, optimizer)
                     metrics["judge_evaluation_source"] = b_judge.last_evaluation_source if b_judge else "disabled"
                     metrics.update(
@@ -627,9 +789,10 @@ def run_long_train(
                             step=current_step,
                             model=bridge.trainer_model,
                             optimizer=optimizer,
-                            base_model_name=model,
+                            base_model_name=bridge.config.model_name,
                             reward_logs=reward_history_logs[-50:],
                             completed_dataset_hash=None,
+                            **checkpoint_source_options,
                         )
                         print(f"[Sword] Emergency checkpoint successfully secured at: {emergency_ckpt}")
                         return {
@@ -646,6 +809,8 @@ def run_long_train(
 
             visited_row_hashes.add(current_row.row_hash)
             current_step = step_idx
+            if dashboard is not None:
+                dashboard.publish("step", step=step_idx, scores=[s.total_score for s in step_scores])
             if metrics.get("optimizer_step_skipped", False):
                 skipped_optimizer_steps += 1
             else:
@@ -713,11 +878,12 @@ def run_long_train(
                     step=current_step,
                     model=bridge.trainer_model,
                     optimizer=optimizer,
-                    base_model_name=model,
+                    base_model_name=bridge.config.model_name,
                     lora_r=bridge_config.lora_r,
                     lora_alpha=bridge_config.lora_alpha,
                     target_modules=bridge_config.target_modules,
                     reward_logs=reward_history_logs[-100:],
+                    **checkpoint_source_options,
                 )
                 print(f"[*] Checkpoint saved at: {saved_path}")
 
@@ -726,6 +892,9 @@ def run_long_train(
     except KeyboardInterrupt:
         print("\n[Sword] Training interrupted by user. Saving current checkpoint...")
     finally:
+        bridge.generation_callback = None
+        if dashboard is not None:
+            dashboard.finish("Completed" if completed_successfully else "Interrupted")
         if b_judge is not None:
             b_judge.release_after_eval()
         bridge.weight_sync.cleanup()
@@ -744,12 +913,13 @@ def run_long_train(
             step=current_step,
             model=bridge.trainer_model,
             optimizer=optimizer,
-            base_model_name=model,
+            base_model_name=bridge.config.model_name,
             lora_r=bridge_config.lora_r,
             lora_alpha=bridge_config.lora_alpha,
             target_modules=bridge_config.target_modules,
             reward_logs=reward_history_logs,
             completed_dataset_hash=dataset_sha256 if (completed_successfully and all_rows_visited) else None,
+            **checkpoint_source_options,
         )
         print(f"\n[Sword] Training process recorded. Final checkpoint: {final_ckpt}")
 
@@ -772,7 +942,10 @@ def run_long_train(
         "checkpoint_dir": final_ckpt,
         "rollout_backend": "vllm" if bridge.vllm_engine is not None else "pytorch",
         "vllm_initialization_error": bridge.vllm_initialization_error,
+        "training_base_model": bridge.config.model_name,
+        "source_lora": bridge.source_lora_manifest,
         "step_metrics": step_metrics,
+        "gradio_logger": dashboard.info() if dashboard is not None else {"enabled": False},
         "b_model": {
             "enabled": True,
             "model_name": b_judge.config.model_name,

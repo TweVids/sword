@@ -182,6 +182,8 @@ class CheckpointManager:
         training_state: Optional[Dict[str, Any]] = None,
         reward_logs: Optional[List[Dict[str, Any]]] = None,
         completed_dataset_hash: Optional[str] = None,
+        source_lora_manifest: Optional[Dict[str, Any]] = None,
+        tokenizer: Optional[Any] = None,
     ) -> str:
         """
         Performs custom checkpoint serialization with read-back verification:
@@ -251,6 +253,15 @@ class CheckpointManager:
         state["timestamp"] = time.time()
         with open(os.path.join(ckpt_dir, "training_state.json"), "w", encoding="utf-8") as f:
             json.dump(state, f, indent=2)
+        if source_lora_manifest is not None:
+            from .lora_source import SOURCE_MANIFEST
+            with open(os.path.join(ckpt_dir, SOURCE_MANIFEST), "w", encoding="utf-8") as f:
+                json.dump(source_lora_manifest, f, indent=2)
+        if tokenizer is not None:
+            tokenizer.save_pretrained(ckpt_dir)
+            if getattr(tokenizer, "chat_template", None) and isinstance(tokenizer.chat_template, str):
+                with open(os.path.join(ckpt_dir, "chat_template.jinja"), "w", encoding="utf-8") as f:
+                    f.write(tokenizer.chat_template)
 
         # 4. Save reward details log inside checkpoint folder
         if reward_logs:

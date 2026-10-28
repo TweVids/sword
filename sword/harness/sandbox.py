@@ -12,6 +12,8 @@ import fnmatch
 import shutil
 import tempfile
 import subprocess
+import time
+from collections import deque
 from typing import Dict, Any, List, Optional, Tuple
 
 
@@ -25,6 +27,8 @@ class WorkspaceSandbox:
         self.cleanup = cleanup
         self.timeout_sec = timeout_sec
         self.was_removed = False
+        self.last_execution_result = None
+        self.execution_history = deque(maxlen=32)
         if base_dir:
             self.root_dir = os.path.abspath(base_dir)
             os.makedirs(self.root_dir, exist_ok=True)
@@ -199,8 +203,35 @@ class WorkspaceSandbox:
         except Exception as e:
             return False, f"grep_search error: {e}"
 
-    def run_bash(self, command: str) -> Tuple[bool, str]:
+    def run_command(self, command, *, shell=False, stdin=None) -> Tuple[bool, str]:
+        """Run a process and retain bounded stdout/stderr separately from display text."""
+        started = time.monotonic()
+        try:
+            res = subprocess.run(command, shell=shell, cwd=self.root_dir,
+                                 capture_output=True, text=True, input=stdin,
+                                 timeout=self.timeout_sec,
+                                 executable="/bin/bash" if shell and os.name != "nt" and os.path.exists("/bin/bash") else None)
+            result = {"success": res.returncode == 0, "exit_code": res.returncode,
+                      "stdout": res.stdout[:8192], "stderr": res.stderr[:8192], "timed_out": False,
+                      "output_truncated": len(res.stdout) > 8192 or len(res.stderr) > 8192}
+        except subprocess.TimeoutExpired as exc:
+            def decoded(value):
+                return (value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value or "")[:8192]
+            result = {"success": False, "exit_code": None, "timed_out": True,
+                      "stdout": decoded(exc.stdout), "stderr": decoded(exc.stderr),
+                      "error": f"Command timed out after {self.timeout_sec}s"}
+        except Exception as exc:
+            result = {"success": False, "exit_code": None, "timed_out": False,
+                      "stdout": "", "stderr": str(exc), "error": f"Execution failed: {exc}"}
+        result["duration_sec"] = round(time.monotonic() - started, 4)
+        self.last_execution_result = result
+        self.execution_history.append(result)
+        output = result["stdout"] if result["success"] else (result.get("error") or result["stderr"] or result["stdout"] or f"Exit code {result['exit_code']}")
+        return result["success"], output[:2000].strip() or "Command completed with no output (exit code 0)"
+
+    def run_bash(self, command: str, stdin=None) -> Tuple[bool, str]:
         """Executes a shell command inside the sandbox."""
+        self.last_execution_result = None
         cmd_clean = command.strip()
         if not cmd_clean:
             return False, "Empty shell command"
@@ -209,33 +240,11 @@ class WorkspaceSandbox:
         if any(bad in cmd_clean for bad in dangerous):
             return False, "Command rejected: dangerous operation detected."
 
-        try:
-            shell_executable = None
-            if os.name == "nt":
-                # On Windows, execute via cmd / powershell
-                shell_executable = True
-            else:
-                shell_executable = "/bin/bash" if os.path.exists("/bin/bash") else True
+        return self.run_command(cmd_clean, shell=True, stdin=stdin)
 
-            res = subprocess.run(
-                cmd_clean,
-                shell=True,
-                cwd=self.root_dir,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout_sec,
-                executable=shell_executable if shell_executable is not True else None,
-            )
-            success = (res.returncode == 0)
-            output = res.stdout if success else (res.stderr or res.stdout or f"Exit code {res.returncode}")
-            return success, output[:2000].strip() or "Command completed with no output (exit code 0)"
-        except subprocess.TimeoutExpired:
-            return False, f"Command timed out after {self.timeout_sec}s"
-        except Exception as e:
-            return False, f"Execution failed: {e}"
-
-    def run_python(self, code: str) -> Tuple[bool, str]:
+    def run_python(self, code: str, stdin=None) -> Tuple[bool, str]:
         """Executes Python code inside the sandbox using the active Python interpreter."""
+        self.last_execution_result = None
         code_clean = code.strip()
         if not code_clean:
             return False, "Empty Python code"
@@ -247,18 +256,7 @@ class WorkspaceSandbox:
             with open(script_path, "w", encoding="utf-8") as f:
                 f.write(code_clean)
 
-            res = subprocess.run(
-                [sys.executable, script_path],
-                cwd=self.root_dir,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout_sec,
-            )
-            success = (res.returncode == 0)
-            output = res.stdout if success else (res.stderr or res.stdout or f"Exit code {res.returncode}")
-            return success, output[:2000].strip() or "Execution succeeded with no output"
-        except subprocess.TimeoutExpired:
-            return False, f"Python execution timed out after {self.timeout_sec}s"
+            return self.run_command([sys.executable, script_path], stdin=stdin)
         except Exception as e:
             return False, f"Python execution error: {e}"
         finally:

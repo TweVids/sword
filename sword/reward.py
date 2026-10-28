@@ -167,6 +167,8 @@ class MultiMetricRewardScorer:
         tools_called: int = 0,
         tools_succeeded: int = 0,
         assistant_history: Optional[List[str]] = None,
+        effort: str = "dynamic",
+        execution_evidence: Optional[Dict[str, Any]] = None,
     ) -> RewardBreakdown:
         """
         Computes the complete multi-metric score breakdown:
@@ -194,9 +196,11 @@ class MultiMetricRewardScorer:
             candidate_response=candidate_response,
             difficulty=difficulty,
             category=category,
+            effort=effort,
             tools_called=tools_called,
             tools_succeeded=tools_succeeded,
             **({"assistant_history": assistant_history} if assistant_history else {}),
+            **({"execution_evidence": execution_evidence} if execution_evidence is not None else {}),
         ) if self.b_model_judge is not None else deterministic_evaluation(
             candidate_response, solution, tools_called, tools_succeeded,
         )
@@ -213,6 +217,16 @@ class MultiMetricRewardScorer:
         ) != "deterministic"
         if live_judge or not can_be_verify:
             truth = b_res.truth
+        if execution_evidence is not None:
+            tests = execution_evidence.get("tests", {})
+            total = tests.get("total", 0)
+            if total > 0:
+                test_truth = max(0.0, min(1.0, tests.get("passed", 0) / total))
+                # A judge cannot override failing authoritative dataset checks.
+                truth = min(truth, test_truth) if live_judge else test_truth
+                from sword.harness.protocol import visible_response
+                if not visible_response(candidate_response).strip():
+                    truth = 0.0
 
         # 4. Total score calculation based on user specification:
         # If agentic was on: divide by 5; otherwise divide by 4.

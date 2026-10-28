@@ -29,6 +29,8 @@ class HarnessResult:
     workspace_dir: str = ""
     workspace_removed: bool = False
     assistant_turns: List[Dict[str, Any]] = field(default_factory=list)
+    test_results: List[Dict[str, Any]] = field(default_factory=list)
+    execution_results: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -43,6 +45,7 @@ class HarnessResult:
             "stop_reason": self.stop_reason,
             "workspace_dir": self.workspace_dir,
             "workspace_removed": self.workspace_removed,
+            "test_results": self.test_results,
         }
 
 
@@ -52,11 +55,28 @@ class BaseHarness:
 
     def create_sandbox(self):
         from sword.harness.sandbox import WorkspaceSandbox
-        return WorkspaceSandbox(
+        sandbox = WorkspaceSandbox(
             base_dir=getattr(self, "workspace_dir", None), timeout_sec=self.timeout_sec,
             cleanup=not getattr(self, "keep_workspace", False),
             parent_dir=getattr(self, "workspace_parent_dir", None),
         )
+        try:
+            for path, content in getattr(self, "initial_files", {}).items():
+                ok, message = sandbox.write_file(path, content)
+                if not ok:
+                    raise ValueError(message)
+        except Exception:
+            sandbox.close()
+            raise
+        return sandbox
+
+    def run_dataset_tests(self, sandbox, response):
+        import sys
+        if sys.exc_info()[0] is not None:
+            return []
+        from sword.execution import run_dataset_tests
+        return run_dataset_tests(sandbox, getattr(self, "dataset_tests", []), response,
+                                 getattr(self, "language", None) or "python")
 
     @staticmethod
     def has_final_answer(text: str) -> bool:
@@ -98,7 +118,8 @@ class BaseHarness:
             sys_prompt = ("Agent loop protocol: use tools to work on the task, inspect their returned results, "
                           "repair failures and verify the result. Continue until complete. "
                           "Finish with Final Answer: followed by your result. "
-                          "For JSON tools you may emit <tool_call>{\"name\":\"tool_name\",\"arguments\":{...}}</tool_call>.\n\n"
+                          "For tools you may emit JSON <tool_call>{\"name\":\"tool_name\",\"arguments\":{...}}</tool_call> "
+                          "or Gemma <|tool_call>call:tool_name{argument:<|\"|>value<|\"|>}<tool_call|>.\n\n"
                           + sys_prompt)
         if not sys_prompt:
             return problem

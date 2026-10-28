@@ -255,19 +255,60 @@ still require validation on the target hardware.
 CPU mock runs reserve 64 response tokens by default; explicit response limits
 still apply in mock mode.
 
-Policy thinking is requested through the native chat template by default.
-Use `A_model_thinking=False` to disable that request. The tokenizer must support
-the template's `enable_thinking` option for it to control native thinking.
+Datasets accept an optional `effort` column: `dynamic`, `low`, `medium`, or `high`.
+Missing or blank values default to `dynamic`; invalid values raise an error.
+The column is supported in Hugging Face datasets, in-memory rows, JSON/JSONL,
+and CSV/TSV with column headers, and is included in dataset deduplication hashes.
+For example: `{"problem": "What is 2+2?", "solution": "4", "effort": "low"}`.
+
+Policy thinking is requested through the native chat template by default, with
+the row's effort passed to the initial response and every tool follow-up.
+Set `chat_template_path` to use an explicit local Jinja template:
+
+```python
+sword.train(
+    test=False, dataset=rows,
+    model_lora_repo="your-user/lora-model",
+    train_from_lora_checkpoint=900,
+    chat_template_path=r"D:\sword\chat_template.jinja",
+)
+```
+
+The path is optional and also works when training directly from a base model.
+Its contents override the tokenizer/checkpoint template, are validated before
+model loading, participate in merged-tokenizer caching and dataset deduplication,
+and are saved with subsequent checkpoints. A file in the working directory is
+used only when its path is supplied. vLLM and PyTorch rollout prompts use the same
+overridden tokenizer template, including harness follow-up turns.
+
+All four harnesses accept native Gemma calls such as
+`<|tool_call>call:write_file{path:<|"|>state.txt<|"|>,content:<|"|>hello<|"|>}<tool_call|>`
+using each harness's supported tool names and argument schemas. The parser accepts
+nested objects/arrays, booleans, nulls, numbers, and multiline quoted strings.
+JSON tool calls remain supported. Tool-shaped text in thoughts or quoted
+arguments is excluded from execution; incomplete/malformed native calls receive
+normal repair feedback. Code/patch content inside arguments is executed only by
+the requested tool, avoiding duplicate execution by code-block heuristics.
+
+The supplied `chat_template.jinja` renders `<|think|>` and `Effort: <value>` in
+the system turn. With `dynamic`, thinking stays enabled and the model decides
+whether to emit a thought section; the dataset rules govern the judge's scores.
+Use `A_model_thinking=False` to disable the request explicitly. The tokenizer's
+chat template must support `enable_thinking` and `effort` to control them.
 Reasoning markers are preserved, including a thought opener placed in the prompt,
 so the harness does not execute tools mentioned inside thinking. Sampled thought
-tokens remain part of GRPO. `[ModelA Request]` shows `thinking_requested`, each
-output shows `thought_present`, and `ThoughtTurns` counts nonempty tagged thought
-sections across all trained turns. A request alone does not prove the model
+tokens remain part of GRPO. `[ModelA Request]` shows `thinking_requested` and
+`effort`; each output shows `thought_present`, and `ThoughtTurns` counts nonempty
+tagged thought sections across all trained turns. A request alone does not prove the model
 actually emitted a thought section.
 
 Model B uses a **32,768-token context** by default; `B_model_num_ctx` overrides
-it. The judge receives the complete dataset rules, earlier assistant turns as
-reasoning evidence, the final response separately, and measured tool counts.
+it. The judge receives the row's effort, complete dataset rules, all emitted
+thoughts with their original markers, earlier assistant turns, the answer outside
+thought channels separately, and measured tool counts. Unfinished harness turns
+remain reasoning evidence even when no final answer was produced. The judge
+checks thought boundaries against the rules and never counts a result present
+only in thoughts as a final answer. Dynamic effort alone requires no thought section.
 Its rubric evaluates both rules explicitly and avoids inventing an unstated
 reasoning requirement. Ollama structured output requires all six score fields,
 with numeric scores and a boolean `cheating`. Missing or invalid fields trigger
@@ -290,6 +331,70 @@ responses; `0` prints the full response. Judge-only overrides are
 `B_model_log_outputs` and `B_model_output_chars`. Keep `show_detail_logs=True`
 to see turn labels and step summaries.
 
+Coding rows without a resolved harness now use a one-shot code executor. Coding
+categories, an explicit `language`, dataset tests, or supported code fences enable
+it; unfamiliar category names can use `language` or `tests` to select execution.
+Python is the default; JavaScript (`node`) and shell (`bash`) require their runtime
+on the training host. Set `auto_code_executor=False` to disable the fallback.
+Execution alone does not establish answer correctness.
+
+Dataset rows can define `tests` as Python assertion code, a list of assertion
+strings, or a list of objects containing either `code` or `command`. Test objects
+also support `name`, `timeout_sec` (default 10, maximum 300), `stdin`, and
+`expected_stdout`. Command tests can use `{python}` for the active interpreter.
+`test_commands` is an alias for a list of command tests. JSON strings in CSV/TSV
+columns are accepted. `initial_files` maps relative filenames to initial contents.
+Tests and initial files participate in dataset deduplication.
+
+```python
+rows = [{
+    "problem": "Implement add(a, b) in Python.",
+    "category": "custom_coding_task",
+    "language": "python",
+    "tests": [
+        {"name": "addition", "code": "assert add(2, 3) == 5"},
+        {"name": "negative", "code": "assert add(-2, 1) == -1"},
+    ],
+}]
+sword.train(
+    test=False, dataset=rows, gradio_logger=True,
+    Argument={"concurrency_g": 8},
+)
+```
+
+Python assertion tests load `solution.py` into their scope when it exists, so they
+can call solution functions directly; command tests can run project test suites.
+The same checks run for explicit harnesses before workspace cleanup. Dataset tests
+are counted separately from model tool calls. With a live judge, the passed-test
+fraction caps its truth score; without live judging, that fraction supplies the
+truth score. No final answer still receives zero truth credit.
+
+The judge receives exact tool success/failure totals and dataset-test totals,
+plus bounded samples of runner-captured output. Defaults are a 4,000-character
+JSON budget, up to four failed samples and two successful samples, with dataset
+tests prioritized. Configure `judge_execution_chars` (512–16,000),
+`judge_execution_failed_samples`, and `judge_execution_success_samples` through
+`sword.train(...)`. Omitted samples are explicitly counted; full traces remain
+available with `trace_rollouts=True`. stdout/stderr are treated as program output,
+not judge instructions.
+
+Install the optional dashboard dependency with `pip install -e ".[logger]"`.
+`sword.train(gradio_logger=True, ...)` launches Gradio with `share=True` and prints
+the public URL. The read-only dashboard shows live generation, current rollout
+rewards, task totals/means, overall mean reward, a bounded score history, parsed
+judge scores, raw judge JSON, and measured execution evidence. It displays up to
+eight rollouts by default; `gradio_max_rollouts` changes only the display count,
+while `Argument["concurrency_g"]` still controls training. `gradio_refresh_interval`
+(default 1 second, minimum 0.5) and `gradio_port` are optional overrides.
+
+vLLM streaming observes its existing engine loop and keeps final token IDs and
+logprobs in the trainer flow. The PyTorch fallback also publishes live updates.
+Generation updates are throttled, text and event buffers are bounded, and Gradio
+rendering/launch run outside the training thread. The UI has no training controls
+and dashboard failures do not stop training. `gradio_logger=False` loads no Gradio
+dependency and installs no generation observer. The display remains available
+after training finishes for inspection while the Python process remains alive.
+
 Each rollout creates a fresh directory under `<output_dir>/harness_workspaces`.
 Files persist across that rollout's turns, and the directory is removed when
 the harness exits. Set `Argument["keep_harness_workspaces"] = True` to retain
@@ -307,6 +412,58 @@ advantage-weighted objective. Its sign or proximity to zero does not establish
 learning: check reward variation, nonzero gradients, optimizer updates, and truth
 scores. Uniform-reward logs separate policy loss from the weighted entropy
 penalty, which can produce a small nonzero total loss without reward signal.
+
+To start GRPO from a published LoRA checkpoint, select its repository and folder:
+
+```python
+result = sword.train(
+    test=False,
+    dataset="your-user/training-data",
+    model_lora_repo="your-user/gemma-lora",
+    train_from_lora_checkpoint="checkpoint-900",
+    HF_TOKEN=os.environ.get("HF_TOKEN"),
+    Argument={"steps": 200, "output_dir": "checkpoints/grpo_from_900"},
+)
+```
+
+`model_lora_repo` accepts a Hugging Face repo or local adapter repository. A
+checkpoint can be a step number, `checkpoint-900`, a complete nested folder,
+`latest`, or `root`; omitting it selects the repo root. Missing checkpoints and
+ambiguous nested names fail explicitly. The source adapter's
+`adapter_config.json` identifies the base model. An explicit `model` must agree
+with that base, or supplies it if the adapter config has no base name. Remote
+adapter and base revisions are pinned. `model_lora_revision` selects a source
+repo revision when needed.
+
+Sword downloads only the selected adapter and its config/tokenizer/template
+assets, borrowing a root adapter config if the checkpoint lacks one. It loads
+the base without k-bit quantization on CPU, merges the selected adapter with
+PEFT's safe merge, and saves a full model under
+`Argument["output_dir"]/merged_bases`. This one-time merge needs enough CPU RAM
+and disk space for the full base. `merged_base_cache_dir`, `model_cache_dir`, and
+`lora_cache_dir` let you choose storage locations. A matching merged base is
+reused on subsequent runs. Merge failures stop training.
+
+The trainer loads the merged base with the requested training quantization and
+attaches a **new** trainable LoRA. vLLM loads the same merged-base directory and
+receives that new adapter through the existing versioned `LoRARequest` flow.
+The merged source weights stay frozen. For each problem, the policy generates
+the rollout group, Model B scores complete thoughts and answers against the
+dataset rules, GRPO computes advantages and updates the new adapter, and Sword
+exports the updated adapter for the next rollout. Tool follow-ups, effort
+control, logprobs, and GPU handovers use the existing bridge.
+
+New checkpoints include `sword_lora_source.json` and the tokenizer/chat template
+alongside the new adapter. The manifest records the original base and all source
+adapters, so a later `model_lora_repo` run can reconstruct the merged base even
+when the earlier machine's local directory is unavailable. Source repositories
+must remain accessible. Dataset completion hashes also include the selected
+source, so training a different checkpoint does not reuse another source's
+completion log. `train_from_lora_checkpoint` starts a fresh GRPO adapter and
+optimizer; `resume_from_checkpoint` restores a GRPO run and must use the same
+merged-base manifest. Supplying a LoRA source selects GRPO, including when the
+ordinary API's `test=True` default is left unchanged; `prep_and_logs=True`
+continues to run its diagnostic workflow on that source.
 
 ### Target environment setup and test suite
 
@@ -362,8 +519,8 @@ details. A missing dependency, failed harness, PyTorch rollout fallback, or
 deterministic judge fallback makes the live suite return `ok=False`. Failed
 preflight checks prevent large model loading and training.
 
-Use `prep_and_logs=True, setup=True, test=False` to prepare and validate readiness
-without starting GRPO. `sword.setup_environment()` also exposes provisioning
+Without a LoRA source, use `prep_and_logs=True, setup=True, test=False` to prepare
+and validate readiness without starting GRPO. `sword.setup_environment()` also exposes provisioning
 alone. With `setup=False`, diagnostics validate an already prepared environment
 without package installation, repository cloning, or model downloads.
 `b_model=False` disables Ollama setup/checks and model-based reward judging.

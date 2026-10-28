@@ -10,7 +10,7 @@ from typing import Dict, Any, List, Optional, Callable, Tuple
 
 from sword.harness.base import BaseHarness, HarnessResult
 from sword.harness.sandbox import WorkspaceSandbox
-from sword.harness.protocol import structured_calls, visible_response
+from sword.harness.protocol import structured_calls, visible_response, without_structured_calls
 
 
 class OpenCodeHarness(BaseHarness):
@@ -45,6 +45,7 @@ class OpenCodeHarness(BaseHarness):
             calls.append({"type": "tool_call", "payload": {"name": call["name"], "args": call["args"]},
                           "valid_json": call["valid_json"]})
 
+        text = without_structured_calls(text)
         # 2. Markdown bash / python code execution blocks
         for match in re.finditer(r"```(bash|sh|python)\n(.*?)```", text, re.DOTALL):
             lang = match.group(1).lower()
@@ -194,7 +195,10 @@ class OpenCodeHarness(BaseHarness):
                 )
 
         finally:
-            sandbox.close()
+            try:
+                test_results = self.run_dataset_tests(sandbox, final_text)
+            finally:
+                sandbox.close()
 
         success_rate = (tools_succeeded / tools_called) if tools_called > 0 else 0.0
 
@@ -207,6 +211,7 @@ class OpenCodeHarness(BaseHarness):
             tools_succeeded=tools_succeeded,
             tools_failed=tools_failed,
             tool_history=history,
+            test_results=test_results, execution_results=list(sandbox.execution_history),
             success_rate=success_rate,
             is_completed=is_completed,
             error_message=None if is_completed else "No final answer before " + stop_reason,

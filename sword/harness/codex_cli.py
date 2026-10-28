@@ -11,7 +11,7 @@ from typing import Dict, Any, List, Optional, Callable, Tuple
 
 from sword.harness.base import BaseHarness, HarnessResult
 from sword.harness.sandbox import WorkspaceSandbox
-from sword.harness.protocol import structured_calls, visible_response
+from sword.harness.protocol import structured_calls, visible_response, without_structured_calls
 
 
 class CodexCliHarness(BaseHarness):
@@ -39,7 +39,7 @@ class CodexCliHarness(BaseHarness):
     def extract_code_blocks(self, text: str) -> List[str]:
         """Extracts executable python code blocks from markdown."""
         blocks = []
-        for m in re.finditer(r"```(?:python|py)?\n(.*?)```", visible_response(text), re.DOTALL):
+        for m in re.finditer(r"```(?:python|py)?\n(.*?)```", without_structured_calls(text), re.DOTALL):
             code = m.group(1).strip()
             if code and not code.startswith("*** Begin Patch"):
                 blocks.append(code)
@@ -48,7 +48,7 @@ class CodexCliHarness(BaseHarness):
     def extract_patches(self, text: str) -> List[str]:
         """Extracts Codex apply_patch blocks (*** Begin Patch ... *** End Patch)."""
         text = visible_response(text)
-        blocks = [text]
+        blocks = [without_structured_calls(text)]
         for call in structured_calls(text):
             if call["name"] == "apply_patch":
                 args = call["args"]
@@ -66,7 +66,7 @@ class CodexCliHarness(BaseHarness):
         """Extracts Codex exec_command JSON payloads or bash blocks."""
         cmds: List[str] = []
         text = visible_response(text)
-        for m in re.finditer(r"```(?:bash|sh)\n(.*?)```", text, re.DOTALL):
+        for m in re.finditer(r"```(?:bash|sh)\n(.*?)```", without_structured_calls(text), re.DOTALL):
             c = m.group(1).strip()
             if c:
                 cmds.append(c)
@@ -306,7 +306,10 @@ class CodexCliHarness(BaseHarness):
                 )
 
         finally:
-            sandbox.close()
+            try:
+                test_results = self.run_dataset_tests(sandbox, final_text)
+            finally:
+                sandbox.close()
 
         success_rate = (tools_succeeded / tools_called) if tools_called > 0 else 0.0
 
@@ -319,6 +322,7 @@ class CodexCliHarness(BaseHarness):
             tools_succeeded=tools_succeeded,
             tools_failed=tools_failed,
             tool_history=history,
+            test_results=test_results, execution_results=list(sandbox.execution_history),
             success_rate=success_rate,
             is_completed=is_completed,
             error_message=None if is_completed else "No final answer before " + stop_reason,

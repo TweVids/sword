@@ -19,7 +19,8 @@ import re
 import time
 import shutil
 import tempfile
-from dataclasses import dataclass, field
+from contextlib import nullcontext
+from dataclasses import dataclass, field, replace
 from typing import List, Dict, Any, Tuple, Optional, Callable, Union
 
 import torch
@@ -37,24 +38,41 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from .rl.policy import token_statistics, safe_optimizer_step
 from .defaults import DEFAULT_GRPO_MODEL, DEFAULT_GRPO_CONTEXT, DEFAULT_GRPO_MAX_NEW_TOKENS
 from .logging_utils import quiet_quantization_cast_notices, output_preview
+from .lora_source import LoraTrainingSource, SOURCE_MANIFEST, prepare_merged_lora_base
 
 # Runtime-visibility stamp: printed when the trainer initializes, so live logs
 # always reveal which bridge change set is actually executing.
 _CODE_STAMP = "sword-grpo-bridge math-llm-judge/v8"
 
 
-def format_rollout_prompt(tokenizer, prompt: str, *, enable_thinking: bool = True) -> Tuple[str, bool]:
+THINKING_EFFORTS = ("dynamic", "low", "medium", "high")
+
+
+def normalize_effort(effort: Optional[str]) -> str:
+    """Default missing dataset effort to dynamic and reject unsupported values."""
+    if effort is None or (isinstance(effort, str) and not effort.strip()):
+        return "dynamic"
+    if not isinstance(effort, str) or effort.strip().lower() not in THINKING_EFFORTS:
+        raise ValueError("effort must be one of: " + ", ".join(THINKING_EFFORTS))
+    return effort.strip().lower()
+
+
+def format_rollout_prompt(tokenizer, prompt: str, *, enable_thinking: bool = True,
+                          effort: str = "dynamic") -> Tuple[str, bool]:
     """Use the model's assistant-generation template when one is configured."""
+    effort = normalize_effort(effort)
     if getattr(tokenizer, "chat_template", None) and callable(getattr(tokenizer, "apply_chat_template", None)):
         return tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True,
             enable_thinking=enable_thinking,
+            effort=effort if enable_thinking else None,
         ), True
     return prompt, False
 
 
-def tokenize_rollout_prompt(tokenizer, prompt: str, max_prompt_tokens: Optional[int] = None, *, enable_thinking: bool = True):
-    text, is_chat = format_rollout_prompt(tokenizer, prompt, enable_thinking=enable_thinking)
+def tokenize_rollout_prompt(tokenizer, prompt: str, max_prompt_tokens: Optional[int] = None, *,
+                            enable_thinking: bool = True, effort: str = "dynamic"):
+    text, is_chat = format_rollout_prompt(tokenizer, prompt, enable_thinking=enable_thinking, effort=effort)
     options = {"return_tensors": "pt"}
     if is_chat:
         # The template already inserts BOS and role markers. Do not add BOS twice
@@ -68,11 +86,12 @@ def tokenize_rollout_prompt(tokenizer, prompt: str, max_prompt_tokens: Optional[
     return inputs, is_chat
 
 
-def rollout_prompt_budget(tokenizer, max_model_len: int, max_new_tokens: int, *, enable_thinking: bool = True) -> int:
+def rollout_prompt_budget(tokenizer, max_model_len: int, max_new_tokens: int, *,
+                          enable_thinking: bool = True, effort: str = "dynamic") -> int:
     """Reserve role-marker tokens before the harness trims its instructions."""
     budget = max_model_len - max_new_tokens
     if getattr(tokenizer, "chat_template", None):
-        inputs, _ = tokenize_rollout_prompt(tokenizer, "", enable_thinking=enable_thinking)
+        inputs, _ = tokenize_rollout_prompt(tokenizer, "", enable_thinking=enable_thinking, effort=effort)
         budget -= inputs["input_ids"].shape[-1] + 8
     if budget < 1:
         raise ValueError("max_seq_len must leave room for the chat template, task, and response")
@@ -265,8 +284,17 @@ class GRPOBridgeConfig:
     log_model_outputs: bool = True
     enable_thinking: bool = True
     model_output_chars: int = 1200
+    effort: str = "dynamic"
+    lora_training_source: Optional[LoraTrainingSource] = field(default=None, repr=False)
+    merged_base_cache_dir: str = "checkpoints/merged_bases"
+    chat_template_path: Optional[str] = None
+    chat_template_override: Optional[str] = field(default=None, repr=False)
 
     def __post_init__(self):
+        self.effort = normalize_effort(self.effort)
+        if self.chat_template_path is not None and self.chat_template_override is None:
+            from .chat_templates import read_chat_template
+            self.chat_template_override = read_chat_template(self.chat_template_path)
         if self.load_in_4bit and self.load_in_8bit:
             raise ValueError("Choose either load_in_4bit or load_in_8bit.")
         if self.concurrency_g < 1 or self.micro_batch_size < 1 or self.chunk_size < 1:
@@ -744,15 +772,18 @@ class FallbackRolloutEngine:
         top_p: float = 0.9,
         max_model_len: Optional[int] = None,
         enable_thinking: bool = True,
+        effort: str = "dynamic",
+        generation_callback: Optional[Callable] = None,
     ) -> List[Dict[str, Any]]:
         device = next(self.model.parameters()).device
         results = []
         eos_ids = getattr(self.tokenizer, "eos_token_id", None)
         eos_ids = set(eos_ids if isinstance(eos_ids, (list, tuple)) else [eos_ids])
-        for prompt in prompts:
+        for rollout_index, prompt in enumerate(prompts):
             raw_inputs, _ = tokenize_rollout_prompt(
                 self.tokenizer, prompt, max_model_len - max_new_tokens if max_model_len is not None else None,
                 enable_thinking=enable_thinking,
+                effort=effort,
             )
             if hasattr(raw_inputs, "to"):
                 inputs = raw_inputs.to(device)
@@ -765,6 +796,7 @@ class FallbackRolloutEngine:
             gen_tokens = []
             gen_logprobs = []
             curr_input = inputs["input_ids"]
+            last_stream_update = 0.0
 
             for _ in range(max_new_tokens):
                 out = self.model(input_ids=curr_input, use_cache=False)
@@ -789,6 +821,13 @@ class FallbackRolloutEngine:
 
                 gen_tokens.append(token_val)
                 gen_logprobs.append(token_lp)
+                if generation_callback is not None and time.monotonic() - last_stream_update >= 0.25:
+                    try:
+                        generation_callback(rollout_index, restore_thinking_prefix(
+                            self.tokenizer, p_ids, self.tokenizer.decode(gen_tokens, skip_special_tokens=False)), finished=False)
+                    except Exception:
+                        pass
+                    last_stream_update = time.monotonic()
 
                 if token_val in eos_ids:
                     break
@@ -852,6 +891,8 @@ class GRPOBridge:
         self.global_step: int = 0
         self.mock_test = False
         self.vllm_initialization_error = None
+        self.source_lora_manifest: Optional[Dict[str, Any]] = None
+        self.generation_callback: Optional[Callable] = None
 
     def initialize_trainer(
         self,
@@ -865,6 +906,22 @@ class GRPOBridge:
         quiet_quantization_cast_notices()
         print(f"[GRPO] bridge code {_CODE_STAMP} (from {_sys.modules[__name__].__file__})", flush=True)
         self.mock_test = bool(mock_test or kwargs.get("mock_test", False))
+        if self.config.lora_training_source is not None:
+            if self.mock_test or model is not None or tokenizer is not None:
+                raise ValueError("Source LoRA training must load the selected merged base, without mock or injected models")
+            source = self.config.lora_training_source
+            if self.config.chat_template_override is not None:
+                source = replace(source, chat_template=self.config.chat_template_override)
+            merged_path = prepare_merged_lora_base(
+                source, self.config.merged_base_cache_dir,
+                token=self.config.hf_token, cache_dir=self.config.model_cache_dir,
+                local_files_only=self.config.local_files_only,
+            )
+            self.config.model_name = merged_path
+            self.config.model_revision = None
+            self.weight_sync.base_model_name = merged_path
+            with open(os.path.join(merged_path, SOURCE_MANIFEST), encoding="utf-8") as stream:
+                self.source_lora_manifest = json.load(stream)
         load_options = {
             "token": self.config.hf_token, "cache_dir": self.config.model_cache_dir,
             "revision": self.config.model_revision, "local_files_only": self.config.local_files_only,
@@ -990,6 +1047,10 @@ class GRPOBridge:
                     self.trainer_model = get_peft_model(self.trainer_model, adapter_config)
                     adapter_targets = retry_targets
 
+        if self.source_lora_manifest is not None:
+            # A fresh adapter depends on the merged source, never the original HF base.
+            for adapter_config in getattr(self.trainer_model, "peft_config", {}).values():
+                adapter_config.base_model_name_or_path = self.config.model_name
         if adapter_targets is not None:
             # Keep both loading paths and manual adapter export aligned with the
             # exact modules selected, including when default targets were used.
@@ -1034,6 +1095,8 @@ class GRPOBridge:
             except Exception:
                 pass
 
+        if self.config.chat_template_override is not None:
+            self.tokenizer.chat_template = self.config.chat_template_override
         self.fallback_engine = FallbackRolloutEngine(self.trainer_model, self.tokenizer)
 
     def initialize_vllm(self) -> bool:
@@ -1147,7 +1210,8 @@ class GRPOBridge:
         if self.config.log_model_outputs:
             print(f"[ModelA Request] model={self.config.model_name} backend={'pytorch' if use_fallback else 'vllm'} "
                   f"rollouts={len(expanded_prompts)} context={self.config.max_model_len} "
-                  f"max_tokens={self.config.max_new_tokens} thinking_requested={self.config.enable_thinking}", flush=True)
+                  f"max_tokens={self.config.max_new_tokens} thinking_requested={self.config.enable_thinking} "
+                  f"effort={self.config.effort}", flush=True)
         if not use_fallback:
             # Token prompts prevent vLLM from inserting another BOS into an
             # already-rendered chat template. Preserve original text for harnesses.
@@ -1157,6 +1221,7 @@ class GRPOBridge:
                     inputs, _ = tokenize_rollout_prompt(
                         self.tokenizer, prompt, self.config.max_model_len - self.config.max_new_tokens,
                         enable_thinking=self.config.enable_thinking,
+                        effort=self.config.effort,
                     )
                     engine_prompts.append({"prompt_token_ids": inputs["input_ids"][0].tolist()})
                 else:
@@ -1172,21 +1237,30 @@ class GRPOBridge:
                     skip_special_tokens=False,
                 )
                 lora_req = self.weight_sync.get_current_lora_request()
+                if self.generation_callback is not None:
+                    try:
+                        from vllm.sampling_params import RequestOutputKind
+                        sp.output_kind = RequestOutputKind.CUMULATIVE
+                    except ImportError:
+                        pass
+                def generate_outputs():
+                    observer = nullcontext()
+                    if self.generation_callback is not None:
+                        from .training_logger import observe_vllm_generation
+                        observer = observe_vllm_generation(self.vllm_engine, self.generation_callback)
+                    with observer:
+                        if lora_req is not None:
+                            return self.vllm_engine.generate(engine_prompts, sp, lora_request=lora_req)
+                        return self.vllm_engine.generate(engine_prompts, sp)
                 try:
-                    if lora_req is not None:
-                        outputs = self.vllm_engine.generate(engine_prompts, sp, lora_request=lora_req)
-                    else:
-                        outputs = self.vllm_engine.generate(engine_prompts, sp)
+                    outputs = generate_outputs()
                 except torch.cuda.OutOfMemoryError:
                     # Co-residency spike (trainer + awake engine). Drain, retry once;
                     # persistent OOM surfaces to the fallback path below.
                     print("[GRPO] CUDA OOM during rollout generation; draining caches and retrying once", flush=True)
                     gc.collect()
                     torch.cuda.empty_cache()
-                    if lora_req is not None:
-                        outputs = self.vllm_engine.generate(engine_prompts, sp, lora_request=lora_req)
-                    else:
-                        outputs = self.vllm_engine.generate(engine_prompts, sp)
+                    outputs = generate_outputs()
 
                 if len(outputs) != len(expanded_prompts):
                     raise ValueError("vLLM returned an incomplete rollout batch")
@@ -1239,6 +1313,8 @@ class GRPOBridge:
                 top_p=self.config.top_p,
                 max_model_len=self.config.max_model_len,
                 enable_thinking=self.config.enable_thinking,
+                effort=self.config.effort,
+                **({"generation_callback": self.generation_callback} if self.generation_callback is not None else {}),
             )
             for idx, res in enumerate(fb_results):
                 batch.items.append(RolloutItem(
@@ -1252,6 +1328,12 @@ class GRPOBridge:
                     is_truncated=res.get("is_truncated", False),
                 ))
 
+        if self.generation_callback is not None:
+            for idx, item in enumerate(batch.items):
+                try:
+                    self.generation_callback(idx, item.response_text, finished=True)
+                except Exception:
+                    pass
         if self.config.log_model_outputs:
             for idx, item in enumerate(batch.items):
                 print(f"[ModelA Output] model={self.config.model_name} backend={'pytorch' if use_fallback else 'vllm'} "
