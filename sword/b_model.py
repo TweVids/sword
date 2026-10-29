@@ -814,7 +814,18 @@ class ModelBJudge:
                                            "Use numbers from 0.0 to 1.0 for all five scores and a boolean for cheating. "
                                            "An unfulfilled rule still needs a numeric score of 0.0.")
                         continue
-                    # Transport/load failure (timeout, OOM, server error): do not
+                    # BUG (b_model.think_ladder) fix: a think-spec timeout means the
+                    # budget expired, not that this model is broken — fall through to
+                    # the remaining no-think spec on the SAME model before swapping to
+                    # the fallback model. Previously any non-ValueError broke straight
+                    # out and thrashed a full fallback model load per evaluation.
+                    is_timeout = requests is not None and isinstance(
+                        exc, (requests.exceptions.Timeout, requests.exceptions.ConnectionError))
+                    if is_timeout and payload.get("think") is True:
+                        print("[ModelB] think-spec timeout; retrying this model with think=False",
+                              flush=True)
+                        continue
+                    # Other transport/load failure (OOM, server error): do not
                     # wait again on this model; escalate to the fallback now.
                     break
             # Every spec failed for this model: escalate to the fallback model
