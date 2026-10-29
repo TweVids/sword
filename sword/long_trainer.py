@@ -465,7 +465,13 @@ def run_long_train(
     if b_judge is not None and b_judge_config.auto_setup:
         # Download before allocating trainer VRAM; inference loads only in the score phase.
         b_judge.ensure_ready()
-    reward_scorer = MultiMetricRewardScorer(b_model_judge=b_judge)
+    # Style metrics cannot subsidize factually wrong answers: "pretty but
+    # wrong" caps at 0.25 of the flat average. Pass wrong_answer_cap=1.0 to
+    # restore the legacy behavior.
+    reward_scorer = MultiMetricRewardScorer(
+        b_model_judge=b_judge,
+        wrong_answer_cap=float(kwargs.get("wrong_answer_cap", 0.25)),
+    )
 
     # 4. GRPO Bridge Setup
     bridge_config = GRPOBridgeConfig(

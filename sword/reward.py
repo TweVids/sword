@@ -122,9 +122,21 @@ class MultiMetricRewardScorer:
     Computes unified GRPO reward using dataset attributes:
     problem, solution, reasoning_rule, answer_rule, difficulty, category, harness and code tests.
     """
-    def __init__(self, b_model_judge: Optional[ModelBJudge] = _DEFAULT_JUDGE):
+    def __init__(self, b_model_judge: Optional[ModelBJudge] = _DEFAULT_JUDGE,
+                 wrong_answer_cap: float = 1.0):
         # Omitted means the default judge; explicit None disables all Ollama IO.
         self.b_model_judge = ModelBJudge() if b_model_judge is _DEFAULT_JUDGE else b_model_judge
+        # BUG (reward.style_subsidy) fix: with the flat metric average, an answer
+        # that is factually WRONG (truth=0) but well-formatted and rule-obedient
+        # still earned 0.75 — rewarding style while ignoring correctness and
+        # nearly flattening the reward surface (correct ~1.0 vs wrong ~0.75).
+        # The cap multiplies the style-only base score when truth is zero, so
+        # wrong answers can earn at most wrong_answer_cap of it (0.25 default
+        # in the trainer = "pretty but wrong" floors at 0.25). Set 1.0 to
+        # restore the legacy flat average.
+        if not (0.0 <= wrong_answer_cap <= 1.0):
+            raise ValueError("wrong_answer_cap must be within [0.0, 1.0]")
+        self.wrong_answer_cap = float(wrong_answer_cap)
 
     def check_formatting(self, candidate_response: str) -> float:
         """
@@ -239,10 +251,17 @@ class MultiMetricRewardScorer:
         # 4. Total score calculation based on user specification:
         # If agentic was on: divide by 5; otherwise divide by 4.
         # If cheating was caught: subtract 0.2 penalty.
+        # Truth-weighted gate: style/rule metrics subsidize the total in
+        # proportion (1 - truth_weight) so a wrong answer cannot ride on
+        # formatting. truth_weight == 0 restores the legacy flat average;
+        # the single-truth gate keeps partial credit honest and gives
+        # wrong answers a small style-only floor instead of truncating.
         if is_agentic:
             base_score = (truth + formatted + rule_reasoning_follow + rule_answer_follow + tools_success) / 5.0
         else:
             base_score = (truth + formatted + rule_reasoning_follow + rule_answer_follow) / 4.0
+        if truth <= 1e-6 and self.wrong_answer_cap < 1.0:
+            base_score *= self.wrong_answer_cap
 
         if cheating:
             total_score = base_score - 0.2
