@@ -1,6 +1,6 @@
 """
 Multi-Metric Reward Engine for GRPO Training.
-Combines exact mathematical verification, structural formatting checks,
+Combines Model B correctness ratings, structural formatting checks,
 Model B reasoning/answer rule evaluation, agentic tool success rates,
 and penalty deductions for cheating.
 """
@@ -120,7 +120,7 @@ class MathVerifier:
 class MultiMetricRewardScorer:
     """
     Computes unified GRPO reward using dataset attributes:
-    problem, solution, reasoning_rule, answer_rule, can_be_verify, difficult, category, harness.
+    problem, solution, reasoning_rule, answer_rule, difficulty, category, harness and code tests.
     """
     def __init__(self, b_model_judge: Optional[ModelBJudge] = _DEFAULT_JUDGE):
         # Omitted means the default judge; explicit None disables all Ollama IO.
@@ -146,6 +146,8 @@ class MultiMetricRewardScorer:
         fence_count = text.count("```")
         if fence_count % 2 != 0:
             score -= 0.3  # Unbalanced code blocks
+        if text.count("'''") % 2 != 0:
+            score -= 0.3  # Unbalanced quoted code blocks
 
         # Check nested think tags
         if text.count("<think>") > 1 or text.count("</think>") > 1:
@@ -160,7 +162,7 @@ class MultiMetricRewardScorer:
         candidate_response: str,
         reasoning_rule: str = "",
         answer_rule: str = "",
-        can_be_verify: bool = True,
+        can_be_verify: Optional[bool] = None,
         difficulty: str = "medium",
         category: str = "general",
         harness_name: Optional[str] = None,
@@ -169,10 +171,13 @@ class MultiMetricRewardScorer:
         assistant_history: Optional[List[str]] = None,
         effort: str = "dynamic",
         execution_evidence: Optional[Dict[str, Any]] = None,
+        dataset_row: Optional[Dict[str, Any]] = None,
+        code_execution: Optional[Dict[str, Any]] = None,
     ) -> RewardBreakdown:
         """
         Computes the complete multi-metric score breakdown:
         truth, formatted, rule_reasoning_follow, rule_answer_follow, tools_success, cheating.
+        The legacy can_be_verify caller argument is accepted but has no effect.
         """
         is_agentic = (tools_called > 0) or (bool(harness_name) and harness_name.lower() not in ("none", "default", "raw", ""))
         tools_success = (tools_succeeded / max(1, tools_called)) if tools_called > 0 else 0.0
@@ -180,14 +185,7 @@ class MultiMetricRewardScorer:
         # 1. Structural formatting check
         formatted = self.check_formatting(candidate_response)
 
-        # 2. Truth check
-        # If can_be_verify is true, verify exact math ground truth
-        truth = 0.0
-        if can_be_verify:
-            is_math_correct = MathVerifier.verify_answer(candidate_response, solution)
-            truth = 0.5 if is_math_correct else 0.0
-
-        # 3. Model B evaluation for correctness and dataset rules, including math.
+        # Model B evaluates correctness and dataset rules for all categories.
         b_res = self.b_model_judge.evaluate(
             problem=problem,
             solution=solution,
@@ -201,6 +199,8 @@ class MultiMetricRewardScorer:
             tools_succeeded=tools_succeeded,
             **({"assistant_history": assistant_history} if assistant_history else {}),
             **({"execution_evidence": execution_evidence} if execution_evidence is not None else {}),
+            **({"dataset_row": dataset_row} if dataset_row is not None else {}),
+            **({"code_execution": code_execution} if code_execution else {}),
         ) if self.b_model_judge is not None else deterministic_evaluation(
             candidate_response, solution, tools_called, tools_succeeded,
         )
@@ -208,15 +208,15 @@ class MultiMetricRewardScorer:
         rule_reasoning_follow = b_res.rule_reasoning_follow
         rule_answer_follow = b_res.rule_answer_follow
         cheating = b_res.cheating
+        truth = b_res.truth
 
         # A successful live judge owns math correctness too: exact string/number
         # matching must not override semantic evaluation or cap it at 0.5.
-        # Preserve exact verification when the judge is disabled or falls back.
+        # Offline callers use the judge's deterministic fallback, without a
+        # dataset flag or a separate half-credit math override.
         live_judge = self.b_model_judge is not None and getattr(
             self.b_model_judge, "last_evaluation_source", None,
         ) != "deterministic"
-        if live_judge or not can_be_verify:
-            truth = b_res.truth
         if execution_evidence is not None:
             tests = execution_evidence.get("tests", {})
             total = tests.get("total", 0)
@@ -224,9 +224,17 @@ class MultiMetricRewardScorer:
                 test_truth = max(0.0, min(1.0, tests.get("passed", 0) / total))
                 # A judge cannot override failing authoritative dataset checks.
                 truth = min(truth, test_truth) if live_judge else test_truth
-                from sword.harness.protocol import visible_response
-                if not visible_response(candidate_response).strip():
-                    truth = 0.0
+        cases = (code_execution or {}).get("cases", [])
+        expected_cases = len((dataset_row or {}).get("code_tests", []))
+        if cases or expected_cases:
+            code_truth = sum(bool(case.get("success")) for case in cases) / max(1, expected_cases, len(cases))
+            if live_judge or (execution_evidence or {}).get("tests", {}).get("total", 0):
+                truth = min(truth, code_truth)
+            else:
+                truth = code_truth
+        from sword.harness.protocol import visible_response
+        if not visible_response(candidate_response).strip():
+            truth = 0.0
 
         # 4. Total score calculation based on user specification:
         # If agentic was on: divide by 5; otherwise divide by 4.

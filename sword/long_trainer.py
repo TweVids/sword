@@ -35,12 +35,13 @@ from sword.harness.prompts import harness_repo_policy
 from sword.harness import get_harness, HarnessResult, WorkspaceSandbox
 from sword.reward import MultiMetricRewardScorer, RewardBreakdown
 from sword.checkpoint import CheckpointManager
+from sword.task_queue import TaskRetryQueue
 from sword.grpo_bridge import (
     GRPOBridge, GRPOBridgeConfig, RolloutBatch, RolloutItem, rollout_prompt_budget, normalize_effort,
 )
 from sword.logging_utils import quiet_quantization_cast_notices
 from sword.lora_source import resolve_lora_training_source, SOURCE_MANIFEST
-from sword.execution import normalize_tests, coding_row, execute_coding_answer
+from sword.execution import normalize_tests, normalize_code_tests, coding_row, has_candidate_code, execute_coding_answer
 from sword.execution_evidence import build_execution_evidence
 
 
@@ -51,7 +52,6 @@ class DatasetProblemRow:
     solution: str
     reasoning_rule: str = ""
     answer_rule: str = ""
-    can_be_verify: bool = True
     difficulty: str = "medium"
     category: str = "general"
     harness: Optional[str] = None
@@ -61,26 +61,32 @@ class DatasetProblemRow:
     tests: List[Dict[str, Any]] = field(default_factory=list)
     initial_files: Dict[str, str] = field(default_factory=dict)
     language: Optional[str] = None
+    code_tests: List[Dict[str, Any]] = field(default_factory=list)
+    extra_fields: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         self.effort = normalize_effort(self.effort)
+        self.code_tests = normalize_code_tests(self.code_tests)
 
     def to_dict(self) -> Dict[str, Any]:
-        result = {
+        result = {key: value for key, value in self.extra_fields.items()
+                  if key not in ("can_be_verify", "can_be__verify")}
+        result.update({
             "problem": self.problem,
             "solution": self.solution,
             "reasoning_rule": self.reasoning_rule,
             "answer_rule": self.answer_rule,
             "effort": self.effort,
-            "can_be_verify": self.can_be_verify,
             "difficulty": self.difficulty,
             "category": self.category,
             "harness": self.harness,
             "problem_id": self.problem_id,
             "row_hash": self.row_hash,
-        }
+        })
         if self.tests or self.initial_files or self.language:
             result.update(tests=self.tests, initial_files=self.initial_files, language=self.language)
+        if self.code_tests:
+            result["code_tests"] = self.code_tests
         return result
 
 
@@ -105,17 +111,8 @@ def parse_dataset_row(raw: Dict[str, Any], index: int = 0) -> DatasetProblemRow:
     solution = next((str(raw[key]).strip() for key in ("solution", "answer", "assistant", "model")
                      if key in raw and raw[key] is not None and str(raw[key]).strip()), "")
     reasoning_rule = str(raw.get("reasoning_rule") or raw.get("reasoning") or "").strip()
-    answer_rule = str(raw.get("answer_rule") or "").strip()
+    answer_rule = str(raw.get("answer_rule") or raw.get("answer_field") or "").strip()
     effort = normalize_effort(raw.get("effort"))
-
-    # Handle spelling variations in dataset schemas: can_be__verify or can_be_verify
-    cbv = raw.get("can_be__verify") if "can_be__verify" in raw else raw.get("can_be_verify")
-    if cbv is None:
-        can_be_verify = bool(re.search(r"^\s*[-+]?(?:\d*\.\d+|\d+)\s*$", solution))
-    elif isinstance(cbv, str):
-        can_be_verify = cbv.strip().lower() in ("true", "1", "yes")
-    else:
-        can_be_verify = bool(cbv)
 
     difficulty = str(raw.get("difficult") or raw.get("difficulty") or "medium").strip().lower()
     category = str(raw.get("cagetory") or raw.get("category") or "general").strip().lower()
@@ -134,6 +131,7 @@ def parse_dataset_row(raw: Dict[str, Any], index: int = 0) -> DatasetProblemRow:
             raise ValueError("test_commands must be a string or a list of command strings")
         test_spec = [{"command": command} for command in commands]
     tests = normalize_tests(test_spec)
+    code_tests = normalize_code_tests(raw.get("code_tests"))
     initial_files = raw.get("initial_files", raw.get("files")) or {}
     if isinstance(initial_files, str):
         initial_files = json.loads(initial_files)
@@ -141,38 +139,46 @@ def parse_dataset_row(raw: Dict[str, Any], index: int = 0) -> DatasetProblemRow:
         raise ValueError("initial_files must map relative filenames to text contents")
     language = str(raw.get("language") or "").strip().lower() or None
 
-    # Deterministic row hash for expandable deduplication
-    row_dict = {
-        "problem": problem,
-        "solution": solution,
-        "reasoning_rule": reasoning_rule,
-        "answer_rule": answer_rule,
-        "effort": effort,
-        "can_be_verify": can_be_verify,
-        "difficulty": difficulty,
-        "category": category,
-        "harness": harness,
-    }
-    row_hash = hashlib.sha256(json.dumps(row_dict, sort_keys=True).encode("utf-8")).hexdigest()[:16]
-    # Keep hashes of existing datasets stable while making changed tests/seeds new work.
-    if tests or initial_files or language:
-        row_dict.update(tests=tests, initial_files=initial_files, language=language)
-        row_hash = hashlib.sha256(json.dumps(row_dict, sort_keys=True).encode("utf-8")).hexdigest()[:16]
-
-    return DatasetProblemRow(
+    normalized_keys = {"problem", "solution", "reasoning_rule", "answer_rule", "effort", "difficulty", "category",
+                       "harness", "problem_id", "row_hash", "tests", "initial_files", "language", "code_tests",
+                       "can_be_verify", "can_be__verify"}
+    # Keep other columns (including original aliases) available to the judge
+    # and checkpoint snapshots instead of silently discarding row metadata.
+    extra_fields = {key: value for key, value in raw.items() if key not in normalized_keys}
+    problem_id = raw.get("problem_id", raw.get("id"))
+    row = DatasetProblemRow(
         problem=problem,
         solution=solution,
         reasoning_rule=reasoning_rule,
         answer_rule=answer_rule,
         effort=effort,
-        can_be_verify=can_be_verify,
         difficulty=difficulty,
         category=category,
         harness=harness,
-        problem_id=str(raw.get("id") or f"problem_{index}"),
-        row_hash=row_hash,
+        problem_id=str(problem_id) if problem_id is not None else f"problem_{index}",
         tests=tests, initial_files=initial_files, language=language,
+        code_tests=code_tests, extra_fields=extra_fields,
     )
+    row_dict = {key: value for key, value in row.to_dict().items() if key not in ("problem_id", "row_hash", "id")}
+    row.row_hash = hashlib.sha256(json.dumps(row_dict, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+    return row
+
+
+def restore_dataset_row(raw: Dict[str, Any], index: int = 0) -> DatasetProblemRow:
+    """Migrate stored schemas while retaining queue/completion identity."""
+    row = parse_dataset_row(raw, index)
+    if raw.get("row_hash"):
+        row.row_hash = str(raw["row_hash"])
+    return row
+
+
+def _dataset_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Duplicate dataset key %r; each code_tests input/output pair must be a separate object" % key)
+        result[key] = value
+    return result
 
 
 def load_dataset_records(dataset_spec: Union[str, List[Any], Dict[str, Any]], hf_token: Optional[str] = None) -> Tuple[List[DatasetProblemRow], str]:
@@ -212,11 +218,11 @@ def load_dataset_records(dataset_spec: Union[str, List[Any], Dict[str, Any]], hf
                 for line in content_bytes.decode("utf-8", errors="replace").splitlines():
                     if line.strip():
                         try:
-                            raw_items.append(json.loads(line))
-                        except Exception:
+                            raw_items.append(json.loads(line, object_pairs_hook=_dataset_json_object))
+                        except json.JSONDecodeError:
                             pass
             elif spec.endswith(".json"):
-                data = json.loads(content_bytes.decode("utf-8", errors="replace"))
+                data = json.loads(content_bytes.decode("utf-8", errors="replace"), object_pairs_hook=_dataset_json_object)
                 raw_items = data if isinstance(data, list) else [data]
             else:
                 text = content_bytes.decode("utf-8-sig", errors="replace")
@@ -248,7 +254,6 @@ def load_dataset_records(dataset_spec: Union[str, List[Any], Dict[str, Any]], hf
                             "solution": str(2**i + i * 3),
                             "reasoning_rule": "Derive step by step.",
                             "answer_rule": "Provide exact integer answer.",
-                            "can_be__verify": True,
                             "difficult": "easy" if i < 3 else "medium",
                             "cagetory": "math",
                             "harness": "none",
@@ -267,8 +272,25 @@ def load_dataset_records(dataset_spec: Union[str, List[Any], Dict[str, Any]], hf
     return records, sha256
 
 
+def task_rollout_solved(row, candidate, score, harness_result=None, *, threshold=1.0, judge_source=""):
+    """Use correctness and completed final answers, independently of aggregate reward."""
+    from sword.harness.protocol import visible_response
+    answer = visible_response(candidate).strip()
+    if not answer or score.cheating or not getattr(harness_result, "is_completed", True):
+        return False
+    tests = getattr(harness_result, "test_results", [])
+    if len(tests) < len(row.tests) + len(row.code_tests):
+        return False
+    code_cases = [test for test in tests if test.get("kind") == "code_io"]
+    if len(code_cases) < len(row.code_tests):
+        return False
+    if tests and any(not test.get("success", False) for test in tests):
+        return False
+    return score.truth >= threshold
+
+
 def run_long_train(
-    dataset: Union[str, List[Any], Dict[str, Any]] = "math-ai/TemplateGSM",
+    dataset: Optional[Union[str, List[Any], Dict[str, Any]]] = "math-ai/TemplateGSM",
     model: str = DEFAULT_GRPO_MODEL,
     B_model_port: int = 11343,
     custom_checkpoint_save: bool = True,
@@ -320,7 +342,12 @@ def run_long_train(
     steps = int(args.get("steps") or args.get("max_steps") or 200)
     lr = float(args.get("lr") or args.get("learning_rate") or 5e-6)
     concurrency_g = int(args.get("concurrency_g") or args.get("num_rollouts") or 4)
-    save_steps = int(args.get("save_steps") or 25)
+    save_steps = int(25 if args.get("save_steps") is None else args["save_steps"])
+    if save_steps < 1:
+        raise ValueError("save_steps must be positive")
+    solved_threshold = float(kwargs.get("task_solved_threshold", args.get("task_solved_threshold", 1.0)))
+    if not 0 < solved_threshold <= 1:
+        raise ValueError("task_solved_threshold must be in (0, 1]")
     micro_batch_size = int(args.get("micro_batch_size") or 1)
     max_seq_len = int(args.get("max_seq_len") or DEFAULT_GRPO_CONTEXT)
     max_new_tokens = int(args.get("max_new_tokens") or
@@ -356,26 +383,51 @@ def run_long_train(
         hf_token=HF_TOKEN,
         is_save_and_upload_checkpoint=is_save_and_upload_checkpoint,
     )
+    resolved_ckpt = ckpt_mgr.find_latest_checkpoint(resume_from_checkpoint)
+    if (resume_from_checkpoint and str(resume_from_checkpoint).strip().lower() not in ("none", "false", "0")
+            and not resolved_ckpt):
+        raise FileNotFoundError(f"Requested resume checkpoint was not found: {resume_from_checkpoint}")
+    if resolved_ckpt:
+        ckpt_mgr._validate_checkpoint(resolved_ckpt)
+    restored_state = ckpt_mgr.read_training_state(resolved_ckpt) if resolved_ckpt else {}
+    saved_dataset = ckpt_mgr.read_dataset_snapshot(resolved_ckpt) if resolved_ckpt else None
+    if resolved_ckpt:
+        ckpt_mgr.restore_completion_log(resolved_ckpt)
 
     # 2. Ingest Dataset & Check Expandable SHA-256 Deduplication
-    records, dataset_sha256 = load_dataset_records(dataset, hf_token=HF_TOKEN)
-    if source_lora is not None:
+    snapshot_requested = dataset is None or (
+        saved_dataset is not None and isinstance(dataset, str) and not os.path.exists(dataset)
+        and (os.path.isabs(dataset) or dataset.lower().endswith((".json", ".jsonl", ".csv", ".tsv"))))
+    if snapshot_requested:
+        if not saved_dataset:
+            raise ValueError("dataset=None or a missing local dataset requires a checkpoint dataset snapshot")
+        records = [restore_dataset_row(row, index) for index, row in enumerate(saved_dataset["records"])]
+        dataset_sha256 = saved_dataset["dataset_sha256"]
+        print("[*] Restored the dataset snapshot from the checkpoint.")
+    else:
+        records, dataset_sha256 = load_dataset_records(dataset, hf_token=HF_TOKEN)
+    if not records:
+        raise ValueError("The training dataset contains no problems")
+    if source_lora is not None and not snapshot_requested:
         source_key = json.dumps(source_lora.manifest, sort_keys=True)
         dataset_sha256 = hashlib.sha256((dataset_sha256 + source_key).encode()).hexdigest()
         for row in records:
             row.row_hash = hashlib.sha256((row.row_hash + source_key).encode()).hexdigest()[:16]
-    if template_override is not None:
+    if template_override is not None and not snapshot_requested:
         template_key = hashlib.sha256(template_override.encode("utf-8")).hexdigest()
         dataset_sha256 = hashlib.sha256((dataset_sha256 + template_key).encode()).hexdigest()
         for row in records:
             row.row_hash = hashlib.sha256((row.row_hash + template_key).encode()).hexdigest()[:16]
     print(f"[*] Dataset SHA-256: {dataset_sha256} ({len(records)} problem rows)")
+    all_records = list(records)
+    dataset_snapshot = {"schema_version": 2, "dataset_sha256": dataset_sha256,
+                        "records": [row.to_dict() for row in all_records]}
 
     allow_retest = bool(kwargs.get("allow_retest", args.get("allow_retest", False)))
     completed_hashes = ckpt_mgr.get_completed_dataset_hashes()
 
     # If entire dataset SHA-256 matches completed log
-    if dataset_sha256 in completed_hashes and not allow_retest:
+    if dataset_sha256 in completed_hashes and not allow_retest and not resolved_ckpt:
         print(f"\n[Sword] The data is already train on, suggest prepare new dataset to continues.")
         return {
             "status": "already_trained",
@@ -384,7 +436,7 @@ def run_long_train(
         }
 
     # Expandable dataset: filter out already-completed rows
-    if not allow_retest:
+    if not allow_retest and not resolved_ckpt:
         uncompleted_records = [r for r in records if r.row_hash not in completed_hashes]
         if not uncompleted_records:
             ckpt_mgr.mark_dataset_completed(dataset_sha256, str(dataset)[:50])
@@ -478,54 +530,116 @@ def run_long_train(
 
     # 5. Checkpoint Resume Discovery (only when explicitly requested)
     start_step = 0
-    resolved_ckpt = ckpt_mgr.find_latest_checkpoint(resume_from_checkpoint)
-    if resolved_ckpt:
-        if bridge.source_lora_manifest is not None:
-            source_file = os.path.join(resolved_ckpt, SOURCE_MANIFEST)
-            if not os.path.isfile(source_file):
-                raise ValueError("Resume checkpoint is missing its merged-base source manifest")
-            with open(source_file, encoding="utf-8") as stream:
-                if json.load(stream) != bridge.source_lora_manifest:
-                    raise ValueError("Resume checkpoint was trained on a different source LoRA base")
-        print(f"[*] Resuming from checkpoint: {resolved_ckpt}")
-        try:
-            res_info = ckpt_mgr.load_checkpoint(
-                ckpt_dir=resolved_ckpt,
-                model=bridge.trainer_model,
-                optimizer=optimizer,
-            )
+    try:
+        if resolved_ckpt:
+            if bridge.source_lora_manifest is not None:
+                source_file = os.path.join(resolved_ckpt, SOURCE_MANIFEST)
+                if not os.path.isfile(source_file):
+                    raise ValueError("Resume checkpoint is missing its merged-base source manifest")
+                with open(source_file, encoding="utf-8") as stream:
+                    if json.load(stream) != bridge.source_lora_manifest:
+                        raise ValueError("Resume checkpoint was trained on a different source LoRA base")
+            print(f"[*] Resuming from checkpoint: {resolved_ckpt}")
+            if restored_state.get("dataset_sha256", dataset_sha256) != dataset_sha256:
+                raise ValueError("Resume checkpoint was saved for a different dataset")
+            res_info = ckpt_mgr.load_checkpoint(ckpt_dir=resolved_ckpt, model=bridge.trainer_model, optimizer=optimizer)
             start_step = res_info["step"]
             bridge.global_step = start_step
+            baseline = restored_state.get("reward_baseline", {})
+            bridge._reward_ema = baseline.get("mean")
+            bridge._reward_ema_var = baseline.get("variance", 1.0)
+            if "task_solved_threshold" not in kwargs and "task_solved_threshold" not in args:
+                solved_threshold = float(restored_state.get("task_solved_threshold", solved_threshold))
             print(f"[*] Resumed at step {start_step} ({res_info['matched_keys']} adapter keys matched).")
-        except Exception as e_res:
-            print(f"[Sword] Resume notice: {e_res}. Continuing with fresh state.")
 
-    # 6. Initialize vLLM / Fallback Engine
-    bridge.initialize_vllm()
+        task_queue = TaskRetryQueue(
+            all_records,
+            retry_limit=kwargs.get("task_retry_limit", args.get("task_retry_limit", 3)),
+            retry_delay=kwargs.get("task_retry_delay", args.get("task_retry_delay", 100)),
+            failure_action=kwargs.get("task_failure_action", args.get("task_failure_action", "waitlist")),
+            enabled=kwargs.get("task_retry_enabled", args.get("task_retry_enabled", True)),
+            completed_hashes=completed_hashes if not allow_retest and not resolved_ckpt else (),
+            state=restored_state.get("task_queue"),
+            decisions_path=os.path.join(output_dir, "task_decisions.jsonl"),
+        )
+        # 6. Initialize vLLM / Fallback Engine, then undo initialization's RNG use.
+        bridge.initialize_vllm()
+        if resolved_ckpt:
+            ckpt_mgr.restore_random_state(resolved_ckpt)
+    except BaseException:
+        bridge.weight_sync.cleanup()
+        if b_judge is not None:
+            b_judge.release_after_eval()
+        raise
+    record_lookup = {row.row_hash: row for row in all_records}
 
     reward_history_logs: List[Dict[str, Any]] = []
     step_metrics: List[Dict[str, Any]] = []
-    visited_row_hashes = set()
+    visited_row_hashes = set(restored_state.get("visited_row_hashes", []))
     optimizer_steps = 0
     skipped_optimizer_steps = 0
     rollout_details_path = os.path.join(output_dir, "rollout_details.jsonl")
     trace_rollouts = bool(kwargs.get("trace_rollouts", False))
     current_step = start_step
     completed_successfully = False
+    exit_reason = None
+    score_sum = float(restored_state.get("score_sum", 0.0))
+    score_count = int(restored_state.get("score_count", 0))
+    last_checkpoint_revision = int(restored_state.get("task_queue", {}).get("decision_revision", task_queue.decision_revision))
+    wait_checkpoint_saved = False
     dashboard = None
     if gradio_logger:
         from sword.training_logger import create_training_logger
         dashboard = create_training_logger(max_rollouts=kwargs.get("gradio_max_rollouts", 8),
                                            refresh_interval=kwargs.get("gradio_refresh_interval", 1.0),
                                            server_port=kwargs.get("gradio_port"))
+        dashboard.attach_progress(task_queue, ckpt_mgr, save_steps=save_steps, score_sum=score_sum, score_count=score_count)
+
+    def save_progress_checkpoint(logs=None, completed_hash=None):
+        nonlocal last_checkpoint_revision
+        queue_state = task_queue.export_state()
+        path = ckpt_mgr.save_checkpoint(
+            step=current_step, model=bridge.trainer_model, optimizer=optimizer,
+            base_model_name=bridge.config.model_name, lora_r=bridge_config.lora_r,
+            lora_alpha=bridge_config.lora_alpha, target_modules=bridge_config.target_modules,
+            reward_logs=reward_history_logs if logs is None else logs,
+            completed_dataset_hash=completed_hash, dataset_snapshot=dataset_snapshot,
+            training_state={"dataset_sha256": dataset_sha256, "task_queue": queue_state,
+                            "visited_row_hashes": sorted(visited_row_hashes), "score_sum": score_sum,
+                            "score_count": score_count, "task_solved_threshold": solved_threshold,
+                            "reward_baseline": {"mean": bridge._reward_ema, "variance": bridge._reward_ema_var}},
+            **checkpoint_source_options,
+        )
+        last_checkpoint_revision = queue_state["decision_revision"]
+        return path
 
     print(f"\n[*] Starting training loop from step {start_step + 1} to {start_step + steps}...\n")
 
     try:
         while current_step < start_step + steps:
+            if task_queue.decision_revision != last_checkpoint_revision:
+                save_progress_checkpoint(reward_history_logs[-100:])
+            current_key = task_queue.next_key()
+            if current_key is None:
+                waiting = task_queue.monitor_snapshot(limit=0)["summary"]["waiting_approval"]
+                exit_reason = "waiting_approval" if waiting else "exhausted"
+                if not waiting:
+                    break
+                if not wait_checkpoint_saved:
+                    save_progress_checkpoint(reward_history_logs[-100:])
+                    wait_checkpoint_saved = True
+                if dashboard is not None:
+                    dashboard.publish("status", status="Waiting for task approval")
+                if (dashboard is None or not kwargs.get("gradio_wait_for_approval", args.get("gradio_wait_for_approval", True))
+                        or dashboard.error or (dashboard._launch_complete.is_set() and dashboard.app is None)):
+                    break
+                task_queue.decision_event.wait(0.5)
+                task_queue.decision_event.clear()
+                continue
+            exit_reason = None
+            wait_checkpoint_saved = False
             step_idx = current_step + 1
-            row_idx = (step_idx - 1) % len(records)
-            current_row = records[row_idx]
+            current_row = record_lookup[current_key]
             # Keep the same dataset effort for the initial response and all tool follow-ups.
             bridge.config.effort = current_row.effort
             policy_task = policy_task_prompt(current_row)
@@ -534,6 +648,7 @@ def run_long_train(
                 harness.workspace_parent_dir = os.path.join(output_dir, "harness_workspaces")
                 harness.keep_workspace = keep_harness_workspaces
                 harness.dataset_tests = current_row.tests
+                harness.code_tests = current_row.code_tests
                 harness.initial_files = current_row.initial_files
                 harness.language = current_row.language
 
@@ -549,7 +664,8 @@ def run_long_train(
                 try:
                     if dashboard is not None:
                         dashboard.publish("task", step=step_idx, problem_id=current_row.problem_id,
-                                          problem=current_row.problem, rollout_count=concurrency_g)
+                                          problem=current_row.problem, rollout_count=concurrency_g,
+                                          row_hash=current_row.row_hash, category=current_row.category)
                         bridge.generation_callback = dashboard.generation
                     # Rollout Phase with authentic harness prompt injection and token-budget guard
                     prompt_token_budget = rollout_prompt_budget(
@@ -633,8 +749,7 @@ def run_long_train(
                                       f"({'removed' if getattr(h_res, 'workspace_removed', False) else 'kept'})")
                         else:
                             candidate_response = item.response_text
-                            if kwargs.get("auto_code_executor", True) and (coding_row(current_row) or re.search(
-                                    r"```(?:python|py|javascript|js|bash|sh)\s*\n", candidate_response)):
+                            if kwargs.get("auto_code_executor", True) and (coding_row(current_row) or has_candidate_code(candidate_response)):
                                 h_res = execute_coding_answer(
                                     current_row, candidate_response,
                                     parent_dir=os.path.join(output_dir, "harness_workspaces"),
@@ -666,13 +781,14 @@ def run_long_train(
                             reasoning_rule=current_row.reasoning_rule,
                             answer_rule=current_row.answer_rule,
                             effort=current_row.effort,
-                            can_be_verify=current_row.can_be_verify,
                             difficulty=current_row.difficulty,
                             category=current_row.category,
                             harness_name=current_row.harness,
                             tools_called=tools_called,
                             tools_succeeded=tools_succeeded,
                             assistant_history=[turn.response_text for turn in earlier_turns],
+                            dataset_row=current_row.to_dict(),
+                            code_execution=getattr(h_res, "code_execution", None),
                             **({"execution_evidence": execution_evidence} if execution_evidence is not None else {}),
                         )
                         item.reward = score_breakdown.total_score
@@ -681,6 +797,7 @@ def run_long_train(
                         detail = {
                             "step": step_idx, "rollout": rollout_idx, "group_id": item.group_id,
                             "problem_id": current_row.problem_id, "problem": current_row.problem,
+                            "row_hash": current_row.row_hash, "category": current_row.category,
                             "effort": current_row.effort,
                             "scores": score_breakdown.to_dict(), "judge_scores": score_breakdown.judge_scores,
                             "judge_source": str(score_breakdown.judge_source or (b_judge.last_evaluation_source if b_judge else "disabled")),
@@ -692,7 +809,11 @@ def run_long_train(
                             "training_response_tokens": sum(len(turn.response_token_ids) for turn in [item] + item.followup_turns),
                             "tools_called": tools_called, "tools_succeeded": tools_succeeded,
                             "execution_evidence": execution_evidence,
+                            "code_execution": getattr(h_res, "code_execution", {}),
                         }
+                        detail["solved"] = task_rollout_solved(
+                            current_row, candidate_response, score_breakdown, h_res, threshold=solved_threshold,
+                            judge_source=detail["judge_source"])
                         if h_res is not None:
                             detail["harness"] = {
                                 "turns": getattr(h_res, "turns", 0), "stop_reason": getattr(h_res, "stop_reason", "unknown"),
@@ -725,7 +846,8 @@ def run_long_train(
                                               judge_scores=score_breakdown.judge_scores,
                                               judge_response=score_breakdown.judge_response[:16000],
                                               judge_source=score_breakdown.judge_source,
-                                              execution_evidence=execution_evidence)
+                                              execution_evidence=execution_evidence,
+                                              code_execution=detail["code_execution"])
                         if score_logs:
                             reward_history_logs.append(detail)
 
@@ -785,15 +907,8 @@ def run_long_train(
                             b_judge.release_after_eval()
 
                         # Emergency save: NEVER mark incomplete dataset as completed
-                        emergency_ckpt = ckpt_mgr.save_checkpoint(
-                            step=current_step,
-                            model=bridge.trainer_model,
-                            optimizer=optimizer,
-                            base_model_name=bridge.config.model_name,
-                            reward_logs=reward_history_logs[-50:],
-                            completed_dataset_hash=None,
-                            **checkpoint_source_options,
-                        )
+                        del reward_history_logs[log_start_len:]
+                        emergency_ckpt = save_progress_checkpoint(reward_history_logs[-50:])
                         print(f"[Sword] Emergency checkpoint successfully secured at: {emergency_ckpt}")
                         return {
                             "status": "oom_aborted",
@@ -809,6 +924,18 @@ def run_long_train(
 
             visited_row_hashes.add(current_row.row_hash)
             current_step = step_idx
+            best_truth = max(s.truth for s in step_scores)
+            task_outcome = task_queue.record_result(
+                current_key, solved_rollouts=sum(detail["solved"] for detail in step_details),
+                rollout_count=len(step_details), best_truth=best_truth, step=current_step,
+                reason=f"No correct completed rollout; highest truth score {best_truth:.4g}")
+            score_sum += sum(s.total_score for s in step_scores)
+            score_count += len(step_scores)
+            metrics.update(task_status=task_outcome["status"], task_failures=task_outcome["failures"],
+                           task_attempts=task_outcome["attempts"])
+            for detail in step_details:
+                detail.update(task_status=task_outcome["status"], task_attempt=task_outcome["attempts"],
+                              task_failures=task_outcome["failures"])
             if dashboard is not None:
                 dashboard.publish("step", step=step_idx, scores=[s.total_score for s in step_scores])
             if metrics.get("optimizer_step_skipped", False):
@@ -874,17 +1001,7 @@ def run_long_train(
 
             # Periodic checkpoint saving
             if current_step % save_steps == 0:
-                saved_path = ckpt_mgr.save_checkpoint(
-                    step=current_step,
-                    model=bridge.trainer_model,
-                    optimizer=optimizer,
-                    base_model_name=bridge.config.model_name,
-                    lora_r=bridge_config.lora_r,
-                    lora_alpha=bridge_config.lora_alpha,
-                    target_modules=bridge_config.target_modules,
-                    reward_logs=reward_history_logs[-100:],
-                    **checkpoint_source_options,
-                )
+                saved_path = save_progress_checkpoint(reward_history_logs[-100:])
                 print(f"[*] Checkpoint saved at: {saved_path}")
 
         completed_successfully = (current_step >= start_step + steps)
@@ -893,37 +1010,27 @@ def run_long_train(
         print("\n[Sword] Training interrupted by user. Saving current checkpoint...")
     finally:
         bridge.generation_callback = None
-        if dashboard is not None:
-            dashboard.finish("Completed" if completed_successfully else "Interrupted")
         if b_judge is not None:
             b_judge.release_after_eval()
         bridge.weight_sync.cleanup()
-        # Mark dataset completed ONLY if training truly completed all planned steps and all dataset rows were visited
+        # Unsolved rows must remain eligible after a reset or a new invocation.
         all_rows_visited = len(records) > 0 and all(r.row_hash in visited_row_hashes for r in records)
-        if completed_successfully and all_rows_visited:
-            ckpt_mgr.mark_dataset_completed(dataset_sha256, str(dataset)[:50])
+        solved_keys = task_queue.solved_keys()
+        complete_keys = solved_keys if task_queue.config["enabled"] else visited_row_hashes | completed_hashes
+        all_rows_solved = all(row.row_hash in complete_keys for row in all_records)
+        dataset_completed = completed_successfully and all_rows_visited and all_rows_solved
+        final_ckpt = save_progress_checkpoint(completed_hash=dataset_sha256 if dataset_completed else None)
+        if dataset_completed:
             print(f"[Sword] Dataset {dataset_sha256} marked completed in data_complete.logs.")
-
-        # Always record completed row hashes for rows that were visited and trained
-        for r in records:
-            if r.row_hash in visited_row_hashes:
-                ckpt_mgr.mark_dataset_completed(r.row_hash, f"row_{r.problem_id}")
-
-        final_ckpt = ckpt_mgr.save_checkpoint(
-            step=current_step,
-            model=bridge.trainer_model,
-            optimizer=optimizer,
-            base_model_name=bridge.config.model_name,
-            lora_r=bridge_config.lora_r,
-            lora_alpha=bridge_config.lora_alpha,
-            target_modules=bridge_config.target_modules,
-            reward_logs=reward_history_logs,
-            completed_dataset_hash=dataset_sha256 if (completed_successfully and all_rows_visited) else None,
-            **checkpoint_source_options,
-        )
         print(f"\n[Sword] Training process recorded. Final checkpoint: {final_ckpt}")
+        if dashboard is not None:
+            dashboard.finish("Waiting for task approval" if exit_reason == "waiting_approval" else
+                             "Task queue exhausted" if exit_reason == "exhausted" else
+                             "Completed" if completed_successfully else "Interrupted")
 
-    if completed_successfully and all_rows_visited:
+    if exit_reason:
+        run_status = exit_reason
+    elif completed_successfully and all_rows_visited:
         run_status = "completed"
     elif completed_successfully:
         run_status = "partial"
@@ -946,6 +1053,8 @@ def run_long_train(
         "source_lora": bridge.source_lora_manifest,
         "step_metrics": step_metrics,
         "gradio_logger": dashboard.info() if dashboard is not None else {"enabled": False},
+        "task_progress": task_queue.monitor_snapshot(),
+        "checkpoint_upload": ckpt_mgr.upload_info(),
         "b_model": {
             "enabled": True,
             "model_name": b_judge.config.model_name,

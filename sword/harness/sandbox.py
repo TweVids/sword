@@ -28,6 +28,7 @@ class WorkspaceSandbox:
         self.timeout_sec = timeout_sec
         self.was_removed = False
         self.last_execution_result = None
+        self.last_stdout = None
         self.execution_history = deque(maxlen=32)
         if base_dir:
             self.root_dir = os.path.abspath(base_dir)
@@ -206,13 +207,18 @@ class WorkspaceSandbox:
     def run_command(self, command, *, shell=False, stdin=None) -> Tuple[bool, str]:
         """Run a process and retain bounded stdout/stderr separately from display text."""
         started = time.monotonic()
+        self.last_stdout = None
         try:
             res = subprocess.run(command, shell=shell, cwd=self.root_dir,
-                                 capture_output=True, text=True, input=stdin,
+                                 capture_output=True, text=True, encoding="utf-8", errors="replace", input=stdin,
+                                 env={**os.environ, "PYTHONIOENCODING": "utf-8"},
                                  timeout=self.timeout_sec,
                                  executable="/bin/bash" if shell and os.name != "nt" and os.path.exists("/bin/bash") else None)
+            self.last_stdout = res.stdout
             result = {"success": res.returncode == 0, "exit_code": res.returncode,
                       "stdout": res.stdout[:8192], "stderr": res.stderr[:8192], "timed_out": False,
+                      "stdout_char_count": len(res.stdout), "stderr_char_count": len(res.stderr),
+                      "stdout_truncated": len(res.stdout) > 8192, "stderr_truncated": len(res.stderr) > 8192,
                       "output_truncated": len(res.stdout) > 8192 or len(res.stderr) > 8192}
         except subprocess.TimeoutExpired as exc:
             def decoded(value):
@@ -268,6 +274,7 @@ class WorkspaceSandbox:
 
     def close(self):
         """Cleans up workspace if temporary."""
+        self.last_stdout = None
         if self._created_temp and self.cleanup and os.path.exists(self.root_dir):
             resolved = os.path.realpath(self.root_dir)
             if resolved != self._owned_root or os.path.dirname(resolved) != self._owned_parent:

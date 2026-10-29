@@ -331,12 +331,54 @@ responses; `0` prints the full response. Judge-only overrides are
 `B_model_log_outputs` and `B_model_output_chars`. Keep `show_detail_logs=True`
 to see turn labels and step summaries.
 
-Coding rows without a resolved harness now use a one-shot code executor. Coding
-categories, an explicit `language`, dataset tests, or supported code fences enable
-it; unfamiliar category names can use `language` or `tests` to select execution.
+Coding rows without a resolved harness use a code executor. Coding categories,
+an explicit `language`, dataset tests, or supported final code blocks enable it;
+unfamiliar category names can use `language`, `tests`, or `code_tests` to select execution.
 Python is the default; JavaScript (`node`) and shell (`bash`) require their runtime
 on the training host. Set `auto_code_executor=False` to disable the fallback.
 Execution alone does not establish answer correctness.
+
+Use one `code_tests` column for multiple input/output pairs. Each pair must be
+its own object in the list; repeated `input`/`output` keys in one object would lose
+cases. JSON strings in CSV/TSV columns are accepted.
+
+```json
+{
+  "problem": "Read two integers from stdin and print their sum in Python.",
+  "solution": "print(sum(map(int, input().split())))",
+  "category": "code",
+  "answer_rule": "Provide executable Python code and satisfy every input/output case.",
+  "code_tests": [
+    {"input": "2 3\n", "output": "5"},
+    {"input": "4 6\n", "output": "10"}
+  ]
+}
+```
+
+The executor extracts final code from Markdown fences or balanced `'''...'''`
+blocks, including an optional language label. Code in thought sections is excluded.
+Every I/O case starts a separate process running the same generated source with
+the case's `input` as stdin. There is no preliminary run with empty stdin. Strings
+are passed verbatim using UTF-8; other JSON values are serialized as JSON text, preserving
+zero, false, and empty values. Output comparison normalizes line endings and
+ignores final newlines while preserving spaces. Cases can also specify `name`
+and `timeout_sec` (default 10, maximum 300).
+
+Model B receives the full normalized dataset row, including additional metadata,
+the generated source, and **every** I/O case's input, expected output, actual
+stdout/stderr, exit status, timeout status, and output match. These results have
+their own labeled judge section and are retained separately from bounded tool
+samples. Output capture remains capped at 8,192 characters per stream, with
+truncation marked; matching uses the full stdout before that cap. The judge uses
+the problem, reference solution, and `answer_rule` guidance to rate the code and
+its measured behavior. `answer_field` is accepted as an alias for `answer_rule`.
+References, test cases, and private row metadata are kept out of the policy prompt.
+
+`can_be_verify` is removed from the dataset schema. Math answers go to Model B
+for correctness and rule ratings without that flag or a half-credit cap. Legacy
+verification columns are ignored, and older checkpoint dataset snapshots can
+still be restored with `dataset=None` while retaining task queue identities.
+When Model B is disabled or unavailable, local fallback scoring remains available.
 
 Dataset rows can define `tests` as Python assertion code, a list of assertion
 strings, or a list of objects containing either `code` or `command`. Test objects
@@ -364,7 +406,7 @@ sword.train(
 
 Python assertion tests load `solution.py` into their scope when it exists, so they
 can call solution functions directly; command tests can run project test suites.
-The same checks run for explicit harnesses before workspace cleanup. Dataset tests
+The same assertion and I/O checks run for explicit harnesses before workspace cleanup. Dataset tests
 are counted separately from model tool calls. With a live judge, the passed-test
 fraction caps its truth score; without live judging, that fraction supplies the
 truth score. No final answer still receives zero truth credit.
@@ -380,9 +422,10 @@ not judge instructions.
 
 Install the optional dashboard dependency with `pip install -e ".[logger]"`.
 `sword.train(gradio_logger=True, ...)` launches Gradio with `share=True` and prints
-the public URL. The read-only dashboard shows live generation, current rollout
+the public URL. The dashboard shows live generation, current rollout
 rewards, task totals/means, overall mean reward, a bounded score history, parsed
-judge scores, raw judge JSON, and measured execution evidence. It displays up to
+judge scores, raw judge JSON, measured execution evidence, and complete code test
+inputs and results. It displays up to
 eight rollouts by default; `gradio_max_rollouts` changes only the display count,
 while `Argument["concurrency_g"]` still controls training. `gradio_refresh_interval`
 (default 1 second, minimum 0.5) and `gradio_port` are optional overrides.
@@ -390,10 +433,90 @@ while `Argument["concurrency_g"]` still controls training. `gradio_refresh_inter
 vLLM streaming observes its existing engine loop and keeps final token IDs and
 logprobs in the trainer flow. The PyTorch fallback also publishes live updates.
 Generation updates are throttled, text and event buffers are bounded, and Gradio
-rendering/launch run outside the training thread. The UI has no training controls
-and dashboard failures do not stop training. `gradio_logger=False` loads no Gradio
+rendering/launch run outside the training thread. Task review controls approve
+retries or remove waitlisted tasks. Dashboard failures do not stop training. `gradio_logger=False` loads no Gradio
 dependency and installs no generation observer. The display remains available
 after training finishes for inspection while the Python process remains alive.
+
+The dashboard also shows each task's attempts, total failed attempts, failed
+rollouts, retry status, next queue position, and failure reason. The category
+table reports **Total problems / Solved / Unsolved / Solved %**, plus attempted
+tasks, failed attempts, tasks waiting for approval, and removed tasks. Totals
+count unique dataset row hashes across the entire dataset; the task and waitlist
+tables display up to 1,000 entries. Unsolved includes unattempted tasks, and
+solved counts reflect the latest outcome for each task.
+
+A task is solved when at least one rollout produces a completed final answer
+without cheating, satisfies its dataset tests, and reaches the correctness
+threshold (`task_solved_threshold=1.0`). When the judge is disabled or unavailable,
+a matching math answer receives full truth credit from the local fallback.
+Aggregate reward alone does not establish correctness. A failed attempt means
+all rollouts for that task failed; individual failed rollouts are counted
+separately, including those in otherwise successful attempts.
+
+Unsolved tasks retry immediately. After three consecutive failed attempts, the
+task moves to queue position **N+100**; a shorter queue puts it at the tail.
+If the next attempt still fails, it enters the **Task waitlist**. **Approve retry**
+starts another retry cycle while preserving lifetime failure counts;
+**Reject / remove** removes it from the active queue. Other queued tasks keep
+training. If all remaining tasks need approval, Gradio waits for a decision;
+without a working dashboard, training saves and returns `status="waiting_approval"`.
+
+These options can be passed directly to `sword.train(...)` or in `Argument`:
+
+| Option | Default | Behavior |
+| --- | --- | --- |
+| `task_retry_enabled` | `True` | Schedule retries for unsolved tasks. `False` retains dataset-order cycling and visited-row completion logging. |
+| `task_retry_limit` | `3` | Consecutive failures before deferring a task. |
+| `task_retry_delay` | `100` | Queue-position offset after reaching the failure limit. |
+| `task_failure_action` | `"waitlist"` | Use `"remove"` to remove a still-unsolved deferred task automatically. |
+| `task_solved_threshold` | `1.0` | Minimum correctness score for solved counts. |
+| `gradio_wait_for_approval` | `True` | Use `False` to save and return when only waitlisted tasks remain. |
+
+With retries enabled, unsolved or rejected rows are never marked completed in
+`data_complete.logs`. A successful training-step budget can still return
+`status="completed"` with unsolved tasks; inspect `result["task_progress"]` for
+task outcomes. The five-step compatibility diagnostic disables retry scheduling
+by default so it can exercise every diagnostic category and harness.
+
+Long training saves a checkpoint every `Argument["save_steps"]` steps (default
+**25**), as well as on interruption, when all tasks need approval, and at the
+end. With `upload_id`, Hub credentials, and
+`is_save_and_upload_checkpoint=True`, each complete checkpoint is uploaded to
+Hugging Face. Gradio displays the last saved step, last successfully uploaded
+step, pending uploads, and upload errors. Failed uploads remain local for retry;
+they can temporarily exceed `num_latest_checkpoint_save`.
+
+Checkpoints now include the exact dataset snapshot, task queue, failures,
+category outcomes, approval decisions, visited rows, overall score totals,
+reward baseline, optimizer, and Python/PyTorch/NumPy random state. Files are
+written to a temporary directory and verified before the checkpoint becomes
+available. Resume errors are reported explicitly.
+
+```python
+import os
+import sword
+
+options = dict(
+    long_train=True, test=False, model="google/gemma-4-31B-it", gradio_logger=True,
+    upload_id="your-name/sword-training", HF_TOKEN=os.environ["HF_TOKEN"],
+    is_save_and_upload_checkpoint=True,
+    Argument={"steps": 1000, "save_steps": 25, "output_dir": "checkpoints/run"},
+)
+result = sword.train(dataset="dataset.jsonl", **options)
+
+# After a sandbox reset, recreate options and load the latest uploaded checkpoint.
+# dataset=None uses the saved dataset even when the original local file is gone.
+result = sword.train(dataset=None, resume_from_checkpoint="latest", **options)
+```
+
+Resume with the same base model and training configuration. As before,
+`Argument["steps"]` sets the additional step budget on a resumed invocation.
+A sandbox reset recovers the last successfully uploaded checkpoint; work and
+decisions after that upload can be lost. Local approval decisions also have a
+durable journal and are checkpointed at the next training boundary. Approving
+after training has returned saves the decision for the next
+`resume_from_checkpoint="latest"` invocation.
 
 Each rollout creates a fresh directory under `<output_dir>/harness_workspaces`.
 Files persist across that rollout's turns, and the directory is removed when

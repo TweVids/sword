@@ -1,4 +1,4 @@
-"""Live Model B scores must remain authoritative for verifiable math tasks."""
+"""Live Model B scores must remain authoritative for math tasks."""
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -43,7 +43,7 @@ def test_math_reward_uses_actual_http_judge_scores_and_preserves_reasoning(candi
         reward = scorer.score(
             "Solve this math problem.", reference, candidate,
             reasoning_rule="Show only necessary calculation; avoid repeated verification.",
-            answer_rule="Give the correct value and requested units.", can_be_verify=True,
+            answer_rule="Give the correct value and requested units.",
             category="math", harness_name="none", assistant_history=history,
         )
         assert len(requests_seen) == 1
@@ -69,8 +69,8 @@ def test_math_uses_exact_fallback_when_judge_is_disabled_or_offline(enabled):
     if judge:
         judge._memory_ready = False
     scorer = MultiMetricRewardScorer(judge)
-    reward = scorer.score("2 + 2?", "4", "Final Answer: 4", can_be_verify=True, category="math")
-    assert reward.truth == 0.5
+    reward = scorer.score("2 + 2?", "4", "Final Answer: 4", category="math")
+    assert reward.truth == 1.0
     assert reward.judge_source == ("deterministic" if enabled else "disabled")
 
 

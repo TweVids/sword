@@ -1,4 +1,4 @@
-"""Optional, read-only Gradio monitoring with bounded, nonblocking producer updates."""
+"""Optional Gradio monitoring and task review with bounded producer updates."""
 import copy
 import queue
 import threading
@@ -14,7 +14,7 @@ class TrainingLogger:
         self.server_port = server_port
         self.events = queue.Queue(maxsize=128)
         self.lock = threading.Lock()
-        self.state = {"status": "Starting", "step": 0, "problem_id": "", "problem": "",
+        self.state = {"status": "Starting", "step": 0, "problem_id": "", "problem": "", "row_hash": "", "category": "",
                       "rollout_count": 0, "rollouts": {}, "scores": {}, "mean_score": None,
                       "task_total": None, "overall_mean": None, "scored_rollouts": 0,
                       "score_sum": 0.0, "history": deque(maxlen=1000)}
@@ -25,12 +25,44 @@ class TrainingLogger:
         self._worker = None
         self._score_sum = 0.0
         self._score_count = 0
+        self.task_queue = self.checkpoint_manager = None
+        self.save_steps = None
+        self._launch_complete = threading.Event()
 
     def start(self):
         self._worker = threading.Thread(target=self._consume, name="sword-logger-events", daemon=True)
         self._worker.start()
-        threading.Thread(target=self._launch, name="sword-gradio", daemon=True).start()
+        def launch():
+            try:
+                self._launch()
+            finally:
+                self._launch_complete.set()
+        threading.Thread(target=launch, name="sword-gradio", daemon=True).start()
         return self
+
+    def attach_progress(self, task_queue, checkpoint_manager, *, save_steps, score_sum=0.0, score_count=0):
+        self.task_queue, self.checkpoint_manager, self.save_steps = task_queue, checkpoint_manager, save_steps
+        self._score_sum, self._score_count = score_sum, score_count
+        with self.lock:
+            self.state.update(score_sum=score_sum, scored_rollouts=score_count,
+                              overall_mean=score_sum / score_count if score_count else None)
+
+    def review_task(self, key, action):
+        if not key:
+            return "Select a task from the waitlist."
+        if self.task_queue is None:
+            return "Task review is unavailable."
+        try:
+            changed = self.task_queue.decide(key, action)
+        except Exception as exc:
+            return f"Could not save the task decision: {exc}"
+        if not changed:
+            return "This task is no longer waiting for approval."
+        if action == "reject":
+            return "Task removed from the active queue."
+        if self._finished.is_set():
+            return "Retry approved. Resume training with resume_from_checkpoint='latest' to continue."
+        return "Retry approved; training will pick up this task."
 
     def publish(self, event, **data):
         """Only small CPU snapshots cross this queue; tensors never reach the UI."""
@@ -69,6 +101,7 @@ class TrainingLogger:
             if event == "task":
                 self.state.update(status="Generating", step=data["step"], problem_id=data["problem_id"],
                                   problem=data["problem"][:16000], rollout_count=data["rollout_count"],
+                                  row_hash=data.get("row_hash", ""), category=data.get("category", ""),
                                   rollouts={}, scores={}, mean_score=None, task_total=None)
             elif event == "generation":
                 current = self.state["rollouts"].setdefault(data["rollout"], {"turns": {}})
@@ -97,6 +130,10 @@ class TrainingLogger:
         with self.lock:
             state = copy.deepcopy(self.state)
         state["history"] = list(state["history"])
+        if self.task_queue is not None:
+            state["task_progress"] = self.task_queue.monitor_snapshot(state["row_hash"])
+        if self.checkpoint_manager is not None:
+            state["checkpoint_upload"] = {"save_every_steps": self.save_steps, **self.checkpoint_manager.upload_info()}
         return state
 
     def finish(self, status):
@@ -117,6 +154,23 @@ class TrainingLogger:
                 status = gr.Textbox(label="Training status", interactive=False)
                 task = gr.Textbox(label="Current task", lines=4, interactive=False)
                 summary = gr.JSON(label="Task and overall scores")
+                failures = gr.Textbox(label="Current task: total failed attempts", interactive=False)
+                retry_status = gr.Textbox(label="Task retry status and next position", interactive=False)
+                checkpoint = gr.JSON(label="Checkpoint saves and Hugging Face uploads")
+                with gr.Tab("Task outcomes"):
+                    gr.Markdown("Solved counts use correctness checks. Unsolved includes tasks awaiting their first attempt. "
+                                "Tables show up to 1,000 tasks; category totals include the entire dataset.")
+                    categories = gr.Dataframe(headers=["Category", "Total problems", "Solved", "Unsolved", "Solved %",
+                                                      "Attempted", "Failed attempts", "Waiting approval", "Removed"], interactive=False)
+                    tasks = gr.Dataframe(headers=["Task", "Category", "Status", "Attempts", "Failed attempts", "Failed rollouts",
+                                                 "Next position", "Last step", "Failure reason"], interactive=False)
+                with gr.Tab("Task waitlist"):
+                    gr.Markdown("Approve a task to start another retry cycle, or reject it to remove it from the active queue.")
+                    waitlist = gr.Dataframe(headers=["Task", "Category", "Failed attempts", "Last truth", "Last step", "Problem"], interactive=False)
+                    review_selected = gr.Dropdown(choices=[], value=None, label="Task to review", interactive=True)
+                    approve = gr.Button("Approve retry")
+                    reject = gr.Button("Reject / remove")
+                    review_result = gr.Textbox(label="Review decision", interactive=False)
                 with gr.Tab("Rollouts"):
                     outputs = []
                     for index in range(self.max_rollouts):
@@ -134,8 +188,9 @@ class TrainingLogger:
                     quick = gr.JSON(label="Parsed judge scores")
                     raw = gr.Textbox(label="Raw judge response", lines=12, interactive=False)
                     evidence = gr.JSON(label="Measured execution evidence")
+                    code_results = gr.JSON(label="Code test inputs and results")
 
-                def refresh(index):
+                def refresh(index, review_key=None):
                     state = self.snapshot()
                     score_rows = []
                     for rollout, entry in sorted(state["scores"].items()):
@@ -148,15 +203,46 @@ class TrainingLogger:
                     frame = pd.DataFrame(state["history"], columns=["step", "problem_id", "mean_score", "total_score"])
                     aggregate = {key: state[key] for key in ("step", "rollout_count", "mean_score", "task_total",
                                                             "overall_mean", "scored_rollouts")}
-                    return [state["status"], state["problem"], aggregate, *generation, score_rows, frame,
+                    progress = state.get("task_progress", {})
+                    current = progress.get("current_task", {})
+                    totals = progress.get("summary", {})
+                    aggregate.update(category=state["category"], task_attempts=current.get("attempts", 0),
+                                     task_failures=current.get("failures", 0), task_failed_rollouts=current.get("failed_rollouts", 0),
+                                     total_failed_attempts=totals.get("failed_attempts", 0),
+                                     total_failed_rollouts=totals.get("failed_rollouts", 0),
+                                     solved_tasks=totals.get("solved", 0), unsolved_tasks=totals.get("unsolved", 0),
+                                     waiting_approval=totals.get("waiting_approval", 0))
+                    category_rows = [[row[key] for key in ("category", "total", "solved", "unsolved", "solve_rate",
+                                                          "attempted", "failed_attempts", "waiting_approval", "removed")]
+                                     for row in progress.get("categories", [])]
+                    task_rows = [[row.get(key) for key in ("problem_id", "category", "status", "attempts", "failures", "failed_rollouts",
+                                                          "next_position", "last_step", "reason")]
+                                 for row in progress.get("tasks", [])]
+                    waiting = progress.get("waitlist", [])
+                    wait_rows = [[row[key] for key in ("problem_id", "category", "failures", "last_truth", "last_step", "problem")]
+                                 for row in waiting]
+                    choices = [(f"{row['problem_id']} ({row['row_hash']})", row["row_hash"]) for row in waiting]
+                    active_keys = {row["row_hash"] for row in waiting}
+                    selection = gr.Dropdown(choices=choices, value=review_key if review_key in active_keys else None,
+                                            interactive=True)
+                    retry_text = current.get("status", "")
+                    if current.get("next_position") is not None:
+                        retry_text += f"; next queue position {current['next_position']}"
+                    return [state["status"], state["problem"], aggregate, str(current.get("failures", 0)), retry_text,
+                            state.get("checkpoint_upload", {}), category_rows, task_rows, wait_rows, selection,
+                            *generation, score_rows, frame,
                             [[h["step"], h["problem_id"], h["mean_score"], h["total_score"]] for h in state["history"]],
-                            detail.get("judge_scores", {}), detail.get("judge_response", ""), detail.get("execution_evidence", {})]
+                            detail.get("judge_scores", {}), detail.get("judge_response", ""), detail.get("execution_evidence", {}),
+                            detail.get("code_execution", {})]
 
-                components = [status, task, summary, *outputs, scores, plot, history, quick, raw, evidence]
+                components = [status, task, summary, failures, retry_status, checkpoint, categories, tasks, waitlist, review_selected,
+                              *outputs, scores, plot, history, quick, raw, evidence, code_results]
                 timer = gr.Timer(self.refresh_interval)
-                timer.tick(refresh, inputs=[selected], outputs=components, queue=False)
-                app.load(refresh, inputs=[selected], outputs=components, queue=False)
-                selected.change(refresh, inputs=[selected], outputs=components, queue=False)
+                timer.tick(refresh, inputs=[selected, review_selected], outputs=components, queue=False)
+                app.load(refresh, inputs=[selected, review_selected], outputs=components, queue=False)
+                selected.change(refresh, inputs=[selected, review_selected], outputs=components, queue=False)
+                approve.click(lambda key: self.review_task(key, "approve"), inputs=[review_selected], outputs=[review_result], queue=False)
+                reject.click(lambda key: self.review_task(key, "reject"), inputs=[review_selected], outputs=[review_result], queue=False)
             self.app = app
             _, self.local_url, self.share_url = app.launch(share=True, prevent_thread_lock=True,
                                                          server_port=self.server_port, quiet=True,

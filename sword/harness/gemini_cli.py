@@ -210,6 +210,7 @@ class GeminiCliHarness(BaseHarness):
             tools_failed=tools_failed,
             tool_history=history,
             test_results=test_results, execution_results=list(sandbox.execution_history),
+            code_execution=getattr(sandbox, "code_execution", {}),
             success_rate=success_rate,
             is_completed=is_completed,
             error_message=None if is_completed else "No final answer before " + stop_reason,

@@ -271,7 +271,7 @@ def test_numeric_zero_dataset_solution_is_preserved():
     from sword.long_trainer import parse_dataset_row
     row = parse_dataset_row({"problem": "2 - 2", "solution": 0})
     assert row.solution == "0"
-    assert row.can_be_verify is True
+    assert "can_be_verify" not in row.to_dict()
 
 
 def test_bridge_microbatching_preserves_parameter_updates_and_loss_metrics():

@@ -171,7 +171,7 @@ def test_long_training_executes_tests_and_logger_preserves_policy_update(tmp_pat
         assert state["scores"][0]["execution_evidence"]["tests"]["passed"] == 1
 
 
-def test_gradio_dashboard_is_read_only_public_and_refreshes_judge_details():
+def test_gradio_dashboard_keeps_metrics_read_only_and_refreshes_judge_details():
     components = []
     callbacks = []
     launch_options = {}
@@ -184,12 +184,12 @@ def test_gradio_dashboard_is_read_only_public_and_refreshes_judge_details():
             pass
         def tick(self, function, **kwargs):
             callbacks.append(function)
-        load = change = tick
+        load = change = click = tick
         def launch(self, **kwargs):
             launch_options.update(kwargs)
             return None, "http://localhost:7860", "https://example.gradio.live"
     fake = SimpleNamespace(**{name: Component for name in (
-        "Blocks", "Markdown", "Textbox", "JSON", "Tab", "Accordion", "Dataframe", "LinePlot", "Dropdown", "Timer")})
+        "Blocks", "Markdown", "Textbox", "JSON", "Tab", "Accordion", "Dataframe", "LinePlot", "Dropdown", "Timer", "Button")})
     logger = TrainingLogger(max_rollouts=2)
     logger._apply("task", {"step": 1, "problem_id": "p", "problem": "Implement add", "rollout_count": 8})
     logger._apply("score", {"rollout": 0, "scores": {"total_score": 0.8}, "judge_scores": {"truth": 1.0},
@@ -199,7 +199,7 @@ def test_gradio_dashboard_is_read_only_public_and_refreshes_judge_details():
     assert logger.error is None
     assert launch_options["share"] is True and launch_options["prevent_thread_lock"] is True
     assert logger.share_url == "https://example.gradio.live"
-    assert all(value["interactive"] is False for value in components if "interactive" in value)
+    assert [value.get("label") for value in components if value.get("interactive")] == ["Task to review"]
     values = callbacks[0](0)
     assert values[-3] == {"truth": 1.0}
     assert values[-2] == '{"truth":1.0}' and values[-1]["tests"]["passed"] == 2

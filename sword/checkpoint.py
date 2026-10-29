@@ -10,6 +10,9 @@ import time
 import glob
 import shutil
 import hashlib
+import random
+import tempfile
+import threading
 from typing import Dict, Any, List, Optional, Tuple, Union, Set
 
 import torch
@@ -41,19 +44,204 @@ class CheckpointManager:
         self.hf_token = hf_token
         self.is_save_and_upload = is_save_and_upload_checkpoint
         os.makedirs(self.output_dir, exist_ok=True)
+        self._status_lock = threading.Lock()
+        self._pending_uploads = set()
+        self._upload_status = {"last_saved_step": None, "last_uploaded_step": None, "upload_error": None}
+        pending_file = os.path.join(self.output_dir, "checkpoint_uploads.json")
+        if os.path.isfile(pending_file):
+            with open(pending_file, encoding="utf-8") as stream:
+                pending = json.load(stream)
+            if pending.get("repo_id") == self.upload_id:
+                self._pending_uploads = {name for name in pending.get("pending", [])
+                                        if re.fullmatch(r"checkpoint-\d+", name)}
+                self._upload_status["last_uploaded_step"] = pending.get("last_uploaded_step")
+                self._upload_status["last_saved_step"] = pending.get("last_saved_step")
+                self._upload_status["upload_error"] = pending.get("upload_error")
 
         self.api = None
-        if self.upload_id and self.hf_token and HAS_HF_HUB:
+        if self.upload_id and HAS_HF_HUB:
             try:
                 self.api = HfApi(token=self.hf_token)
-                self.api.create_repo(
-                    repo_id=self.upload_id,
-                    repo_type="model",
-                    private=True,
-                    exist_ok=True,
-                )
+                if self.is_save_and_upload:
+                    self.api.create_repo(repo_id=self.upload_id, repo_type="model", private=True, exist_ok=True)
             except Exception as e:
+                self._upload_status["upload_error"] = str(e)
                 print(f"[CheckpointManager] Note: Hugging Face repo setup notice: {e}")
+        elif self.upload_id and self.is_save_and_upload:
+            self._upload_status["upload_error"] = "huggingface_hub is not installed"
+
+    def upload_info(self):
+        with self._status_lock:
+            return {"enabled": bool(self.is_save_and_upload and self.upload_id), "repo_id": self.upload_id,
+                    **self._upload_status, "pending_uploads": sorted(self._pending_uploads)}
+
+    def _save_upload_status(self):
+        with self._status_lock:
+            state = {"repo_id": self.upload_id, "pending": sorted(self._pending_uploads),
+                     **self._upload_status}
+        self._write_json_atomic(os.path.join(self.output_dir, "checkpoint_uploads.json"), state)
+
+    @staticmethod
+    def _write_json_atomic(path, value):
+        temporary = path + ".tmp"
+        with open(temporary, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+
+    def _remove_checkpoint_directory(self, path):
+        root, target = os.path.realpath(self.output_dir), os.path.realpath(path)
+        if target == root or os.path.commonpath([root, target]) != root:
+            raise ValueError("Checkpoint cleanup path escaped output_dir")
+        shutil.rmtree(path, ignore_errors=True)
+
+    def _publish_checkpoint(self, temporary, target):
+        root = os.path.realpath(self.output_dir)
+        for path in (temporary, target):
+            resolved = os.path.realpath(path)
+            if resolved == root or os.path.commonpath([root, resolved]) != root:
+                raise ValueError("Checkpoint publication path escaped output_dir")
+        backup = target + ".previous-" + os.urandom(16).hex()
+        if os.path.exists(target):
+            os.replace(target, backup)
+        try:
+            os.replace(temporary, target)
+        except BaseException:
+            if os.path.exists(backup):
+                os.replace(backup, target)
+            raise
+        if os.path.exists(backup):
+            self._remove_checkpoint_directory(backup)
+
+    @staticmethod
+    def read_training_state(ckpt_dir):
+        path = os.path.join(ckpt_dir, "training_state.json")
+        if not os.path.isfile(path):
+            return {}
+        with open(path, encoding="utf-8") as stream:
+            state = json.load(stream)
+        if not isinstance(state, dict):
+            raise ValueError("Invalid checkpoint training state")
+        return state
+
+    @staticmethod
+    def read_dataset_snapshot(ckpt_dir):
+        path = os.path.join(ckpt_dir, "dataset_snapshot.json")
+        if not os.path.isfile(path):
+            return None
+        with open(path, encoding="utf-8") as stream:
+            return json.load(stream)
+
+    def restore_random_state(self, ckpt_dir):
+        rng_file = os.path.join(ckpt_dir, "rng_state.pt")
+        if not os.path.isfile(rng_file):
+            return False
+        rng = torch.load(rng_file, map_location="cpu", weights_only=True)
+        torch.set_rng_state(rng["torch"])
+        random.setstate(rng["python"])
+        if "cuda" in rng and torch.cuda.is_available():
+            for device, state in enumerate(rng["cuda"][:torch.cuda.device_count()]):
+                torch.cuda.set_rng_state(state, device=device)
+        if "numpy" in rng:
+            import numpy as np
+            name, keys, position, gaussian, cached = rng["numpy"]
+            np.random.set_state((name, np.asarray(keys, dtype=np.uint32), position, gaussian, cached))
+        return True
+
+    @staticmethod
+    def _checkpoint_ready(path):
+        return (os.path.isfile(os.path.join(path, "training_state.json")) and
+                any(os.path.isfile(os.path.join(path, name))
+                    for name in ("adapter_model.safetensors", "adapter_model.bin")))
+
+    def _validate_checkpoint(self, path):
+        if not self._checkpoint_ready(path):
+            raise RuntimeError(f"Incomplete checkpoint: {path}")
+        manifest_path = os.path.join(path, "checkpoint_manifest.json")
+        if os.path.isfile(manifest_path):
+            with open(manifest_path, encoding="utf-8") as stream:
+                manifest = json.load(stream)
+            root = os.path.realpath(path)
+            for name, expected in manifest["files"].items():
+                candidate = os.path.realpath(os.path.join(path, name))
+                if os.path.commonpath([root, candidate]) != root or not os.path.isfile(candidate):
+                    raise RuntimeError(f"Missing checkpoint file: {name}")
+                if self.compute_sha256(candidate) != expected:
+                    raise RuntimeError(f"Checkpoint checksum mismatch: {name}")
+        self.read_training_state(path)
+
+    def restore_completion_log(self, ckpt_dir):
+        source = os.path.join(ckpt_dir, "data_complete.logs")
+        if not os.path.isfile(source):
+            return
+        target = os.path.join(self.output_dir, "data_complete.logs")
+        entries = self._completion_entries(target)
+        state = self.read_training_state(ckpt_dir)
+        task_state = self._task_completion_state(state)
+        if task_state:
+            for key in {*task_state["tasks"], state.get("dataset_sha256")}:
+                entries.pop(key, None)
+        entries.update(self._completion_entries(source))
+        temporary = target + ".tmp"
+        with open(temporary, "w", encoding="utf-8") as stream:
+            stream.writelines(line + "\n" for line in entries.values())
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+
+    @staticmethod
+    def _completion_entries(path):
+        entries = {}
+        if os.path.isfile(path):
+            with open(path, encoding="utf-8") as stream:
+                for line in stream:
+                    value = line.strip()
+                    if value and not value.startswith("#"):
+                        entries[value.split()[0]] = value
+        return entries
+
+    @staticmethod
+    def _task_completion_state(state):
+        task_state = state.get("task_queue")
+        if (isinstance(task_state, dict) and task_state.get("version") == 1
+                and isinstance(task_state.get("tasks"), dict)
+                and isinstance(task_state.get("config"), dict) and "enabled" in task_state["config"]):
+            return task_state
+        return {}
+
+    def retry_pending_uploads(self):
+        if not (self.is_save_and_upload and self.api and self.upload_id):
+            return
+        for name in sorted(self._pending_uploads, key=lambda value: int(value.split("-")[-1]), reverse=True):
+            directory = os.path.join(self.output_dir, name)
+            if not self._checkpoint_ready(directory):
+                continue
+            uploaded = False
+            for attempt in range(3):
+                try:
+                    self.api.upload_folder(folder_path=directory, path_in_repo=name, repo_id=self.upload_id,
+                                           repo_type="model", commit_message=f"save {name}")
+                    step = int(name.split("-")[-1])
+                    with self._status_lock:
+                        self._pending_uploads.discard(name)
+                        self._upload_status["last_uploaded_step"] = max(step, self._upload_status["last_uploaded_step"] or 0)
+                        self._upload_status["upload_error"] = None
+                    print(f"[CheckpointManager] {name} uploaded to https://huggingface.co/{self.upload_id}")
+                    uploaded = True
+                    break
+                except Exception as exc:
+                    with self._status_lock:
+                        self._upload_status["upload_error"] = str(exc)
+                    if attempt < 2:
+                        time.sleep(attempt + 1)
+                    else:
+                        print(f"[CheckpointManager] Upload failed for {name}; retained for retry: {exc}")
+            self._save_upload_status()
+            if not uploaded:
+                # Retry the newest snapshot first; an outage must not multiply
+                # training delays by every previously failed upload.
+                break
 
     @staticmethod
     def compute_sha256(data_source: Union[str, bytes]) -> str:
@@ -113,14 +301,14 @@ class CheckpointManager:
             return None
 
         # 1. Exact path match
-        if os.path.isdir(clean_query):
+        if os.path.isdir(clean_query) and self._checkpoint_ready(clean_query):
             return clean_query
 
         # 2. Local search in output_dir
         local_ckpts: Dict[int, str] = {}
         for p in glob.glob(os.path.join(self.output_dir, "checkpoint-*")):
             m = re.search(r"checkpoint-(\d+)$", p)
-            if m:
+            if m and self._checkpoint_ready(p):
                 local_ckpts[int(m.group(1))] = p
 
         query_step: Optional[int] = None
@@ -142,23 +330,30 @@ class CheckpointManager:
                     m = re.match(r"(checkpoint-(\d+))/", f)
                     if m:
                         step_num = int(m.group(2))
-                        remote_ckpts[step_num] = m.group(1)
+                        name = m.group(1)
+                        if (f"{name}/training_state.json" in files and
+                                any(f"{name}/{weight}" in files for weight in ("adapter_model.safetensors", "adapter_model.bin"))):
+                            remote_ckpts[step_num] = name
 
                 target_step = query_step if query_step is not None else (max(remote_ckpts.keys()) if remote_ckpts else None)
                 local_max_step = max(local_ckpts.keys()) if local_ckpts else -1
 
-                if target_step is not None and (query_step is not None or target_step > local_max_step):
+                if target_step in remote_ckpts and (query_step is not None or target_step > local_max_step):
                     target_name = remote_ckpts[target_step]
                     local_target = os.path.join(self.output_dir, target_name)
-                    os.makedirs(local_target, exist_ok=True)
-                    for f in files:
-                        if f.startswith(f"{target_name}/"):
-                            hf_hub_download(
-                                repo_id=self.upload_id,
-                                filename=f,
-                                local_dir=self.output_dir,
-                                token=self.hf_token,
-                            )
+                    download_dir = tempfile.mkdtemp(prefix=".resume-", dir=self.output_dir)
+                    try:
+                        for f in files:
+                            if f.startswith(f"{target_name}/"):
+                                hf_hub_download(repo_id=self.upload_id, filename=f, local_dir=download_dir, token=self.hf_token)
+                        staged = os.path.join(download_dir, target_name)
+                        self._validate_checkpoint(staged)
+                        self._publish_checkpoint(staged, local_target)
+                    finally:
+                        self._remove_checkpoint_directory(download_dir)
+                    with self._status_lock:
+                        self._upload_status["last_uploaded_step"] = target_step
+                        self._upload_status["last_saved_step"] = target_step
                     return local_target
             except Exception as e:
                 print(f"[CheckpointManager] Remote checkpoint lookup notice: {e}")
@@ -184,15 +379,40 @@ class CheckpointManager:
         completed_dataset_hash: Optional[str] = None,
         source_lora_manifest: Optional[Dict[str, Any]] = None,
         tokenizer: Optional[Any] = None,
+        dataset_snapshot: Optional[Dict[str, Any]] = None,
     ) -> str:
+        """Publish only complete snapshots, then upload and retain failed uploads for retry."""
+        target = os.path.join(self.output_dir, f"checkpoint-{step}")
+        temporary = tempfile.mkdtemp(prefix=f".checkpoint-{step}-", dir=self.output_dir)
+        try:
+            self._write_checkpoint(temporary, step, model, optimizer, base_model_name, lora_r, lora_alpha,
+                                   target_modules, training_state, reward_logs, completed_dataset_hash,
+                                   source_lora_manifest, tokenizer, dataset_snapshot)
+            self._publish_checkpoint(temporary, target)
+        except BaseException:
+            self._remove_checkpoint_directory(temporary)
+            raise
+        # Completion history advances only after the model/optimizer snapshot
+        # has been published. A failed save cannot mark a dataset completed.
+        self.restore_completion_log(target)
+        with self._status_lock:
+            self._upload_status["last_saved_step"] = step
+            if self.is_save_and_upload and self.upload_id:
+                self._pending_uploads.add(f"checkpoint-{step}")
+        if self.is_save_and_upload and self.upload_id:
+            self._save_upload_status()
+            self.retry_pending_uploads()
+        self.prune_local_checkpoints()
+        return target
+
+    def _write_checkpoint(self, ckpt_dir, step, model, optimizer, base_model_name, lora_r, lora_alpha,
+                          target_modules, training_state, reward_logs, completed_dataset_hash,
+                          source_lora_manifest, tokenizer, dataset_snapshot):
         """
         Performs custom checkpoint serialization with read-back verification:
         adapter_model.safetensors, adapter_config.json, training_state.json,
         reward_details.jsonl, data_complete.logs, optimizer.pt, and uploads to Hugging Face.
         """
-        ckpt_dir = os.path.join(self.output_dir, f"checkpoint-{step}")
-        os.makedirs(ckpt_dir, exist_ok=True)
-
         # 1. Save LoRA adapter weights
         peft_saved = False
         if hasattr(model, "save_pretrained") and hasattr(model, "peft_config"):
@@ -248,11 +468,14 @@ class CheckpointManager:
         self.verify_saved_weights(ckpt_dir)
 
         # 3. Save training state
-        state = training_state or {}
+        state = dict(training_state or {})
         state["step"] = step
         state["timestamp"] = time.time()
         with open(os.path.join(ckpt_dir, "training_state.json"), "w", encoding="utf-8") as f:
             json.dump(state, f, indent=2)
+        if dataset_snapshot is not None:
+            with open(os.path.join(ckpt_dir, "dataset_snapshot.json"), "w", encoding="utf-8") as stream:
+                json.dump(dataset_snapshot, stream, ensure_ascii=False)
         if source_lora_manifest is not None:
             from .lora_source import SOURCE_MANIFEST
             with open(os.path.join(ckpt_dir, SOURCE_MANIFEST), "w", encoding="utf-8") as f:
@@ -269,42 +492,46 @@ class CheckpointManager:
                 for entry in reward_logs:
                     f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
-        # 5. Handle data_complete.logs:
-        # If completed_dataset_hash is provided, write to authoritative log
-        if completed_dataset_hash:
-            self.mark_dataset_completed(completed_dataset_hash)
-
-        # Copy authoritative log into checkpoint directory if it exists
+        # 5. Assemble completion history inside the unpublished snapshot first.
         main_log = os.path.join(self.output_dir, "data_complete.logs")
         ckpt_log = os.path.join(ckpt_dir, "data_complete.logs")
-        if os.path.exists(main_log):
-            shutil.copy2(main_log, ckpt_log)
+        entries = self._completion_entries(main_log)
+        task_state = self._task_completion_state(state)
+        if task_state:
+            tasks = task_state["tasks"]
+            for key in {*tasks, state.get("dataset_sha256")}:
+                entries.pop(key, None)
+            visited = set(state.get("visited_row_hashes", []))
+            enabled = task_state["config"]["enabled"]
+            for key, task in tasks.items():
+                if task["solved"] or (not enabled and key in visited):
+                    entries[key] = f"{key}  row_{task['problem_id']}"
+        if completed_dataset_hash:
+            entries[completed_dataset_hash] = completed_dataset_hash
+        if entries or task_state or os.path.isfile(main_log):
+            with open(ckpt_log, "w", encoding="utf-8") as stream:
+                stream.writelines(line + "\n" for line in entries.values())
 
         # 6. Save optimizer state if provided
         if optimizer is not None:
-            try:
-                torch.save(optimizer.state_dict(), os.path.join(ckpt_dir, "optimizer.pt"))
-            except Exception as e_opt:
-                print(f"[CheckpointManager] Optimizer serialization notice: {e_opt}")
+            torch.save(optimizer.state_dict(), os.path.join(ckpt_dir, "optimizer.pt"))
 
-        # 7. Prune older local checkpoints to respect num_latest_checkpoint_save
-        self.prune_local_checkpoints()
-
-        # 8. Upload checkpoint to Hugging Face if enabled
-        if self.is_save_and_upload and self.api and self.upload_id:
-            try:
-                self.api.upload_folder(
-                    folder_path=ckpt_dir,
-                    path_in_repo=f"checkpoint-{step}",
-                    repo_id=self.upload_id,
-                    repo_type="model",
-                    commit_message=f"save checkpoint-{step}",
-                )
-                print(f"[CheckpointManager] Checkpoint-{step} uploaded to https://huggingface.co/{self.upload_id}")
-            except Exception as e:
-                print(f"[CheckpointManager] Upload notice for checkpoint-{step}: {e}")
-
-        return ckpt_dir
+        rng = {"torch": torch.get_rng_state(), "python": random.getstate()}
+        if torch.cuda.is_initialized():
+            rng["cuda"] = torch.cuda.get_rng_state_all()
+        try:
+            import numpy as np
+            name, keys, position, gaussian, cached = np.random.get_state()
+            rng["numpy"] = (name, keys.tolist(), position, gaussian, cached)
+        except ImportError:
+            pass
+        torch.save(rng, os.path.join(ckpt_dir, "rng_state.pt"))
+        files = {}
+        for directory, _, names in os.walk(ckpt_dir):
+            for name in names:
+                path = os.path.join(directory, name)
+                files[os.path.relpath(path, ckpt_dir).replace(os.sep, "/")] = self.compute_sha256(path)
+        self._write_json_atomic(os.path.join(ckpt_dir, "checkpoint_manifest.json"), {"version": 1, "files": files})
 
     def verify_saved_weights(self, ckpt_dir: str):
         """Validates that saved weights file can be loaded back into memory."""
@@ -337,6 +564,8 @@ class CheckpointManager:
         Restores model adapter weights and optimizer state from checkpoint.
         Verifies key matching and reports restoration metrics.
         """
+        self._validate_checkpoint(ckpt_dir)
+        training_state = self.read_training_state(ckpt_dir)
         weights_file = os.path.join(ckpt_dir, "adapter_model.safetensors")
         if not os.path.exists(weights_file):
             weights_file = os.path.join(ckpt_dir, "adapter_model.bin")
@@ -399,6 +628,8 @@ class CheckpointManager:
                 matched_keys = list(candidate_sd.keys())
 
         print(f"[CheckpointManager] Restored {len(matched_keys)} / {len(sd)} adapter weight tensors.")
+        if not matched_keys:
+            raise RuntimeError("Resume checkpoint matched no model parameters")
 
         # Restore optimizer if present
         opt_restored = False
@@ -410,34 +641,32 @@ class CheckpointManager:
                 opt_restored = True
                 print("[CheckpointManager] Successfully restored optimizer state.")
             except Exception as e_opt:
-                print(f"[CheckpointManager] Optimizer state restoration notice: {e_opt}")
+                raise RuntimeError("Failed to restore checkpoint optimizer state") from e_opt
 
         # Restore step from training_state.json
-        step = 0
-        state_file = os.path.join(ckpt_dir, "training_state.json")
-        if os.path.exists(state_file):
-            try:
-                with open(state_file, "r", encoding="utf-8") as f:
-                    st = json.load(f)
-                    step = int(st.get("step", 0))
-            except Exception:
-                pass
+        step = int(training_state.get("step", 0))
+        rng_restored = self.restore_random_state(ckpt_dir)
+        self.restore_completion_log(ckpt_dir)
 
         return {
             "step": step,
             "matched_keys": len(matched_keys),
             "total_keys": len(sd),
             "optimizer_restored": opt_restored,
+            "rng_restored": rng_restored,
+            "training_state": training_state,
             "ckpt_dir": ckpt_dir,
         }
 
     def prune_local_checkpoints(self):
         """Keeps only num_latest_checkpoint_save latest checkpoints."""
         local_checkpoints = sorted(
-            glob.glob(os.path.join(self.output_dir, "checkpoint-*")),
-            key=lambda p: int(re.search(r"checkpoint-(\d+)", p).group(1)) if re.search(r"checkpoint-(\d+)", p) else -1
+            [path for path in glob.glob(os.path.join(self.output_dir, "checkpoint-*"))
+             if re.fullmatch(r"checkpoint-\d+", os.path.basename(path)) and self._checkpoint_ready(path)],
+            key=lambda path: int(os.path.basename(path).split("-")[-1])
         )
         if len(local_checkpoints) > self.num_latest_checkpoint_save:
             to_remove = local_checkpoints[:-self.num_latest_checkpoint_save]
             for p in to_remove:
-                shutil.rmtree(p, ignore_errors=True)
+                if os.path.basename(p) not in self._pending_uploads:
+                    self._remove_checkpoint_directory(p)

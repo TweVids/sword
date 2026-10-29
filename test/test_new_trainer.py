@@ -271,17 +271,16 @@ class TestNewTrainerArchitecture(unittest.TestCase):
     def test_multi_metric_reward_scoring(self):
         scorer = MultiMetricRewardScorer(ModelBJudge(ModelBJudgeConfig(auto_setup=False)))
 
-        # Non-agentic verifiable math task
+        # Non-agentic math task with a disabled/offline judge
         breakdown = scorer.score(
             problem="Compute 10 + 15",
             solution="25",
             candidate_response="<think>Adding 10 and 15</think> 25",
             reasoning_rule="Show addition",
             answer_rule="Single number",
-            can_be_verify=True,
             harness_name="none",
         )
-        self.assertEqual(breakdown.truth, 0.5)
+        self.assertEqual(breakdown.truth, 1.0)
         self.assertEqual(breakdown.formatted, 1.0)
         self.assertFalse(breakdown.is_agentic)
         self.assertGreater(breakdown.total_score, 0.0)
@@ -402,7 +401,7 @@ class TestNewTrainerArchitecture(unittest.TestCase):
         # Without OOM mock, it succeeds and completes
         self.assertEqual(retry_res.get("status"), "completed")
 
-    def test_expandable_dataset_deduplication(self):
+    def test_expandable_dataset_deduplication_without_retry_scheduler(self):
         from sword.finetune import apply_lora_to_model
         apply_lora_to_model(self.model, r=4, lora_alpha=8, target_moe=False)
 
@@ -419,7 +418,7 @@ class TestNewTrainerArchitecture(unittest.TestCase):
             dataset=dataset_v1,
             model="test_model",
             is_save_and_upload_checkpoint=False,
-            Argument={"steps": 2, "concurrency_g": 2, "output_dir": out_dir},
+            Argument={"steps": 2, "concurrency_g": 2, "output_dir": out_dir, "task_retry_enabled": False},
             show_detail_logs=False,
         )
         self.assertEqual(res1.get("status"), "completed")
@@ -436,7 +435,7 @@ class TestNewTrainerArchitecture(unittest.TestCase):
             dataset=dataset_v2,
             model="test_model",
             is_save_and_upload_checkpoint=False,
-            Argument={"steps": 1, "concurrency_g": 2, "output_dir": out_dir},
+            Argument={"steps": 1, "concurrency_g": 2, "output_dir": out_dir, "task_retry_enabled": False},
             show_detail_logs=False,
         )
         self.assertEqual(res2.get("status"), "completed")
@@ -448,12 +447,12 @@ class TestNewTrainerArchitecture(unittest.TestCase):
             dataset=dataset_v2,
             model="test_model",
             is_save_and_upload_checkpoint=False,
-            Argument={"steps": 1, "concurrency_g": 2, "output_dir": out_dir},
+            Argument={"steps": 1, "concurrency_g": 2, "output_dir": out_dir, "task_retry_enabled": False},
             show_detail_logs=False,
         )
         self.assertEqual(res3.get("status"), "already_trained")
 
-    def test_partial_dataset_train_only_marks_visited_rows(self):
+    def test_partial_dataset_train_only_marks_visited_rows_without_retry_scheduler(self):
         from sword.finetune import apply_lora_to_model
         apply_lora_to_model(self.model, r=4, lora_alpha=8, target_moe=False)
 
@@ -471,7 +470,7 @@ class TestNewTrainerArchitecture(unittest.TestCase):
             dataset=dataset,
             model="test_model",
             is_save_and_upload_checkpoint=False,
-            Argument={"steps": 1, "concurrency_g": 2, "output_dir": out_dir},
+            Argument={"steps": 1, "concurrency_g": 2, "output_dir": out_dir, "task_retry_enabled": False},
             show_detail_logs=False,
         )
         self.assertEqual(res.get("status"), "partial")

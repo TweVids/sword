@@ -22,9 +22,13 @@ def build_execution_evidence(history=(), *, tools_called=0, tools_succeeded=0,
             if not name and isinstance(call, dict):
                 name = call.get("payload", {}).get("name") or call.get("type")
             sample = {"kind": kind, "name": str(name or kind)[:100], "success": bool(record.get("success"))}
-            for key in ("exit_code", "timed_out", "stdout", "stderr", "expected_stdout"):
+            if record.get("kind") == "code_io":
+                sample["case_type"] = "code_io"
+            for key in ("exit_code", "timed_out", "stdout", "stderr", "expected_stdout", "stdin",
+                        "output_match", "process_success", "executed", "output_truncated"):
                 if key in record:
-                    sample[key] = record[key] if key in ("exit_code", "timed_out") else str(record[key])[:500]
+                    sample[key] = record[key] if key in ("exit_code", "timed_out", "output_match", "process_success",
+                                                        "executed", "output_truncated") else str(record[key])[:500]
             if "stdout" not in sample and "stderr" not in sample:
                 sample["output"] = str(record.get("output", record.get("message", "")))[:500]
             entries.append(sample)

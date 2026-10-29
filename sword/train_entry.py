@@ -77,7 +77,7 @@ def resolve_prompts(
 def train(
     test: bool = True,
     long_train: bool = False,
-    dataset: Union[str, List[Any], Dict[str, Any]] = "math-ai/TemplateGSM",
+    dataset: Optional[Union[str, List[Any], Dict[str, Any]]] = "math-ai/TemplateGSM",
     model: Optional[str] = None,
     B_model_port: int = 11343,
     custom_checkpoint_save: bool = True,

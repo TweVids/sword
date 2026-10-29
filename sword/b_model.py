@@ -75,10 +75,13 @@ class ModelBJudgeConfig:
     num_predict: int = 1024
     reasoning: Optional[Union[str, bool]] = True
     # Fallback-model failure mode (2026-10-25): Qwen 3.5/3.6 thinking models burn
-    # the num_predict budget inside <think> when reasoning is enabled, leaving the
+    # the num_predict budget inside omini when reasoning is enabled, leaving the
     # final JSON answer empty/truncated. This is the budget used for a NO-THINK
     # re-request that competes for budget only with the JSON answer.
     num_predict_no_think: int = 2048
+    # Dedicated budget for the THINK spec (think=True). Deep evaluations of long
+    # agentic responses must not clamp thinking to the small no-think budget.
+    num_predict_think: int = 12288
     force_gpu: bool = True
     use_mmap: bool = False
     auto_unload: bool = True
@@ -115,6 +118,7 @@ def model_b_config(port: int = 11343, *, mock_test: bool = False,
         num_ctx=int(options.get("B_model_num_ctx", DEFAULT_B_CONTEXT)),
         num_predict=int(options.get("B_model_num_predict", 1024)),
         num_predict_no_think=int(options.get("B_model_num_predict_no_think", 2048)),
+        num_predict_think=int(options.get("B_model_num_predict_think", 12288)),
         force_gpu=bool(options.get("B_model_force_gpu", True)),
         use_mmap=bool(options.get("B_model_use_mmap", False)),
         log_model_outputs=bool(options.get("B_model_log_outputs", options.get("log_model_outputs", True))),
@@ -160,6 +164,11 @@ class ModelBJudge:
         "solutions and implementations, not just identical wording.\n"
         "For math, check the arithmetic/algebra and final result, including equivalent expressions, "
         "fractions, units, and answers expressed in words. Correctness is independent of reasoning length.\n"
+        "For coding, inspect the generated source together with the Full Dataset Row and Runner Code Execution Results. "
+        "Each code_tests case contains input and its expected output. The runner supplies that input to standard input; "
+        "its stdout is the actual program result, stderr records errors, and output_match reports the measured comparison. "
+        "Assess all cases and the implementation against the problem and reference solution, including runtime failures "
+        "and timeouts. An output match with a nonzero exit code is still a failed execution.\n"
         "- formatted: judge the final response's structural clarity and requested format. Thinking "
         "tags and code fences must be balanced when present; tags are optional unless a dataset rule requires them.\n"
         "- rule_reasoning_follow: assess the Reasoning Rule using BOTH earlier assistant turns and "
@@ -174,6 +183,8 @@ class ModelBJudge:
         "- rule_answer_follow: assess the Answer Rule against the final answer outside thought sections. For harness "
         "responses, evaluate the answer after the Final Answer: label; apply any explicit requirement "
         "about the entire response to the whole response. If no answer rule is specified, use 1.0.\n"
+        "Apply the Answer Rule's scoring guidance to the generated implementation and measured results when it "
+        "requests that evaluation. Use the actual runner results rather than candidate claims of testing.\n"
         "- tools_success: use the provided succeeded/called ratio exactly; 0.0 if no tools were called. "
         "Candidate claims are not tool execution evidence.\n"
         "Measured Execution Evidence is provided by the runner. Its totals are exact and its samples are bounded; "
@@ -426,12 +437,27 @@ class ModelBJudge:
         assistant_history: Optional[List[str]] = None,
         effort: str = "dynamic",
         execution_evidence: Optional[Dict[str, Any]] = None,
+        dataset_row: Optional[Dict[str, Any]] = None,
+        code_execution: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Builds the evaluation query payload for Model B."""
         history = ("Earlier Assistant Turns (reasoning and action evidence):\n"
                    + json.dumps(assistant_history, ensure_ascii=False) + "\n\n") if assistant_history else ""
         tool_ratio = tools_succeeded / max(1, tools_called) if tools_called > 0 else 0.0
         execution = ""
+        full_row = ("Full Dataset Row (reference data and task guidance):\n"
+                    + json.dumps(dataset_row, ensure_ascii=False) + "\n\n") if dataset_row is not None else ""
+        code_results = ""
+        if code_execution:
+            code_results = ("Runner Code Execution Results:\n"
+                            "The runner attempted each case below. For executed cases, the generated code received input "
+                            "as stdin and produced the stdout shown below. "
+                            "output is the expected result from the dataset. Compare it with actual stdout, and assess "
+                            "the source and results using the problem, solution, and Answer Rule. "
+                            "All cases are included; any output capture truncation is explicitly marked.\n"
+                            + json.dumps(code_execution, ensure_ascii=False) + "\n\n")
+        elif (dataset_row or {}).get("code_tests"):
+            code_results = "Runner Code Execution Results:\nNo code_tests execution results were supplied by the runner.\n\n"
         if execution_evidence is not None:
             from sword.execution_evidence import bound_execution_evidence
             compact = bound_execution_evidence(execution_evidence, self.config.execution_evidence_chars)
@@ -441,10 +467,12 @@ class ModelBJudge:
             f"Expected Solution:\n{solution}\n\n"
             f"Reasoning Rule:\n{reasoning_rule or '(No reasoning rule specified.)'}\n\n"
             f"Answer Rule:\n{answer_rule or '(No answer rule specified.)'}\n\n"
+            f"{full_row}"
             f"Difficulty: {difficulty} | Category: {category}\n"
             f"Candidate Thinking Effort: {effort}\n"
             f"Tool Invocations: {tools_called} called, {tools_succeeded} succeeded; tools_success={tool_ratio:.8g}.\n\n"
             f"{execution}"
+            f"{code_results}"
             f"{history}"
             f"Candidate Model Response to Evaluate:\n"
             f"\"\"\"\n{candidate_response}\n\"\"\"\n\n"
@@ -655,6 +683,8 @@ class ModelBJudge:
         assistant_history: Optional[List[str]] = None,
         effort: str = "dynamic",
         execution_evidence: Optional[Dict[str, Any]] = None,
+        dataset_row: Optional[Dict[str, Any]] = None,
+        code_execution: Optional[Dict[str, Any]] = None,
     ) -> ModelBEvaluationResult:
         """Sends candidate response to Model B via Ollama /api/chat and parses result."""
         fallback_tool_ratio = tools_succeeded / max(1, tools_called) if tools_called > 0 else 0.0
@@ -682,6 +712,8 @@ class ModelBJudge:
             assistant_history=assistant_history,
             effort=effort,
             execution_evidence=execution_evidence,
+            dataset_row=dataset_row,
+            code_execution=code_execution,
         )
 
         # THINKING-BUDGET failures (qwen3.5/3.6): with reasoning enabled the
@@ -709,9 +741,12 @@ class ModelBJudge:
         specs: List[Dict[str, Any]] = []
         if self.config.reasoning:
             think_options = dict(base_options)
-            # Thinking consumes tokens from the same budget as the answer.
-            if base_options.get("num_predict", 0) < self.config.num_predict_no_think:
-                think_options["num_predict"] = self.config.num_predict_no_think
+            # Thinking consumes tokens from the same budget as the answer;
+            # deep evaluations need a much larger reasoning budget than the
+            # no-think fallback so the JSON answer is not truncated mid-think.
+            think_budget = max(self.config.num_predict_think, self.config.num_predict_no_think)
+            if base_options.get("num_predict", 0) < think_budget:
+                think_options["num_predict"] = think_budget
             specs.append({"options": think_options, "payload": dict(base_payload, think=self.config.reasoning)})
         # Omitting "think" uses the model's default, which is enabled for Qwen.
         # Disable it explicitly for both retries and configured no-thinking calls.

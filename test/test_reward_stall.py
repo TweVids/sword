@@ -196,7 +196,7 @@ def test_explicitly_disabled_judge_never_constructs_or_calls_ollama():
         scorer = MultiMetricRewardScorer(b_model_judge=None)
         score = scorer.score("2+2?", "4", "The answer is 4", can_be_verify=True)
     judge.assert_not_called()
-    assert score.truth == 0.5
+    assert score.truth == 1.0
 
 
 @pytest.mark.parametrize("index", [0, 1])
@@ -209,7 +209,7 @@ def test_diagnostic_coding_truth_uses_semantic_judge(index):
     assert candidate != row["solution"]
     score = MultiMetricRewardScorer(judge).score(
         problem=row["problem"], solution=row["solution"], candidate_response=candidate,
-        can_be_verify=row["can_be_verify"], category=row["category"], harness_name=row["harness"],
+        category=row["category"], harness_name=row["harness"],
     )
     assert score.truth == 0.9
 
@@ -219,7 +219,7 @@ def test_diagnostic_math_truth_uses_live_judge():
     judge = SimpleNamespace(evaluate=lambda **kwargs: ModelBEvaluationResult(truth=0.9))
     score = MultiMetricRewardScorer(judge).score(
         problem=row["problem"], solution=row["solution"], candidate_response="The answer is 9",
-        can_be_verify=row["can_be_verify"], category=row["category"],
+        category=row["category"],
     )
     assert score.truth == 0.9
 
@@ -228,9 +228,9 @@ def test_diagnostic_math_without_judge_keeps_exact_verification():
     row = diagnostic_dataset()[2]
     score = MultiMetricRewardScorer(None).score(
         problem=row["problem"], solution=row["solution"], candidate_response="The answer is 9",
-        can_be_verify=row["can_be_verify"], category=row["category"],
+        category=row["category"],
     )
-    assert score.truth == 0.5
+    assert score.truth == 1.0
 
 
 def test_five_uniform_steps_are_visible_without_parameter_drift(tmp_path, capsys):

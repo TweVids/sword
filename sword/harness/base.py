@@ -31,6 +31,7 @@ class HarnessResult:
     assistant_turns: List[Dict[str, Any]] = field(default_factory=list)
     test_results: List[Dict[str, Any]] = field(default_factory=list)
     execution_results: List[Dict[str, Any]] = field(default_factory=list)
+    code_execution: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -46,6 +47,7 @@ class HarnessResult:
             "workspace_dir": self.workspace_dir,
             "workspace_removed": self.workspace_removed,
             "test_results": self.test_results,
+            "code_execution": self.code_execution,
         }
 
 
@@ -76,7 +78,7 @@ class BaseHarness:
             return []
         from sword.execution import run_dataset_tests
         return run_dataset_tests(sandbox, getattr(self, "dataset_tests", []), response,
-                                 getattr(self, "language", None) or "python")
+                                 getattr(self, "language", None), code_tests=getattr(self, "code_tests", []))
 
     @staticmethod
     def has_final_answer(text: str) -> bool:

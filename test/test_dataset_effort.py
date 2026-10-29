@@ -171,7 +171,7 @@ def test_row_effort_persists_through_harness_followups_and_judge_sees_every_turn
             model="controlled", trainer_model=model, tokenizer=tokenizer,
             b_model=True, B_model_auto_setup=False, auto_unload_B_model=False,
             is_save_and_upload_checkpoint=False, show_detail_logs=False, trace_rollouts=True,
-            Argument={"steps": 4, "concurrency_g": 2, "max_seq_len": 1024, "max_new_tokens": 1,
+            Argument={"steps": 4, "concurrency_g": 2, "max_seq_len": 1024, "max_new_tokens": 1, "task_retry_enabled": False,
                       "harness_max_turns": 2, "output_dir": str(tmp_path)},
         )
     assert requests == [(e, initial) for e in THINKING_EFFORTS for initial in (True, False, False)]

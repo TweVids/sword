@@ -336,32 +336,30 @@ def diagnostic_dataset():
             "solution": "def is_prime(n):\n    return n > 1 and all(n % i for i in range(2, int(n**0.5) + 1))",
             "reasoning_rule": "Explain the algorithm inside <think> tags.",
             "answer_rule": "Provide the Python function in a code block.",
-            # Reference implementations require semantic judging, not numeric
-            # answer extraction from the candidate's source code.
-            "can_be_verify": False, "difficulty": "medium", "category": "code", "harness": "opencode",
+            "difficulty": "medium", "category": "code", "harness": "opencode",
         },
         {
             "problem": "Write reverse_words(s: str) -> str to reverse the order of words.",
             "solution": "def reverse_words(s):\n    return ' '.join(s.split()[::-1])",
             "reasoning_rule": "Explain whitespace handling.",
             "answer_rule": "Return one Python function.",
-            "can_be_verify": False, "difficulty": "easy", "category": "code", "harness": "codex",
+            "difficulty": "easy", "category": "code", "harness": "codex",
         },
         {
             "problem": "Solve for x: 3*x + 15 = 42.", "solution": "9",
             "reasoning_rule": "Isolate x step by step.", "answer_rule": "Give the exact integer.",
-            "can_be_verify": True, "difficulty": "easy", "category": "math", "harness": "gemini",
+            "difficulty": "easy", "category": "math", "harness": "gemini",
         },
         {
             "problem": "All roses are flowers and some flowers fade quickly. Must all roses fade quickly?",
             "solution": "No", "reasoning_rule": "Check the categorical syllogism.",
-            "answer_rule": "Answer Yes or No.", "can_be_verify": False,
+            "answer_rule": "Answer Yes or No.",
             "difficulty": "medium", "category": "reasoning", "harness": "pi",
         },
         {
             "problem": "What is the primary gas in Earth's atmosphere?", "solution": "Nitrogen",
             "reasoning_rule": "Identify the atmospheric composition.", "answer_rule": "Name the gas.",
-            "can_be_verify": False, "difficulty": "easy", "category": "science", "harness": None,
+            "difficulty": "easy", "category": "science", "harness": None,
         },
     ]
 
@@ -484,6 +482,8 @@ def run_target_diagnostics(
             arguments.setdefault("micro_batch_size", 1)
             arguments.setdefault("output_dir", "checkpoints/diagnostics")
             arguments.setdefault("allow_retest", True)
+            # A diagnostic must exercise each row/harness within its five steps.
+            arguments.setdefault("task_retry_enabled", False)
         hf_overrides = options.get("hf_overrides") or {
             "allow_global_per_layer_attribute_access": True,
             "text_config": {"allow_global_per_layer_attribute_access": True},
