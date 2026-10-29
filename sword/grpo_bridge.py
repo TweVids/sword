@@ -45,7 +45,7 @@ from .lora_source import LoraTrainingSource, SOURCE_MANIFEST, prepare_merged_lor
 _CODE_STAMP = "sword-grpo-bridge math-llm-judge/v8"
 
 
-THINKING_EFFORTS = ("dynamic", "low", "medium", "high")
+THINKING_EFFORTS = ("dynamic", "low", "medium", "high", "xhigh")
 
 
 def normalize_effort(effort: Optional[str]) -> str:

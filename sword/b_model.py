@@ -82,6 +82,12 @@ class ModelBJudgeConfig:
     # Dedicated budget for the THINK spec (think=True). Deep evaluations of long
     # agentic responses must not clamp thinking to the small no-think budget.
     num_predict_think: int = 12288
+    # Thinking-effort level for the judge model (e.g. qwen3.8's effort knob).
+    # Sent as the `think` payload value when reasoning is enabled; models or
+    # Ollama builds that only support boolean think reject the string (the
+    # request handler pops `think` and retries with the model default), so the
+    # graceful degradation path is intact.
+    think_level: str = "xhigh"
     force_gpu: bool = True
     use_mmap: bool = False
     auto_unload: bool = True
@@ -119,6 +125,7 @@ def model_b_config(port: int = 11343, *, mock_test: bool = False,
         num_predict=int(options.get("B_model_num_predict", 1024)),
         num_predict_no_think=int(options.get("B_model_num_predict_no_think", 2048)),
         num_predict_think=int(options.get("B_model_num_predict_think", 12288)),
+        think_level=str(options.get("B_model_effort", options.get("B_model_think_level", "xhigh"))),
         force_gpu=bool(options.get("B_model_force_gpu", True)),
         use_mmap=bool(options.get("B_model_use_mmap", False)),
         log_model_outputs=bool(options.get("B_model_log_outputs", options.get("log_model_outputs", True))),
@@ -753,7 +760,9 @@ class ModelBJudge:
             think_budget = max(self.config.num_predict_think, self.config.num_predict_no_think)
             if base_options.get("num_predict", 0) < think_budget:
                 think_options["num_predict"] = think_budget
-            specs.append({"options": think_options, "payload": dict(base_payload, think=self.config.reasoning)})
+            specs.append({"options": think_options, "payload": dict(base_payload,
+                                                                  think=(self.config.reasoning if not isinstance(self.config.reasoning, bool)
+                                                                         else (self.config.think_level or True)))})
         # Omitting "think" uses the model's default, which is enabled for Qwen.
         # Disable it explicitly for both retries and configured no-thinking calls.
         specs.append({"options": no_think_options, "payload": dict(base_payload, think=False)})
@@ -827,7 +836,7 @@ class ModelBJudge:
                     # out and thrashed a full fallback model load per evaluation.
                     is_timeout = requests is not None and isinstance(
                         exc, (requests.exceptions.Timeout, requests.exceptions.ConnectionError))
-                    if is_timeout and payload.get("think") is True:
+                    if is_timeout and bool(payload.get("think")):                      # think may be True or an effort level string
                         print("[ModelB] think-spec timeout; retrying this model with think=False",
                               flush=True)
                         continue
