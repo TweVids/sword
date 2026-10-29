@@ -94,7 +94,16 @@ class TrainingLogger:
                 event, data = self.events.get(timeout=0.1)
             except queue.Empty:
                 continue
-            self._apply(event, data)
+            try:
+                self._apply(event, data)
+            except Exception as exc:
+                # BUG (gradio.consumer_silent_death) fix: an exception here used
+                # to kill the consumer thread with no message - the dashboard
+                # froze on that exact step and the share tunnel then surfaced
+                # 502 Bad Gateway to every poller.
+                self.error = f"event apply failed ({exc})"
+                print(f"[Sword logger] Event {event!r} failed to apply ({exc}); "
+                      "dashboard state stale, training unaffected.", flush=True)
 
     def _apply(self, event, data):
         with self.lock:
@@ -130,10 +139,18 @@ class TrainingLogger:
         with self.lock:
             state = copy.deepcopy(self.state)
         state["history"] = list(state["history"])
-        if self.task_queue is not None:
-            state["task_progress"] = self.task_queue.monitor_snapshot(state["row_hash"])
-        if self.checkpoint_manager is not None:
-            state["checkpoint_upload"] = {"save_every_steps": self.save_steps, **self.checkpoint_manager.upload_info()}
+        for key, source in (("task_progress", self.task_queue), ("checkpoint_upload", self.checkpoint_manager)):
+            try:
+                if source is not None:
+                    if key == "task_progress":
+                        state[key] = source.monitor_snapshot(state["row_hash"])
+                    else:
+                        state[key] = {"save_every_steps": self.save_steps, **source.upload_info()}
+            except Exception as exc:
+                # BUG (gradio.snapshot_poison_row) fix: one malformed task/queue or
+                # upload-status entry previously made EVERY dashboard tick raise -
+                # the browser kept polling a permanently erroring endpoint.
+                state[key] = {"error": f"{key} snapshot failed: {exc}"}
         return state
 
     def finish(self, status):
@@ -190,7 +207,26 @@ class TrainingLogger:
                     evidence = gr.JSON(label="Measured execution evidence")
                     code_results = gr.JSON(label="Code test inputs and results")
 
+                _last_good = None
+
                 def refresh(index, review_key=None):
+                    # BUG (gradio.tick_poison) fix: wrap the whole payload build -
+                    # one bad value (e.g. NaN in a plot column) previously failed
+                    # every timer tick from that step onward, showing 502-style
+                    # errors in every open browser pane.
+                    nonlocal _last_good
+                    try:
+                        result = _build_refresh(index, review_key)
+                        _last_good = result
+                        return result
+                    except Exception as exc:
+                        print(f"[Sword logger] Refresh failed ({exc}); serving last "
+                              "known dashboard state.", flush=True)
+                        if _last_good is None:
+                            raise
+                        return _last_good
+
+                def _build_refresh(index, review_key=None):
                     state = self.snapshot()
                     score_rows = []
                     for rollout, entry in sorted(state["scores"].items()):
