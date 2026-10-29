@@ -82,12 +82,13 @@ class ModelBJudgeConfig:
     # Dedicated budget for the THINK spec (think=True). Deep evaluations of long
     # agentic responses must not clamp thinking to the small no-think budget.
     num_predict_think: int = 12288
-    # Thinking-effort level for the judge model (e.g. qwen3.8's effort knob).
-    # Sent as the `think` payload value when reasoning is enabled; models or
-    # Ollama builds that only support boolean think reject the string (the
-    # request handler pops `think` and retries with the model default), so the
-    # graceful degradation path is intact.
-    think_level: str = "xhigh"
+    # Thinking-effort level for the judge model. Empty string => plain
+    # think:true (the recommended default: qwen3.8's template already
+    # defaults to xhigh, so a plain boolean is equivalent and portable
+    # across Ollama builds). Set explicitly (e.g. B_model_effort="medium")
+    # only to turn qwen3.8's knob DOWN; invalid level strings degrade via
+    # the existing pop-think 400 retry.
+    think_level: str = ""
     force_gpu: bool = True
     use_mmap: bool = False
     auto_unload: bool = True
@@ -125,7 +126,7 @@ def model_b_config(port: int = 11343, *, mock_test: bool = False,
         num_predict=int(options.get("B_model_num_predict", 1024)),
         num_predict_no_think=int(options.get("B_model_num_predict_no_think", 2048)),
         num_predict_think=int(options.get("B_model_num_predict_think", 12288)),
-        think_level=str(options.get("B_model_effort", options.get("B_model_think_level", "xhigh"))),
+        think_level=str(options.get("B_model_effort", options.get("B_model_think_level", ""))),
         force_gpu=bool(options.get("B_model_force_gpu", True)),
         use_mmap=bool(options.get("B_model_use_mmap", False)),
         log_model_outputs=bool(options.get("B_model_log_outputs", options.get("log_model_outputs", True))),
