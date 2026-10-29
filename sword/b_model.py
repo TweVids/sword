@@ -439,6 +439,7 @@ class ModelBJudge:
         execution_evidence: Optional[Dict[str, Any]] = None,
         dataset_row: Optional[Dict[str, Any]] = None,
         code_execution: Optional[Dict[str, Any]] = None,
+        truth_guide: Optional[str] = None,
     ) -> str:
         """Builds the evaluation query payload for Model B."""
         history = ("Earlier Assistant Turns (reasoning and action evidence):\n"
@@ -447,6 +448,8 @@ class ModelBJudge:
         execution = ""
         full_row = ("Full Dataset Row (reference data and task guidance):\n"
                     + json.dumps(dataset_row, ensure_ascii=False) + "\n\n") if dataset_row is not None else ""
+        truth_section = ("Dataset Truth Score Guide (authoritative reference for the truth score):\n"
+                         f"{truth_guide}\n\n") if truth_guide else ""
         code_results = ""
         if code_execution:
             code_results = ("Runner Code Execution Results:\n"
@@ -467,6 +470,7 @@ class ModelBJudge:
             f"Expected Solution:\n{solution}\n\n"
             f"Reasoning Rule:\n{reasoning_rule or '(No reasoning rule specified.)'}\n\n"
             f"Answer Rule:\n{answer_rule or '(No answer rule specified.)'}\n\n"
+            f"{truth_section}"
             f"{full_row}"
             f"Difficulty: {difficulty} | Category: {category}\n"
             f"Candidate Thinking Effort: {effort}\n"
@@ -685,6 +689,7 @@ class ModelBJudge:
         execution_evidence: Optional[Dict[str, Any]] = None,
         dataset_row: Optional[Dict[str, Any]] = None,
         code_execution: Optional[Dict[str, Any]] = None,
+        truth_guide: Optional[str] = None,
     ) -> ModelBEvaluationResult:
         """Sends candidate response to Model B via Ollama /api/chat and parses result."""
         fallback_tool_ratio = tools_succeeded / max(1, tools_called) if tools_called > 0 else 0.0
@@ -714,6 +719,7 @@ class ModelBJudge:
             execution_evidence=execution_evidence,
             dataset_row=dataset_row,
             code_execution=code_execution,
+            truth_guide=truth_guide,
         )
 
         # THINKING-BUDGET failures (qwen3.5/3.6): with reasoning enabled the

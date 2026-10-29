@@ -183,6 +183,7 @@ class MultiMetricRewardScorer:
         assistant_history: Optional[List[str]] = None,
         effort: str = "dynamic",
         execution_evidence: Optional[Dict[str, Any]] = None,
+        truth_guide: Optional[str] = None,
         dataset_row: Optional[Dict[str, Any]] = None,
         code_execution: Optional[Dict[str, Any]] = None,
     ) -> RewardBreakdown:
@@ -211,6 +212,7 @@ class MultiMetricRewardScorer:
             tools_succeeded=tools_succeeded,
             **({"assistant_history": assistant_history} if assistant_history else {}),
             **({"execution_evidence": execution_evidence} if execution_evidence is not None else {}),
+            **({"truth_guide": truth_guide} if truth_guide else {}),
             **({"dataset_row": dataset_row} if dataset_row is not None else {}),
             **({"code_execution": code_execution} if code_execution else {}),
         ) if self.b_model_judge is not None else deterministic_evaluation(

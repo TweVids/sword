@@ -50,6 +50,7 @@ class DatasetProblemRow:
     """Normalized representation of a dataset problem entry."""
     problem: str
     solution: str
+    truth: str = ""
     reasoning_rule: str = ""
     answer_rule: str = ""
     difficulty: str = "medium"
@@ -83,8 +84,9 @@ class DatasetProblemRow:
             "problem_id": self.problem_id,
             "row_hash": self.row_hash,
         })
-        if self.tests or self.initial_files or self.language:
-            result.update(tests=self.tests, initial_files=self.initial_files, language=self.language)
+        if self.truth or self.tests or self.initial_files or self.language:
+            result.update(truth=self.truth, tests=self.tests, initial_files=self.initial_files,
+                          language=self.language)
         if self.code_tests:
             result["code_tests"] = self.code_tests
         return result
@@ -112,6 +114,7 @@ def parse_dataset_row(raw: Dict[str, Any], index: int = 0) -> DatasetProblemRow:
                      if key in raw and raw[key] is not None and str(raw[key]).strip()), "")
     reasoning_rule = str(raw.get("reasoning_rule") or raw.get("reasoning") or "").strip()
     answer_rule = str(raw.get("answer_rule") or raw.get("answer_field") or "").strip()
+    truth = str(raw.get("truth") or "").strip()
     effort = normalize_effort(raw.get("effort"))
 
     difficulty = str(raw.get("difficult") or raw.get("difficulty") or "medium").strip().lower()
@@ -139,7 +142,7 @@ def parse_dataset_row(raw: Dict[str, Any], index: int = 0) -> DatasetProblemRow:
         raise ValueError("initial_files must map relative filenames to text contents")
     language = str(raw.get("language") or "").strip().lower() or None
 
-    normalized_keys = {"problem", "solution", "reasoning_rule", "answer_rule", "effort", "difficulty", "category",
+    normalized_keys = {"problem", "solution", "truth", "reasoning_rule", "answer_rule", "effort", "difficulty", "category",
                        "harness", "problem_id", "row_hash", "tests", "initial_files", "language", "code_tests",
                        "can_be_verify", "can_be__verify"}
     # Keep other columns (including original aliases) available to the judge
@@ -149,6 +152,7 @@ def parse_dataset_row(raw: Dict[str, Any], index: int = 0) -> DatasetProblemRow:
     row = DatasetProblemRow(
         problem=problem,
         solution=solution,
+        truth=truth,
         reasoning_rule=reasoning_rule,
         answer_rule=answer_rule,
         effort=effort,
@@ -795,6 +799,7 @@ def run_long_train(
                             assistant_history=[turn.response_text for turn in earlier_turns],
                             dataset_row=current_row.to_dict(),
                             code_execution=getattr(h_res, "code_execution", None),
+                            **({"truth_guide": current_row.truth} if current_row.truth else {}),
                             **({"execution_evidence": execution_evidence} if execution_evidence is not None else {}),
                         )
                         item.reward = score_breakdown.total_score
