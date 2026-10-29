@@ -69,6 +69,13 @@ class CheckpointManager:
                 print(f"[CheckpointManager] Note: Hugging Face repo setup notice: {e}")
         elif self.upload_id and self.is_save_and_upload:
             self._upload_status["upload_error"] = "huggingface_hub is not installed"
+            # BUG (checkpoint.silent_upload_disabled) fix: a missing huggingface_hub
+            # previously disabled ALL uploads with no console output at all - local
+            # checkpoints silently accumulated with the run looking healthy.
+            print("[CheckpointManager] HF upload DISABLED: huggingface_hub is not "
+                  "installed on this environment. Checkpoints will only be saved "
+                  "locally (pip install huggingface_hub on the training box to fix).",
+                  flush=True)
 
     def upload_info(self):
         with self._status_lock:
