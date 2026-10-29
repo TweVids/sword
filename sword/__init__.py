@@ -413,7 +413,7 @@ from .reward import MultiMetricRewardScorer, RewardBreakdown, MathVerifier
 from .checkpoint import CheckpointManager
 from .long_trainer import run_long_train
 
-__version__ = "0.9.2"
+__version__ = "1.0.1"
 print(f"[Sword] Version {__version__} loaded successfully.")
 
 # Support hyphenated alias for vllm-patcher and function access

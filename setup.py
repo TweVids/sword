@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="sword",
-    version="0.9.2",
+    version="1.0.1",
     description="High-Throughput Pure-PyTorch Attention & Generation Speed Engine",
     author="TweVids",
     packages=find_packages(),
