@@ -9,6 +9,7 @@ import gc
 import re
 import json
 import time
+import random
 import hashlib
 import csv
 import io
@@ -293,6 +294,9 @@ def task_rollout_solved(row, candidate, score, harness_result=None, *, threshold
     return score.truth >= threshold
 
 
+_DATASET_SHUFFLE_SEED = "sword-grpo-row-shuffle-v1"
+
+
 def run_long_train(
     dataset: Optional[Union[str, List[Any], Dict[str, Any]]] = "math-ai/TemplateGSM",
     model: str = DEFAULT_GRPO_MODEL,
@@ -455,6 +459,17 @@ def run_long_train(
             skipped = len(records) - len(uncompleted_records)
             print(f"[*] Expandable dataset detected: skipping {skipped} already-trained rows. Continuing with {len(uncompleted_records)} new rows.")
             records = uncompleted_records
+
+    # Deterministic dataset shuffle with a hardcoded seed: the round-robin
+    # training walk otherwise follows the file/append order of the Drive file
+    # (easy rows first, new rows last). random.Random(<str>) ignores Python's
+    # hash randomization, so every run - including a GRPO resume from a LoRA
+    # repo - shuffles the identical training order for the same dataset.
+    # Pass shuffle_seed="" to keep original file order instead.
+    shuffle_seed = str(kwargs.get("shuffle_seed", args.get("shuffle_seed", _DATASET_SHUFFLE_SEED)))
+    if shuffle_seed and len(records) > 1:
+        random.Random(shuffle_seed).shuffle(records)
+        print(f"[*] Dataset shuffled deterministically (seed={shuffle_seed!r}, {len(records)} rows)")
 
     # 3. Model B Judge & Scorer Initialization
     quiet_quantization_cast_notices()
