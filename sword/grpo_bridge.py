@@ -47,6 +47,11 @@ _CODE_STAMP = "sword-grpo-bridge math-llm-judge/v8"
 
 THINKING_EFFORTS = ("dynamic", "low", "medium", "high", "xhigh")
 
+# Level normalization for templates with restricted vocabularies: qwen3.8's
+# chat template accepts only xhigh/medium/low, so a dataset `high` maps to its
+# nearest supported depth instead of raising inside apply_chat_template.
+_EFFORT_TEMPLATE_ALIASES = {"high": "xhigh"}
+
 
 def normalize_effort(effort: Optional[str]) -> str:
     """Default missing dataset effort to dynamic and reject unsupported values."""
@@ -62,11 +67,29 @@ def format_rollout_prompt(tokenizer, prompt: str, *, enable_thinking: bool = Tru
     """Use the model's assistant-generation template when one is configured."""
     effort = normalize_effort(effort)
     if getattr(tokenizer, "chat_template", None) and callable(getattr(tokenizer, "apply_chat_template", None)):
-        return tokenizer.apply_chat_template(
-            [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True,
-            enable_thinking=enable_thinking,
-            effort=effort if enable_thinking else None,
-        ), True
+        # BUG (bridge.effort_kwarg) fix: qwen3.8-family templates read
+        # `reasoning_effort`, not `effort`. Supply both names so whichever
+        # the template consumes is honored; unknown context keys are ignored
+        # by templates that don't use them.
+        context = {"enable_thinking": enable_thinking}
+        if enable_thinking and effort != "dynamic":
+            effort = _EFFORT_TEMPLATE_ALIASES.get(effort, effort)
+            context["effort"] = effort
+            context["reasoning_effort"] = effort
+        try:
+            return tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True,
+                **context,
+            ), True
+        except Exception:
+            # Templates with strict level validation (e.g. qwen3.8 accepts only
+            # xhigh/medium/low) or no effort support at all (older/gemma
+            # templates): fall back to the template's own default level rather
+            # than crashing every rollout for a mislabeled dataset row.
+            return tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True,
+                enable_thinking=enable_thinking,
+            ), True
     return prompt, False
 
 
