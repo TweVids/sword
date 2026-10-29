@@ -468,8 +468,26 @@ def run_long_train(
     # Pass shuffle_seed="" to keep original file order instead.
     shuffle_seed = str(kwargs.get("shuffle_seed", args.get("shuffle_seed", _DATASET_SHUFFLE_SEED)))
     if shuffle_seed and len(records) > 1:
-        random.Random(shuffle_seed).shuffle(records)
-        print(f"[*] Dataset shuffled deterministically (seed={shuffle_seed!r}, {len(records)} rows)")
+        grouped = bool(kwargs.get("shuffle_by_category", args.get("shuffle_by_category", True)))
+        categories = {}  # BUG (shuffle.category_scatter) fix: plain shuffling scattered
+        for record in records:  # rows of one cagetory across the whole walk, so the
+            categories.setdefault(record.category, []).append(record)  # model bounced between topics mid-pass instead of drilling each one.
+        if grouped and len(categories) > 1:
+            # Category-cohesive shuffle: shuffle rows WITHIN each category
+            # deterministically, then concatenate the categories in their own
+            # deterministic shuffled order. Same seed -> same order every run,
+            # row-hash dedup and resume all still see the identical sequence.
+            rng = random.Random(shuffle_seed)
+            for rows in categories.values():
+                rng.shuffle(rows)
+            order = list(categories)
+            rng.shuffle(order)
+            records = [row for cat in order for row in categories[cat]]
+            print(f"[*] Dataset shuffled deterministically by category "
+                  f"(seed={shuffle_seed!r}, {len(records)} rows, {len(categories)} categories)")
+        else:
+            random.Random(shuffle_seed).shuffle(records)
+            print(f"[*] Dataset shuffled deterministically (seed={shuffle_seed!r}, {len(records)} rows)")
 
     # 3. Model B Judge & Scorer Initialization
     quiet_quantization_cast_notices()
