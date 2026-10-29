@@ -499,7 +499,12 @@ def run_long_train(
         max_model_len=max_seq_len,
         max_new_tokens=max_new_tokens,
         micro_batch_size=micro_batch_size,
-        vllm_max_num_seqs=int(kwargs.get("vllm_max_num_seqs", 2)),
+        # BUG (rollout.max_num_seqs_default) fix: the default of 2 ignored
+        # concurrency_g - rollouts are always submitted as one group in a single
+        # vLLM generate() call, so the engine needs at least one decode lane per
+        # group member. max_num_seqs=2 serialized an 8-rollout batch 4x and
+        # crushed per-sequence tok/s with it.
+        vllm_max_num_seqs=int(kwargs.get("vllm_max_num_seqs", max(2, concurrency_g))),
         vllm_max_num_batched_tokens=int(kwargs.get("vllm_max_num_batched_tokens", 2048)),
         use_cross_step_baseline=bool(kwargs.get("use_cross_step_baseline", args.get("use_cross_step_baseline", True))),
         temperature=float(args.get("temperature", 0.7)),
